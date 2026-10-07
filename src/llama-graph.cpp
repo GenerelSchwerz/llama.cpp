@@ -1,5 +1,8 @@
 #include "llama-graph.h"
 
+#include "ggml-backend-moe.h"
+#include "ggml-impl.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -18,13 +21,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 // dedup helpers
@@ -79,6 +85,9 @@ static bool can_reuse_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     if (causal_prefix_n_kv) {
+        if (*causal_prefix_n_kv != n_kv && std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+            fprintf(stderr, "moe-graph-reuse: input=causal_prefix saved_kv=%u current_kv=%u rows=%u\n", *causal_prefix_n_kv, n_kv, n_tokens);
+        }
         return kq_mask && kq_mask->type == GGML_TYPE_I64 &&
             kq_mask->ne[0] == n_tokens && kq_mask->ne[1] == 1 &&
             kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 &&
@@ -94,6 +103,12 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
+
+    if (!res && std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+        fprintf(stderr, "moe-graph-reuse: input=kq_mask saved_kv=%lld current_kv=%u saved_rows=%lld current_rows=%u saved_streams=%lld current_streams=%u\n",
+            (long long) kq_mask->ne[0], n_kv, (long long) kq_mask->ne[1], n_tokens/n_stream,
+            (long long) kq_mask->ne[3], n_stream);
+    }
 
     return res;
 }
@@ -1340,14 +1355,9 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 
     for (auto seq_id : active_samplers) {
-        if (samplers.find(seq_id) == samplers.end()) {
-            continue;
-        }
-
-        auto & sampler = samplers[seq_id];
-
-        if (sampler->iface->backend_set_input) {
-            sampler->iface->backend_set_input(sampler);
+        const auto it = inputs.find(seq_id);
+        if (it != inputs.end()) {
+            it->second.set_input();
         }
     }
 }
@@ -1358,7 +1368,9 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     }
 
     for (const auto & [seq_id, sampler] : params.samplers) {
-        if (samplers[seq_id] != sampler) {
+        const auto it = samplers.find(seq_id);
+        const auto input = inputs.find(seq_id);
+        if (it == samplers.end() || it->second != sampler || input == inputs.end() || !input->second.can_reuse()) {
             return false;
         }
     }
@@ -1401,8 +1413,12 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     inp_token_tensors.clear();
+    inp_tensors.clear();
+    inp_tensors_context_used = SIZE_MAX;
     fused_nodes.clear();
     moe_regions.clear();
+    required_grouped_backends.clear();
+    required_grouped_prepared = false;
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1423,6 +1439,18 @@ bool llm_graph_result::can_decode_sampled() const {
     });
 }
 
+const std::vector<ggml_tensor *> & llm_graph_result::get_inp_tensors() {
+    const size_t used = ggml_used_mem(get_ctx());
+    if (used != inp_tensors_context_used) {
+        inp_tensors.clear();
+        for (auto * tensor = ggml_get_first_tensor(get_ctx()); tensor; tensor = ggml_get_next_tensor(get_ctx(), tensor)) {
+            if (tensor->flags & GGML_TENSOR_FLAG_INPUT) { inp_tensors.push_back(tensor); }
+        }
+        inp_tensors_context_used = used;
+    }
+    return inp_tensors;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch, bool skip_token_upload) {
     for (auto & input : inputs) {
         if (skip_token_upload && dynamic_cast<llm_graph_input_embd *>(input.get())) {
@@ -1430,6 +1458,41 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch, bool skip_token_u
             continue;
         }
         input->set_input(ubatch);
+    }
+}
+
+void llm_graph_result::retain_state_computation() {
+    try {
+        std::unordered_set<const ggml_tensor *> live;
+        std::vector<const ggml_tensor *> pending;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const auto * node = ggml_graph_node(gf, i);
+            // Destination views can write state. Only these operations are metadata.
+            const bool metadata = ggml_op_is_empty(node->op);
+            const bool compute = (node->flags & GGML_TENSOR_FLAG_COMPUTE) && !metadata;
+            const bool boundary = !ggml_is_empty(node) && (node->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_PARAM));
+            if (boundary || (compute && (!ggml_op_is_pure(node->op) || node->view_src || node->buffer || node->data))) {
+                pending.push_back(node);
+            }
+        }
+        while (!pending.empty()) {
+            const auto * node = pending.back();
+            pending.pop_back();
+            if (!live.insert(node).second) { continue; }
+            for (const auto * src : node->src) {
+                if (src) { pending.push_back(src); }
+            }
+            if (node->view_src) { pending.push_back(node->view_src); }
+        }
+        // Keep topology and allocation metadata. Change flags only after the proof is complete.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (!ggml_is_empty(node) && ggml_op_is_pure(node->op) && !node->view_src && !live.count(node)) {
+                node->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        // The original computation remains valid if dependency storage is unavailable.
     }
 }
 
@@ -1479,6 +1542,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
+        if (std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+            fprintf(stderr, "moe-graph-reuse: input=graph_params saved_rows=%u current_rows=%u saved_outputs=%u current_outputs=%u\n",
+                this->params.ubatch.n_tokens, params.ubatch.n_tokens, this->params.n_outputs, params.n_outputs);
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1492,8 +1559,13 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
+    size_t input_index = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if (!cur && std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+            fprintf(stderr, "moe-graph-reuse: input_index=%zu rows=%u\n", input_index, params.ubatch.n_tokens);
+        }
+        ++input_index;
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
@@ -1510,6 +1582,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
+    inp_tensors_context_used = SIZE_MAX;
     if (auto * embd = dynamic_cast<llm_graph_input_embd *>(input.get())) {
         if (embd->tokens) {
             inp_token_tensors.push_back(embd->tokens);
@@ -1528,17 +1601,85 @@ static bool is_metadata_view(const ggml_tensor * tensor) {
            tensor->op == GGML_OP_TRANSPOSE;
 }
 
+static bool checked_size_add(size_t a, size_t b, size_t & result) {
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+static bool checked_size_mul(size_t a, size_t b, size_t & result) {
+    if (b != 0 && a > SIZE_MAX / b) {
+        return false;
+    }
+    result = a * b;
+    return true;
+}
+
+static bool valid_structural_tensor(const ggml_tensor * tensor, size_t & span) {
+    if (tensor == nullptr || tensor->type < 0 || tensor->type >= GGML_TYPE_COUNT ||
+            tensor->op < GGML_OP_NONE || tensor->op >= GGML_OP_COUNT ||
+            tensor->op == GGML_OP_MAP_CUSTOM1 || tensor->op == GGML_OP_MAP_CUSTOM2 ||
+            tensor->op == GGML_OP_MAP_CUSTOM3 || tensor->op == GGML_OP_CUSTOM) {
+        return false;
+    }
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    const size_t type_size = ggml_type_size(tensor->type);
+    if (block_size <= 0 || type_size == 0 || tensor->ne[0] <= 0 || tensor->ne[0] % block_size != 0 ||
+            tensor->nb[0] != type_size) {
+        return false;
+    }
+    size_t elements = 1;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (tensor->ne[dim] <= 0 || (uint64_t) tensor->ne[dim] > SIZE_MAX ||
+                !checked_size_mul(elements, (size_t) tensor->ne[dim], elements) || elements > INT64_MAX) {
+            return false;
+        }
+    }
+    size_t row_bytes;
+    if (!checked_size_mul(type_size, (size_t) tensor->ne[0] / block_size, row_bytes) ||
+            row_bytes == 0 || tensor->nb[1] < row_bytes) {
+        return false;
+    }
+    for (int dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+        size_t required_stride;
+        if (tensor->nb[dim - 1] == 0 || tensor->nb[dim] == 0 ||
+                !checked_size_mul(tensor->nb[dim - 1], (size_t) tensor->ne[dim - 1], required_stride) ||
+                tensor->nb[dim] < required_stride) {
+            return false;
+        }
+    }
+    span = row_bytes;
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        size_t extent;
+        if (!checked_size_mul((size_t) tensor->ne[dim] - 1, tensor->nb[dim], extent) ||
+                !checked_size_add(span, extent, span)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llm_graph_result::add_moe_region(int32_t       layer,
                                       ggml_tensor * down,
                                       ggml_tensor * route,
                                       ggml_tensor * first,
+                                      ggml_tensor * body_output,
+                                      ggml_tensor * tail_resume,
                                       ggml_tensor * output,
+                                      std::vector<ggml_tensor *> dynamic_inputs,
+                                      bool          has_lora,
                                       bool          external_route) {
     llm_graph_moe_region region;
     region.layer          = layer;
     region.down           = down;
     region.route          = route;
     region.output         = output;
+    region.body_output    = body_output;
+    region.tail_resume    = tail_resume;
+    region.dynamic_inputs = std::move(dynamic_inputs);
+    region.has_lora       = has_lora;
     region.external_route = external_route;
     std::unordered_set<ggml_tensor *> local;
     // The builder supplies its first new tensor. Never collect input ancestors.
@@ -1556,16 +1697,202 @@ void llm_graph_result::add_moe_region(int32_t       layer,
             }
         }
     }
+    const auto tail_resume_it = std::find(region.operations.begin(), region.operations.end(), tail_resume);
+    const auto output_it      = std::find(region.operations.begin(), region.operations.end(), output);
+    if (body_output && tail_resume_it != region.operations.end() && output_it != region.operations.end() &&
+        tail_resume_it <= output_it) {
+        const std::unordered_set<ggml_tensor *> dynamic(region.dynamic_inputs.begin(), region.dynamic_inputs.end());
+        std::unordered_set<ggml_tensor *>       body;
+        std::vector<ggml_tensor *>              pending = { body_output };
+        while (!pending.empty()) {
+            auto * tensor = pending.back();
+            pending.pop_back();
+            if (!tensor || dynamic.count(tensor) || tensor->op == GGML_OP_NONE || !body.insert(tensor).second) {
+                continue;
+            }
+            for (auto * src : tensor->src) {
+                if (src) {
+                    pending.push_back(src);
+                }
+            }
+            if (tensor->view_src) {
+                pending.push_back(tensor->view_src);
+            }
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(get_gf()); ++i) {
+            auto * node = ggml_graph_node(get_gf(), i);
+            if (body.count(node)) {
+                region.body_operations.push_back(node);
+            }
+        }
+        if (!region.body_operations.empty()) {
+            region.first_body = region.body_operations.front();
+        }
+        for (auto * tensor : region.body_operations) {
+            llm_graph_moe_live_out live_out;
+            live_out.tensor = tensor;
+            for (auto * consumer : region.operations) {
+                if (body.count(consumer)) {
+                    continue;
+                }
+                const bool is_source =
+                    std::find(std::begin(consumer->src), std::end(consumer->src), tensor) != std::end(consumer->src);
+                if (is_source || consumer->view_src == tensor) {
+                    live_out.consumers.push_back(consumer);
+                }
+            }
+            if (!live_out.consumers.empty()) {
+                region.live_outs.push_back(std::move(live_out));
+            }
+        }
+
+        const auto body_live_out = std::find_if(
+            region.live_outs.begin(), region.live_outs.end(),
+            [body_output](const llm_graph_moe_live_out & live_out) { return live_out.tensor == body_output; });
+        region.builder_cut_closed =
+            body_live_out != region.live_outs.end() && region.body_operations.size() == body.size() &&
+            region.body_operations.back() == body_output &&
+            std::all_of(region.dynamic_inputs.begin(), region.dynamic_inputs.end(),
+                        [&body](ggml_tensor * tensor) { return tensor && body.count(tensor) == 0; });
+    }
     moe_regions.push_back(std::move(region));
 }
 
+bool llm_graph_result::discover_moe_regions(const std::vector<llama_moe_source_group> & sources,
+                                            bool (*is_cached)(const ggml_tensor *)) {
+    if (!is_cached) { return false; }
+    const int count = ggml_graph_n_nodes(get_gf());
+    std::unordered_map<const ggml_tensor *, int> positions;
+    for (int i = 0; i < count; ++i) {
+        auto * node = ggml_graph_node(get_gf(), i);
+        if (!node || !positions.emplace(node, i).second) { return false; }
+    }
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, uint32_t>> sources_by_tensor;
+    for (size_t index = 0; index < sources.size(); ++index) {
+        const auto & source = sources[index];
+        for (const auto & bank : source.banks) {
+            if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE || !is_cached(bank.tensor)) {
+                continue;
+            }
+            if (index >= GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || source.layer < 0 ||
+                    source.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID ||
+                    !sources_by_tensor.emplace(bank.tensor, std::make_pair(source.layer, source.domain)).second) {
+                return false;
+            }
+        }
+    }
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, uint32_t>> projections;
+    for (int i = 0; i < count; ++i) {
+        auto * node = ggml_graph_node(get_gf(), i);
+        if (node->op != GGML_OP_MUL_MAT_ID || ggml_is_empty(node) || !is_cached(node->src[0])) { continue; }
+        const auto source = sources_by_tensor.find(node->src[0]);
+        if (source == sources_by_tensor.end() || !node->src[1] || !node->src[2]) { return false; }
+        projections.emplace(node, source->second);
+    }
+    const auto refresh_cut = [&](llm_graph_moe_region & region) {
+        region.live_outs.clear();
+        const auto first = positions.find(region.first_body);
+        if (first == positions.end() || region.body_operations.empty() ||
+                region.body_operations.size() > size_t(count - first->second)) { return false; }
+        const int last = first->second + int(region.body_operations.size()) - 1;
+        for (size_t i = 0; i < region.body_operations.size(); ++i) {
+            if (ggml_graph_node(get_gf(), first->second + int(i)) != region.body_operations[i]) { return false; }
+        }
+        if (region.body_operations.back() != region.body_output) { return false; }
+        const std::unordered_set<ggml_tensor *> body(region.body_operations.begin(), region.body_operations.end());
+        const std::unordered_set<ggml_tensor *> dynamic(region.dynamic_inputs.begin(), region.dynamic_inputs.end());
+        for (auto * tensor : region.dynamic_inputs) {
+            if (!tensor || body.count(tensor)) { return false; }
+        }
+        for (auto * tensor : region.body_operations) {
+            for (auto * input : tensor->src) {
+                if (input && !body.count(input) && !dynamic.count(input) && input->op != GGML_OP_NONE) { return false; }
+            }
+            if (tensor->view_src && !body.count(tensor->view_src) && !dynamic.count(tensor->view_src) &&
+                    tensor->view_src->op != GGML_OP_NONE) { return false; }
+            llm_graph_moe_live_out live;
+            live.tensor = tensor;
+            for (int i = 0; i < count; ++i) {
+                auto * consumer = ggml_graph_node(get_gf(), i);
+                if (body.count(consumer)) { continue; }
+                if (ggml_backend_sched_region_consumes_v1(consumer, tensor)) {
+                    if (i <= last) { return false; }
+                    live.consumers.push_back(consumer);
+                }
+            }
+            if (!live.consumers.empty() || (tensor->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                region.live_outs.push_back(std::move(live));
+            }
+        }
+        region.tail_resume = last + 1 < count ? ggml_graph_node(get_gf(), last + 1) : nullptr;
+        region.builder_cut_closed = true;
+        region.finalized_metadata.reset();
+        return true;
+    };
+    std::vector<llm_graph_moe_region> discovered;
+    std::unordered_set<const ggml_tensor *> covered;
+    std::unordered_set<const ggml_tensor *> covered_body;
+    for (const auto & hint : moe_regions) {
+        if (!hint.builder_cut_closed || hint.has_lora) { continue; }
+        auto region = hint;
+        if (!refresh_cut(region) || region.live_outs.size() != 1 || region.live_outs[0].tensor != region.body_output) {
+            continue;
+        }
+        bool valid = true;
+        bool has_source = false;
+        for (auto * node : region.body_operations) {
+            if (covered_body.count(node)) { valid = false; break; }
+            if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+            const auto source = projections.find(node);
+            if (source == projections.end() || covered.count(node)) { valid = false; break; }
+            if (!has_source) { region.layer = source->second.first; region.domain = source->second.second; }
+            if (region.layer != source->second.first || region.domain != source->second.second) { valid = false; break; }
+            has_source = true;
+        }
+        if (!valid || !has_source) { continue; }
+        for (auto * node : region.body_operations) {
+            covered_body.insert(node);
+            if (projections.count(node)) { covered.insert(node); }
+        }
+        discovered.push_back(std::move(region));
+    }
+    for (int i = 0; i < count; ++i) {
+        auto * node = ggml_graph_node(get_gf(), i);
+        const auto source = projections.find(node);
+        if (source == projections.end() || covered.count(node)) { continue; }
+        llm_graph_moe_region region;
+        region.layer = source->second.first;
+        region.domain = source->second.second;
+        region.down = node->src[0];
+        region.route = node->src[2];
+        region.first_body = region.body_output = region.output = node;
+        region.operations = region.body_operations = {node};
+        region.dynamic_inputs = {node->src[1], node->src[2]};
+        for (auto * input : node->src) {
+            if (input && std::find(region.inputs.begin(), region.inputs.end(), input) == region.inputs.end()) {
+                region.inputs.push_back(input);
+            }
+        }
+        if (!refresh_cut(region) || region.live_outs.empty()) { return false; }
+        covered.insert(node);
+        discovered.push_back(std::move(region));
+    }
+    if (covered.size() != projections.size()) { return false; }
+    std::sort(discovered.begin(), discovered.end(), [&](const llm_graph_moe_region & a, const llm_graph_moe_region & b) {
+        return positions.at(a.first_body) < positions.at(b.first_body);
+    });
+    moe_regions = std::move(discovered);
+    return true;
+}
+
 bool llm_graph_moe_region::place(ggml_backend_sched_t sched, ggml_backend_t owner) {
-    if (!owner || external_route || !route || route->op != GGML_OP_VIEW || !route->src[0] ||
-        route->src[0]->op != GGML_OP_ARGSORT) {
+    if (!sched || !owner || !route || route->type != GGML_TYPE_I32 || route->ne[0] <= 0 || route->ne[1] <= 0 ||
+        route->ne[2] != 1 || route->ne[3] != 1) {
         return false;
     }
     const std::unordered_set<ggml_tensor *> local(operations.begin(), operations.end());
-    if (local.count(route) == 0 || local.count(route->src[0]) == 0 || local.count(output) == 0) {
+    const bool boundary_route = std::find(dynamic_inputs.begin(), dynamic_inputs.end(), route) != dynamic_inputs.end();
+    if ((!local.count(route) && !boundary_route) || local.count(output) == 0) {
         return false;
     }
     // Validate the complete region before changing any scheduler assignment.
@@ -1593,6 +1920,242 @@ bool llm_graph_moe_region::place(ggml_backend_sched_t sched, ggml_backend_t owne
     return true;
 }
 
+int32_t llm_graph_moe_region::finalize_metadata(
+        ggml_backend_sched_t sched,
+        const ggml_cgraph *  graph,
+        uint64_t             owner_generation,
+        uint64_t             allocator_generation) {
+    finalized_metadata.reset();
+    if (!builder_cut_closed || has_lora || owner_generation == 0 || allocator_generation == 0 ||
+            body_operations.empty() || body_operations.size() > UINT32_MAX || dynamic_inputs.size() > UINT32_MAX ||
+            live_outs.size() > UINT32_MAX || body_output != body_operations.back()) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<ggml_backend_sched_region_live_output_v1> finalized_outputs;
+        finalized_outputs.reserve(live_outs.size());
+        for (const auto & output : live_outs) {
+            if (output.consumers.size() > UINT32_MAX) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_CAPACITY;
+            }
+            finalized_outputs.push_back({output.consumers.data(), output.tensor,
+                                         static_cast<uint32_t>(output.consumers.size()), 0});
+        }
+        ggml_backend_sched_region_query_v1 query = {};
+        query.struct_size      = sizeof(query);
+        query.abi_version      = GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION;
+        query.graph            = graph;
+        query.body_nodes       = body_operations.data();
+        query.n_body_nodes     = body_operations.size();
+        query.dynamic_inputs   = dynamic_inputs.data();
+        query.n_dynamic_inputs = dynamic_inputs.size();
+        query.n_live_outputs   = finalized_outputs.size();
+        query.live_outputs     = finalized_outputs.data();
+        query.tail_resume      = tail_resume;
+
+        ggml_backend_sched_region_handoff_v1 handoff = {};
+        handoff.struct_size = sizeof(handoff);
+        handoff.abi_version = GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION;
+        const int32_t status = ggml_backend_sched_region_finalize_v1(sched, &query, &handoff);
+        if (status != GGML_BACKEND_SCHED_REGION_STATUS_V1_OK) {
+            return status;
+        }
+
+        auto snapshot = std::make_shared<llm_graph_moe_finalized_snapshot>();
+        snapshot->source_graph_uid     = handoff.source_graph_uid;
+        snapshot->split_graph_uid      = handoff.split_graph_uid;
+        snapshot->owner_generation     = owner_generation;
+        snapshot->allocator_generation = allocator_generation;
+        snapshot->split_index          = handoff.split_index;
+        snapshot->first_node_index     = handoff.first_node_index;
+        snapshot->last_node_index      = handoff.last_node_index;
+        snapshot->tail_node_index      = handoff.tail_node_index;
+
+        std::vector<const ggml_tensor *> tensors;
+        tensors.reserve(body_operations.size() + handoff.n_dynamic_inputs + inputs.size());
+        const auto append = [&](const ggml_tensor * tensor) {
+            if (tensor != nullptr && std::find(tensors.begin(), tensors.end(), tensor) == tensors.end()) {
+                tensors.push_back(tensor);
+                return true;
+            }
+            return false;
+        };
+        const auto is_dynamic = [&](const ggml_tensor * tensor) {
+            for (uint32_t i = 0; i < handoff.n_dynamic_inputs; ++i) {
+                if (handoff.dynamic_inputs[i] == tensor) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (uint32_t i = 0; i < handoff.n_dynamic_inputs; ++i) {
+            append(handoff.dynamic_inputs[i]);
+        }
+        for (const auto * node : body_operations) {
+            append(node);
+        }
+        std::vector<const ggml_tensor *> pending;
+        for (const auto * node : body_operations) {
+            for (const auto * src : node->src) {
+                if (src != nullptr && !is_dynamic(src) &&
+                        std::find(body_operations.begin(), body_operations.end(), src) == body_operations.end()) {
+                    pending.push_back(src);
+                }
+            }
+            if (node->view_src != nullptr && !is_dynamic(node->view_src) &&
+                    std::find(body_operations.begin(), body_operations.end(), node->view_src) == body_operations.end()) {
+                pending.push_back(node->view_src);
+            }
+        }
+        while (!pending.empty()) {
+            const auto * tensor = pending.back();
+            pending.pop_back();
+            if (!append(tensor)) {
+                continue;
+            }
+            if (tensor->op != GGML_OP_NONE) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+            for (const auto * src : tensor->src) {
+                if (src != nullptr) {
+                    return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+                }
+            }
+            if (tensor->view_src != nullptr) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+        }
+
+        std::unordered_map<const ggml_tensor *, size_t> spans;
+        spans.reserve(tensors.size());
+        for (const auto * tensor : tensors) {
+            size_t span;
+            if (!valid_structural_tensor(tensor, span)) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+            spans.emplace(tensor, span);
+        }
+        for (const auto * tensor : tensors) {
+            if (tensor->view_src == nullptr || is_dynamic(tensor)) {
+                continue;
+            }
+            const auto source = spans.find(tensor->view_src);
+            size_t view_end;
+            if (source == spans.end() || !checked_size_add(tensor->view_offs, spans.at(tensor), view_end) ||
+                    view_end > source->second) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+
+        const size_t graph_capacity = std::max(body_operations.size(), tensors.size() - body_operations.size());
+        if (graph_capacity > INT_MAX ||
+                tensors.size() > (SIZE_MAX - ggml_graph_overhead_custom(std::max<size_t>(graph_capacity, 1), false)) /
+                                 ggml_tensor_overhead()) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_CAPACITY;
+        }
+        snapshot->metadata.resize(ggml_tensor_overhead() * tensors.size() +
+                                  ggml_graph_overhead_custom(std::max<size_t>(graph_capacity, 1), false));
+        snapshot->context.reset(ggml_init({snapshot->metadata.size(), snapshot->metadata.data(), true}));
+        if (!snapshot->context) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_CAPACITY;
+        }
+
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> clones;
+        clones.reserve(tensors.size());
+        for (const auto * tensor : tensors) {
+            auto * clone = ggml_new_tensor_1d(snapshot->context.get(), GGML_TYPE_F32, 1);
+            *clone = *tensor;
+            clone->buffer = nullptr;
+            clone->data   = nullptr;
+            clone->extra  = nullptr;
+            std::fill(std::begin(clone->src), std::end(clone->src), nullptr);
+            clone->view_src  = nullptr;
+            clone->view_offs = 0;
+            clones.emplace(tensor, clone);
+        }
+        for (uint32_t i = 0; i < handoff.n_dynamic_inputs; ++i) {
+            auto * clone = clones.at(handoff.dynamic_inputs[i]);
+            clone->op = GGML_OP_NONE;
+            memset(clone->op_params, 0, sizeof(clone->op_params));
+            snapshot->dynamic_inputs.push_back(clone);
+        }
+        for (const auto * tensor : tensors) {
+            if (std::find(body_operations.begin(), body_operations.end(), tensor) == body_operations.end()) {
+                auto * clone = clones.at(tensor);
+                if (!is_dynamic(tensor)) {
+                    for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                        if (tensor->src[src] != nullptr) {
+                            clone->src[src] = clones.at(tensor->src[src]);
+                        }
+                    }
+                    if (tensor->view_src != nullptr) {
+                        clone->view_src  = clones.at(tensor->view_src);
+                        clone->view_offs = tensor->view_offs;
+                    }
+                }
+                snapshot->external_inputs.push_back(clone);
+                llm_graph_moe_source_identity identity;
+                identity.witness = tensor;
+                identity.type    = tensor->type;
+                std::copy(std::begin(tensor->ne), std::end(tensor->ne), std::begin(identity.ne));
+                std::copy(std::begin(tensor->nb), std::end(tensor->nb), std::begin(identity.nb));
+                snapshot->external_input_origins.push_back(identity);
+            }
+        }
+        for (const auto * node : body_operations) {
+            auto * clone = clones.at(node);
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                if (node->src[src] != nullptr) {
+                    clone->src[src] = clones.at(node->src[src]);
+                }
+            }
+            if (node->view_src != nullptr) {
+                clone->view_src  = clones.at(node->view_src);
+                clone->view_offs = node->view_offs;
+            }
+            snapshot->body_nodes.push_back(clone);
+        }
+
+        snapshot->body_graph = ggml_new_graph_custom(snapshot->context.get(), std::max<size_t>(graph_capacity, 1), false);
+        std::vector<ggml_tensor *> graph_nodes;
+        std::vector<ggml_tensor *> graph_leafs;
+        graph_nodes.reserve(snapshot->body_nodes.size());
+        graph_leafs.reserve(snapshot->external_inputs.size());
+        for (const auto * node : snapshot->body_nodes) {
+            graph_nodes.push_back(const_cast<ggml_tensor *>(node));
+        }
+        for (const auto * leaf : snapshot->external_inputs) {
+            graph_leafs.push_back(const_cast<ggml_tensor *>(leaf));
+        }
+        if (!ggml_backend_sched_region_snapshot_graph_v1(
+                snapshot->body_graph, &handoff, graph_nodes.data(), graph_nodes.size(),
+                graph_leafs.data(), graph_leafs.size())) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+
+        for (const auto & output : live_outs) {
+            llm_graph_moe_finalized_live_out live;
+            const auto body = std::find(body_operations.begin(), body_operations.end(), output.tensor);
+            live.body_node = static_cast<uint32_t>(body - body_operations.begin());
+            for (const auto * consumer : output.consumers) {
+                for (int i = handoff.last_node_index + 1; i < ggml_graph_n_nodes(const_cast<ggml_cgraph *>(graph)); ++i) {
+                    if (ggml_graph_node(const_cast<ggml_cgraph *>(graph), i) == consumer) {
+                        live.consumer_nodes.push_back(i);
+                        break;
+                    }
+                }
+            }
+            snapshot->live_outputs.push_back(std::move(live));
+        }
+
+        finalized_metadata = std::move(snapshot);
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_CAPACITY;
+    }
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1600,6 +2163,327 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 //
 // llm_graph_context
 //
+
+struct llm_graph_moe_hybrid_prepared::bucket {
+    ggml_context_ptr context;
+    std::vector<ggml_tensor> tensors;
+    std::vector<const ggml_tensor *> body;
+    std::vector<const ggml_tensor *> dynamic;
+    std::vector<ggml_backend_moe_cpu_region_source_v1> sources;
+    std::vector<const ggml_tensor *> outputs;
+    ggml_backend_moe_cpu_region_query_v1 query = {};
+};
+
+llm_graph_moe_hybrid_prepared::llm_graph_moe_hybrid_prepared() : region(std::make_unique<ggml_backend_moe_hybrid_region_v1>()) {}
+llm_graph_moe_hybrid_prepared::~llm_graph_moe_hybrid_prepared() = default;
+
+const ggml_backend_moe_hybrid_region_v1 & llm_graph_moe_hybrid_prepared::descriptor() const { return *region; }
+
+int32_t llm_graph_moe_region::prepare_routed_metadata(
+        const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+        std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> & output) const try {
+    output.clear();
+    if (!finalized_metadata || !owner.generation || !n_threads) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const auto & snapshot = *finalized_metadata;
+    if (snapshot.nodes().size() != body_operations.size() || snapshot.first_node_index > snapshot.last_node_index ||
+            uint64_t(snapshot.last_node_index) - snapshot.first_node_index + 1 != snapshot.nodes().size()) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const auto origin = [&](const ggml_tensor * tensor) -> const ggml_tensor * {
+        const auto input = std::find(snapshot.inputs().begin(), snapshot.inputs().end(), tensor);
+        if (input != snapshot.inputs().end()) {
+            return static_cast<const ggml_tensor *>(snapshot.input_origins()[input - snapshot.inputs().begin()].witness);
+        }
+        const auto node = std::find(snapshot.nodes().begin(), snapshot.nodes().end(), tensor);
+        return node == snapshot.nodes().end() ? nullptr : body_operations[node - snapshot.nodes().begin()];
+    };
+    std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> pending;
+    for (size_t i = 0; i < snapshot.nodes().size(); ++i) {
+        const auto * node = snapshot.nodes()[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+        const ggml_tensor * original[] = {node->src[0], node->src[1], node->src[2], node};
+        const ggml_tensor * witnesses[] = {origin(original[0]), origin(original[1]), origin(original[2]), origin(node)};
+        if (std::any_of(std::begin(witnesses), std::end(witnesses), [](const auto * tensor) { return tensor == nullptr; })) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_MISSING_SOURCE;
+        }
+        auto metadata = std::make_unique<llm_graph_moe_hybrid_prepared>();
+        auto bucket = std::make_unique<llm_graph_moe_hybrid_prepared::bucket>();
+        bucket->tensors.resize(4);
+        for (size_t n = 0; n < 4; ++n) {
+            auto & tensor = bucket->tensors[n];
+            tensor = *original[n];
+            tensor.data = nullptr; tensor.buffer = nullptr; tensor.extra = nullptr;
+            tensor.view_src = nullptr; tensor.view_offs = 0;
+            std::fill(std::begin(tensor.src), std::end(tensor.src), nullptr);
+            if (n < 3) { tensor.op = GGML_OP_NONE; }
+        }
+        auto * weight = &bucket->tensors[0];
+        auto * activation = &bucket->tensors[1];
+        auto * ids = &bucket->tensors[2];
+        auto * projection = &bucket->tensors[3];
+        projection->src[0] = weight; projection->src[1] = activation; projection->src[2] = ids;
+        bucket->body = {projection}; bucket->dynamic = {activation, ids}; bucket->outputs = {projection};
+        bucket->sources.push_back({weight, witnesses[0], witnesses[0]->data, ggml_nbytes(witnesses[0]),
+            witnesses[0]->nb[2], owner.generation});
+        bucket->context.reset(ggml_init({ggml_graph_overhead_custom(4, false), nullptr, true}));
+        if (!bucket->context) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+        auto * graph = ggml_new_graph_custom(bucket->context.get(), 4, false);
+        ggml_backend_sched_region_handoff_v1 handoff = {};
+        handoff.struct_size = sizeof(handoff); handoff.abi_version = GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION;
+        handoff.source_graph_uid = snapshot.source_graph_uid; handoff.split_graph_uid = snapshot.split_graph_uid;
+        ggml_tensor * leafs[] = {weight, activation, ids};
+        if (!ggml_backend_sched_region_snapshot_graph_v1(graph, &handoff, &projection, 1, leafs, 3) ||
+                !ggml_backend_moe_graph_assign_uid_v1(graph)) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        auto & query = bucket->query;
+        query.struct_size = sizeof(query); query.flags = GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION;
+        query.graph = graph; query.graph_uid = ggml_backend_moe_graph_uid_v1(graph); query.graph_generation = snapshot.allocator_generation;
+        query.source_generation = owner.generation; query.body_nodes = bucket->body.data(); query.n_body_nodes = 1;
+        query.activation = activation; query.ids = ids; query.dynamic_inputs = bucket->dynamic.data(); query.n_dynamic_inputs = 2;
+        query.live_outputs = bucket->outputs.data(); query.n_live_outputs = 1;
+        query.sources = bucket->sources.data(); query.n_sources = 1;
+        if (ids->ne[0] <= 0 || ids->ne[1] <= 0 || uint64_t(ids->ne[0]) > UINT32_MAX ||
+                uint64_t(ids->ne[1]) > UINT32_MAX / uint64_t(ids->ne[0]) || weight->ne[2] <= 0 ||
+                uint64_t(weight->ne[2]) > UINT32_MAX) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+        }
+        query.bucket_rows = ids->ne[1]; query.routes_per_row = ids->ne[0]; query.source_row_capacity = ids->ne[1];
+        query.scatter_capacity = uint32_t(ids->ne[0]) * uint32_t(ids->ne[1]); query.n_lanes = 1; query.n_threads = n_threads;
+        metadata->batch_queries = {&query};
+        auto & descriptor = *metadata->region;
+        descriptor.struct_size = sizeof(descriptor); descriptor.split_index = snapshot.split_index;
+        descriptor.first_node = descriptor.last_node = snapshot.first_node_index + i;
+        descriptor.source_graph_uid = snapshot.source_graph_uid; descriptor.split_graph_uid = snapshot.split_graph_uid;
+        descriptor.owner_generation = snapshot.owner_generation; descriptor.allocator_generation = snapshot.allocator_generation;
+        descriptor.activation = witnesses[1]; descriptor.ids = witnesses[2]; descriptor.output = body_operations[i]; descriptor.down = witnesses[0];
+        descriptor.query = descriptor.body_query = &query;
+        descriptor.cpu_batch_queries = metadata->batch_queries.data(); descriptor.n_cpu_batch_queries = 1;
+        descriptor.geometry = {query.bucket_rows, query.routes_per_row, query.scatter_capacity,
+            uint32_t(weight->ne[2]), std::min(uint32_t(weight->ne[2]), query.scatter_capacity)};
+        const int32_t status = ggml_backend_moe_hybrid_validate_buckets_v1(&descriptor);
+        if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { return status; }
+        metadata->buckets.push_back(std::move(bucket));
+        pending.push_back(std::move(metadata));
+    }
+    if (pending.empty()) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION; }
+    output = std::move(pending);
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+} catch (const std::bad_alloc &) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+
+int32_t llm_graph_moe_region::prepare_hybrid_metadata(
+        const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+        std::unique_ptr<llm_graph_moe_hybrid_prepared> & output) const {
+    output.reset();
+    const auto & region = *this;
+    if (finalized_metadata == nullptr) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const auto & snapshot = *region.finalized_metadata;
+    if (snapshot.dynamic().size() != 2 || snapshot.outputs().size() != 1 ||
+            snapshot.outputs()[0].body_node + 1 != snapshot.nodes().size() || region.route == nullptr ||
+            region.route->ne[0] <= 0 || uint64_t(region.route->ne[0]) > UINT32_MAX || region.route->ne[1] <= 0 ||
+            uint64_t(region.route->ne[1]) > UINT32_MAX / uint64_t(region.route->ne[0])) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    std::vector<const ggml_tensor *> originals(snapshot.inputs());
+    originals.insert(originals.end(), snapshot.nodes().begin(), snapshot.nodes().end());
+    auto metadata = std::make_unique<llm_graph_moe_hybrid_prepared>();
+    auto & buckets = metadata->buckets;
+    auto & queries = metadata->queries;
+    auto & batch_queries = metadata->batch_queries;
+    const ggml_backend_moe_cpu_region_query_v1 * body_query = nullptr;
+    const auto add_bucket = [&](uint32_t routes_per_row, uint32_t bucket_rows, bool compact, bool original_body = false) -> int32_t {
+        auto bucket = std::make_unique<llm_graph_moe_hybrid_prepared::bucket>();
+        auto & clones = bucket->tensors;
+        clones.resize(originals.size());
+        const auto resolve = [&](const ggml_tensor * tensor) -> ggml_tensor * {
+            if (tensor == nullptr) {
+                return nullptr;
+            }
+            const auto found = std::find(originals.begin(), originals.end(), tensor);
+            return found == originals.end() ? nullptr : &clones[found - originals.begin()];
+        };
+        std::vector<ggml_tensor *> leafs;
+        std::vector<ggml_tensor *> nodes;
+        auto & body = bucket->body;
+        auto & dynamic = bucket->dynamic;
+        auto & sources = bucket->sources;
+        for (size_t i = 0; i < originals.size(); ++i) {
+            const auto * original = originals[i];
+            auto & clone = clones[i];
+            clone = *original;
+            clone.data = nullptr;
+            clone.buffer = nullptr;
+            clone.extra = nullptr;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                clone.src[s] = resolve(original->src[s]);
+            }
+            clone.view_src = resolve(original->view_src);
+            if (i < snapshot.inputs().size()) {
+                leafs.push_back(&clone);
+                if (std::find(snapshot.dynamic().begin(), snapshot.dynamic().end(), original) != snapshot.dynamic().end()) {
+                    if (original_body) { continue; }
+                    if (original == snapshot.dynamic()[1]) {
+                        clone.ne[0] = routes_per_row;
+                        clone.ne[1] = bucket_rows;
+                        clone.ne[2] = clone.ne[3] = 1;
+                    } else {
+                        clone.ne[1] = 1;
+                        clone.ne[2] = bucket_rows;
+                        clone.ne[3] = 1;
+                    }
+                    clone.nb[1] = ggml_row_size(clone.type, clone.ne[0]);
+                    if (clone.nb[1] > SIZE_MAX / size_t(clone.ne[1]) ||
+                            clone.nb[1] * size_t(clone.ne[1]) > SIZE_MAX / size_t(clone.ne[2])) {
+                        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+                    }
+                    clone.nb[2] = clone.nb[1] * clone.ne[1];
+                    clone.nb[3] = clone.nb[2] * clone.ne[2];
+                } else {
+                    const auto * witness = static_cast<const ggml_tensor *>(snapshot.input_origins()[i].witness);
+                    if (witness == nullptr || witness->data == nullptr) {
+                        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_MISSING_SOURCE;
+                    }
+                    sources.push_back({&clone, witness, witness->data, ggml_nbytes(witness), witness->nb[2], owner.generation});
+                }
+            } else {
+                if (!original_body) {
+                    clone.ne[1] = routes_per_row;
+                    clone.ne[2] = bucket_rows;
+                    clone.ne[3] = 1;
+                    clone.nb[1] = clone.op == GGML_OP_VIEW ? original->nb[1] : ggml_row_size(clone.type, clone.ne[0]);
+                    if (clone.nb[1] > SIZE_MAX / size_t(routes_per_row) ||
+                            clone.nb[1] * size_t(routes_per_row) > SIZE_MAX / size_t(bucket_rows)) {
+                        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+                    }
+                    clone.nb[2] = clone.nb[1] * routes_per_row;
+                    clone.nb[3] = clone.nb[2] * bucket_rows;
+                }
+                nodes.push_back(&clone);
+                body.push_back(&clone);
+            }
+        }
+        for (const auto * tensor : snapshot.dynamic()) {
+            dynamic.push_back(resolve(tensor));
+        }
+        for (const auto & live : snapshot.outputs()) { bucket->outputs.push_back(body[live.body_node]); }
+        const size_t graph_capacity = nodes.size() + leafs.size();
+        bucket->context.reset(ggml_init({ggml_graph_overhead_custom(graph_capacity, false), nullptr, true}));
+        if (bucket->context == nullptr) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+        }
+        auto * graph = ggml_new_graph_custom(bucket->context.get(), graph_capacity, false);
+        ggml_backend_sched_region_handoff_v1 handoff = {};
+        handoff.struct_size = sizeof(handoff);
+        handoff.abi_version = GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION;
+        handoff.source_graph_uid = snapshot.source_graph_uid;
+        handoff.split_graph_uid = snapshot.split_graph_uid;
+        if (!ggml_backend_sched_region_snapshot_graph_v1(
+                graph, &handoff, nodes.data(), nodes.size(), leafs.data(), leafs.size())) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        if (!ggml_backend_moe_graph_assign_uid_v1(graph)) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+        }
+        auto & query = bucket->query;
+        query.struct_size = sizeof(query);
+        query.flags = compact ? GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_COMPACT_ROUTES :
+                                GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_NONE;
+        query.graph = graph;
+        query.graph_uid = ggml_backend_moe_graph_uid_v1(graph);
+        query.graph_generation = snapshot.allocator_generation;
+        query.source_generation = owner.generation;
+        query.body_nodes = body.data();
+        query.n_body_nodes = body.size();
+        query.activation = dynamic[0];
+        query.ids = dynamic[1];
+        query.dynamic_inputs = dynamic.data();
+        query.n_dynamic_inputs = dynamic.size();
+        query.live_outputs = bucket->outputs.data();
+        query.n_live_outputs = bucket->outputs.size();
+        query.sources = sources.data();
+        query.n_sources = sources.size();
+        query.bucket_rows = bucket_rows;
+        query.n_lanes = 1;
+        query.source_row_capacity = region.route->ne[1];
+        query.routes_per_row = routes_per_row;
+        query.scatter_capacity = region.route->ne[0] * region.route->ne[1];
+        query.n_threads = n_threads;
+        if (original_body) {
+            body_query = &query;
+        } else if (compact) {
+            batch_queries.push_back(&query);
+        } else {
+            queries.push_back(&query);
+        }
+        buckets.push_back(std::move(bucket));
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+    };
+    const int32_t body_status = add_bucket(region.route->ne[0], region.route->ne[1], false, true);
+    if (body_status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { return body_status; }
+    for (uint32_t count = 1; count <= uint32_t(region.route->ne[0]); ++count) {
+        const int32_t status = add_bucket(count, 1, false);
+        if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+            return status;
+        }
+    }
+    const uint32_t route_capacity = uint32_t(region.route->ne[0]) * uint32_t(region.route->ne[1]);
+    const int32_t batch_status = add_bucket(1, route_capacity, true);
+    if (batch_status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        return batch_status;
+    }
+    const auto origin = [&](const ggml_tensor * tensor) {
+        const auto it = std::find(snapshot.inputs().begin(), snapshot.inputs().end(), tensor);
+        return it == snapshot.inputs().end() ? nullptr :
+            static_cast<const ggml_tensor *>(snapshot.input_origins()[it - snapshot.inputs().begin()].witness);
+    };
+    auto & prepared = *metadata->region;
+    prepared.struct_size = sizeof(prepared);
+    prepared.split_index = snapshot.split_index;
+    prepared.first_node = snapshot.first_node_index;
+    prepared.last_node = snapshot.last_node_index;
+    prepared.source_graph_uid = snapshot.source_graph_uid;
+    prepared.split_graph_uid = snapshot.split_graph_uid;
+    prepared.owner_generation = snapshot.owner_generation;
+    prepared.allocator_generation = snapshot.allocator_generation;
+    prepared.activation = origin(snapshot.dynamic()[0]);
+    prepared.ids = origin(snapshot.dynamic()[1]);
+    prepared.output = region.body_output;
+    prepared.down = region.down;
+    prepared.query = queries[0];
+    prepared.body_query = body_query;
+    prepared.cpu_queries = queries.data();
+    prepared.n_cpu_queries = queries.size();
+    prepared.cpu_batch_queries = batch_queries.data();
+    prepared.n_cpu_batch_queries = batch_queries.size();
+    const auto * expert_weight = region.down;
+    if (expert_weight == nullptr || expert_weight->ne[2] <= 0 || uint64_t(expert_weight->ne[2]) > UINT32_MAX ||
+            ggml_backend_moe_hybrid_get_geometry_v1(prepared.activation, prepared.ids, prepared.output,
+                expert_weight->ne[2], &prepared.geometry) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK ||
+            ggml_backend_moe_hybrid_validate_buckets_v1(&prepared) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    output = std::move(metadata);
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+}
+
+int32_t llm_graph_moe_region::prepare_hybrid(
+        ggml_backend_sched_t sched, const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+        const ggml_graph_execution_certificate * certificate) const {
+    std::unique_ptr<llm_graph_moe_hybrid_prepared> prepared;
+    const int32_t status = prepare_hybrid_metadata(owner, n_threads, prepared);
+    if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { return status; }
+    auto descriptor = prepared->descriptor();
+    if (certificate != nullptr) {
+        descriptor.certificate = *certificate;
+        descriptor.certificate.source_graph_uid = descriptor.source_graph_uid;
+        descriptor.certificate.split_graph_uid = descriptor.split_graph_uid;
+    }
+    return ggml_backend_sched_moe_hybrid_prepare_v1(sched, &descriptor);
+}
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
@@ -1705,8 +2589,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor ** mm_id) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    if (mm_id) {
+        *mm_id = res;
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2335,6 +3223,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
+    ggml_tensor * expert_input = cur;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
@@ -2471,7 +3360,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    ggml_tensor * body_output = nullptr;
+    experts                   = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s,
+                                                 &body_output);  // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -2525,7 +3416,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cb(moe_out, "ffn_moe_out", il);
 
-    res->add_moe_region(il, down_exps, selected_experts, ffn_input, moe_out, selected_experts_in != nullptr);
+    ggml_tensor * tail_resume = ggml_get_next_tensor(ctx0, body_output);
+    res->add_moe_region(il, down_exps, selected_experts, ffn_input, body_output, tail_resume, moe_out,
+                        { expert_input, selected_experts }, loras && !loras->empty(), selected_experts_in != nullptr);
 
     return moe_out;
 }
@@ -3997,7 +4890,6 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
-    res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
@@ -4082,6 +4974,11 @@ void llm_graph_context::build_sampling() const {
             }
         }
     }
+
+    for (const auto & [seq_id, sampler] : samplers) {
+        inp_sampling->inputs.emplace(seq_id, llama_sampler_backend_prepare_inputs(sampler));
+    }
+    res->add_input(std::move(inp_sampling));
 
     // TODO: Call backend_accept after all samplers have been applied.
     /*

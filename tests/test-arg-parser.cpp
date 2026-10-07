@@ -223,6 +223,30 @@ static void test(void) {
     assert(params.n_batch == 9090);
 
     params = common_params();
+    argv = {"binary_name", "--moe-expert-profile", "target.gguf", "--moe-profile-adapt", "occurrence",
+        "--spec-draft-moe-expert-profile", "draft.gguf", "--spec-draft-moe-profile-adapt", "occurrence-sync", "-md", "model.gguf"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.moe_expert_profile == "target.gguf" && params.moe_profile_adaptation == "occurrence");
+    auto draft_params = common_base_params_to_speculative(params);
+    assert(draft_params.moe_expert_profile == "draft.gguf" && draft_params.moe_profile_adaptation == "occurrence-sync");
+    params.speculative.draft.moe_expert_profile.clear();
+    params.speculative.draft.moe_profile_adaptation = "off";
+    draft_params = common_base_params_to_speculative(params);
+    assert(draft_params.moe_expert_profile.empty() && draft_params.moe_profile_adaptation == "off");
+    params.speculative.draft.mparams.path.clear();
+    draft_params = common_base_params_to_speculative(params);
+    assert(draft_params.moe_expert_profile.empty());
+    params.speculative.draft.moe_expert_profile = "mtp.gguf";
+    draft_params = common_base_params_to_speculative(params);
+    assert(draft_params.moe_expert_profile == "mtp.gguf");
+    for (const char * option : {"--moe-profile-adapt", "--spec-draft-moe-profile-adapt"}) {
+        params = common_params();
+        argv = {"binary_name", option, "invalid"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        argv = {"binary_name", option, "occurrence"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
     assert(params.fit_moe_report == 1);
@@ -274,6 +298,18 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "-ubd", "16"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_ubatch == 16);
+    {
+        common_params chain_params;
+        auto test_args = [&](std::vector<std::string> arguments, common_params & result) {
+            arguments.insert(arguments.begin(), "binary_name");
+            return common_params_parse(arguments.size(), list_str_to_char(arguments).data(), result, LLAMA_EXAMPLE_SERVER);
+        };
+        assert(test_args({"--spec-type", "draft-mtp", "--spec-lookup-chain", "6", "--spec-lookup-chain-min", "4"}, chain_params));
+        assert(chain_params.speculative.lookup_chain == 6 && chain_params.speculative.lookup_chain_min == 4);
+        assert(!test_args({"--spec-lookup-chain", "-1"}, chain_params));
+        assert(!test_args({"--spec-lookup-chain-min", "2"}, chain_params));
+    }
+
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "-1"};
@@ -605,6 +641,32 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
         assert(phase_params.phase_aware_workspace);
         unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+    }
+
+    {
+        unset_test_env("GGML_MOE_SOURCE_GRAPH_CAPACITY");
+        unset_test_env("LLAMA_ARG_MOE_SOURCE_GRAPH_CAPACITY");
+        common_params capacity_params;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), capacity_params, LLAMA_EXAMPLE_SERVER));
+        assert(!common_context_params_to_llama(capacity_params).moe_source_graph_capacity);
+        assert(!llama_context_default_params().moe_source_graph_capacity);
+
+        argv = {"binary_name", "--moe-source-graph-capacity"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), capacity_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_context_params_to_llama(capacity_params).moe_source_graph_capacity);
+
+        set_test_env("GGML_MOE_SOURCE_GRAPH_CAPACITY", "1");
+        capacity_params = common_params();
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), capacity_params, LLAMA_EXAMPLE_SERVER));
+        assert(common_context_params_to_llama(capacity_params).moe_source_graph_capacity);
+
+        capacity_params = common_params();
+        argv = {"binary_name", "--no-moe-source-graph-capacity"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), capacity_params, LLAMA_EXAMPLE_SERVER));
+        assert(!common_context_params_to_llama(capacity_params).moe_source_graph_capacity);
+        unset_test_env("GGML_MOE_SOURCE_GRAPH_CAPACITY");
     }
 
     {

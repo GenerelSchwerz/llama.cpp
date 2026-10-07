@@ -1374,6 +1374,12 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
         grouped_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_K,
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, b5_rows, n_experts, n_used, 256, &grouped_primary);
 
+    // The reference projections are observed even when ordinary graph fusion is available.
+    for (auto * graph : {&direct_primary, &direct_b5}) {
+        ggml_set_output(graph->gate_output);
+        ggml_set_output(graph->up_output);
+    }
+
     std::vector<std::vector<uint8_t>> bank_data;
     bank_data.reserve(direct_primary.banks.size());
     for (uint32_t bank = 0; bank < direct_primary.banks.size(); ++bank) {
@@ -1554,14 +1560,10 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
         ++total_passes;
         set_active_grouped_dispatch_routes(
             std::vector<active_grouped_dispatch_graph *>(graphs.begin(), graphs.end()), routes);
-        const auto direct_capability = native_mmid_capability(
-            device, graphs[0]->banks[0], graphs[0]->n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
-        const bool direct_f3_skipped = direct_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
-            direct_capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
         const bool grouped_f3_skipped = graphs[2]->n_rows == primary_rows ?
             primary_native.selection == GGML_CUDA_MMID_CONSUMER_MMVQ :
             b5_native.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
-        const auto direct = run_graph(direct_backend.get(), *graphs[0], 0, direct_f3_skipped);
+        const auto direct = run_graph(direct_backend.get(), *graphs[0], 0, false);
         const auto legacy = run_graph(legacy_backend.get(), *graphs[1], 0, false);
         const auto grouped = run_graph(grouped_backend.get(), *graphs[2], host.clock, grouped_f3_skipped);
         check_values(direct, legacy);
@@ -2209,6 +2211,8 @@ static void test_active_grouped_bounded_prefill_waves(int device) {
     CHECK(telemetry.prefill_bounded_ops == candidate.banks.size());
     CHECK(telemetry.prefill_bounded_waves > telemetry.prefill_bounded_ops);
     CHECK(telemetry.prefill_staging_bytes == 2 * lane_bytes);
+    CHECK(telemetry.occupancy_unavailable == 0 && telemetry.populated_slots == 8 && telemetry.slot_capacity == 8);
+    CHECK(telemetry.populated_payload_bytes == telemetry.payload_capacity_bytes);
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, "test-moe-cache: bounded grouped prefill multiwave numerical parity OK\n");

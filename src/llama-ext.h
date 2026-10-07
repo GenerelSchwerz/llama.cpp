@@ -196,6 +196,18 @@ struct llama_sampled_decode_item {
 LLAMA_API int32_t llama_decode_sampled_batch_async(
         struct llama_context * ctx, const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
 
+struct llama_sampled_output_view {
+    const float * probs = nullptr;
+    const float * logits = nullptr;
+    const llama_token * candidates = nullptr;
+    uint32_t probs_count = 0;
+    uint32_t logits_count = 0;
+};
+
+// Read sampling fields after one full synchronization. Pointers follow the ordinary getter lifetime.
+// Returns false without reading outputs unless source execution is selected.
+LLAMA_API bool llama_get_sampled_output_view(struct llama_context * ctx, int32_t i, llama_sampled_output_view * view);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
@@ -284,6 +296,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Experimental opt-in policy. Configure once before the MTP context's first decode.
+LLAMA_API bool llama_set_mtp_draft_vocab(struct llama_context * ctx, const char * path);
+// Write a model-bound GGUF sidecar. Every end-of-generation token must be selected.
+LLAMA_API bool llama_write_mtp_draft_vocab(const struct llama_model * model, const int32_t * ids, size_t count, const char * path);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -326,3 +343,10 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Initialize opt-in GPU cache placement after synchronized prefill, before generation.
+LLAMA_API bool llama_moe_profile_initialize(struct llama_context * ctx);
+
+// Explicit profile selection overrides global profile settings and is copied during construction.
+extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_profile(
+        struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation);

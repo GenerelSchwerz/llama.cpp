@@ -1154,7 +1154,219 @@ static void test_grouped_clock_maintenance(int device) {
     fprintf(stderr, "test-moe-cache: grouped clock maintenance OK\n");
 }
 
+static void test_hybrid_selection(int device) {
+    CUDA_OK(cudaSetDevice(device));
+    const auto make_state = [](uint32_t n_slots) {
+        ggml_cuda_moe_hybrid_selection_test_state state;
+        const uint32_t n_experts = n_slots + 8;
+        state.slot_for_expert.assign(n_experts, -1);
+        state.expert_for_slot.resize(n_slots);
+        for (uint32_t slot = 0; slot < n_slots; ++slot) {
+            state.slot_for_expert[slot] = state.expert_for_slot[slot] = slot;
+        }
+        state.last_used.assign(n_slots, 100);
+        state.frequency.assign(n_experts, 5);
+        state.frequency_epoch.assign(n_experts, 0);
+        state.clock = 10000;
+        state.quota = 3;
+        state.ids = {0, int32_t(n_slots), int32_t(n_slots), int32_t(n_slots - 1), int32_t(n_slots + 1), int32_t(n_slots + 2)};
+        return state;
+    };
+    const auto run = [](ggml_cuda_moe_hybrid_selection_test_state state, const std::vector<int32_t> & admitted_slots) {
+        const auto before = state;
+        CHECK(ggml_cuda_moe_hybrid_select_for_test(state));
+        CHECK(state.selection.status == 0 && state.selection.admissions == admitted_slots.size());
+        CHECK(state.admitted_slots == admitted_slots);
+        CHECK(state.slot_for_expert == before.slot_for_expert && state.expert_for_slot == before.expert_for_slot);
+        CHECK(state.step == before.step + 1);
+        CHECK(state.clock == before.clock + (before.device_clock ? before.ids.size() : 0));
+        std::vector<int32_t> expected_slots, expected_residents, expected_experts, expected_ranks;
+        uint32_t replacements = 0;
+        std::unordered_set<int32_t> seen;
+        for (size_t rank = 0; rank < before.ids.size(); ++rank) {
+            const int32_t expert = before.ids[rank];
+            const bool first = seen.insert(expert).second;
+            int32_t slot = before.slot_for_expert[expert];
+            if (first && slot >= 0) {
+                expected_residents.push_back(slot);
+                CHECK(state.last_used[slot] == before.clock + rank + 1);
+            } else if (first && slot < 0 && expected_experts.size() < admitted_slots.size()) {
+                const int32_t admitted = admitted_slots[expected_experts.size()];
+                replacements += before.expert_for_slot[admitted] >= 0;
+                expected_experts.push_back(expert);
+                expected_ranks.push_back(rank);
+            }
+            const auto found = std::find(expected_experts.begin(), expected_experts.end(), expert);
+            if (found != expected_experts.end()) {
+                slot = -2 - admitted_slots[found - expected_experts.begin()];
+            }
+            expected_slots.push_back(slot);
+        }
+        CHECK(state.selection.replacements == replacements);
+        CHECK(state.selection.resident_count == expected_residents.size());
+        expected_residents.resize(before.ids.size(), -1);
+        CHECK(state.slots == expected_slots && state.residents == expected_residents);
+        CHECK(state.admitted_experts == expected_experts && state.admitted_ranks == expected_ranks);
+        for (size_t expert = 0; expert < before.frequency.size(); ++expert) {
+            if (seen.count(expert) != 0) {
+                const uint64_t epoch = before.step >> 4;
+                const uint64_t elapsed = epoch - before.frequency_epoch[expert];
+                const uint32_t old = elapsed < 32 ? before.frequency[expert] >> elapsed : 0;
+                CHECK(state.frequency[expert] == (old == UINT32_MAX ? old : old + 1));
+                CHECK(state.frequency_epoch[expert] == epoch);
+            } else {
+                CHECK(state.frequency[expert] == before.frequency[expert]);
+                CHECK(state.frequency_epoch[expert] == before.frequency_epoch[expert]);
+            }
+        }
+        if (before.expert_for_slot.size() >= before.ids.size()) {
+            auto compact = before;
+            compact.direct_gather = true;
+            CHECK(ggml_cuda_moe_hybrid_select_for_test(compact));
+            CHECK(compact.selection.status == state.selection.status && compact.selection.admissions == state.selection.admissions &&
+                compact.selection.replacements == state.selection.replacements && compact.selection.resident_count == state.selection.resident_count);
+            CHECK(compact.slots == state.slots && compact.residents == state.residents &&
+                compact.admitted_experts == state.admitted_experts && compact.admitted_slots == state.admitted_slots &&
+                compact.admitted_ranks == state.admitted_ranks && compact.slot_for_expert == state.slot_for_expert &&
+                compact.expert_for_slot == state.expert_for_slot && compact.last_used == state.last_used &&
+                compact.frequency == state.frequency && compact.frequency_epoch == state.frequency_epoch &&
+                compact.step == state.step && compact.clock == state.clock);
+        }
+    };
+    for (const uint32_t n_slots : {7u, 31u, 32u, 33u, 63u, 64u, 65u, 96u, 128u, 129u, 257u}) {
+        auto state = make_state(n_slots);
+        const int32_t middle = n_slots / 2, last = n_slots - 2;
+        state.frequency[middle] = state.frequency[last] = 0;
+        state.last_used[middle] = state.last_used[last] = 50;
+        state.last_used[1] = 10;
+        run(state, {middle, last, 1});
+        state.quota = 1;
+        run(state, {middle});
+        state.quota = 0;
+        run(state, {});
+        state.quota = 32;
+        state.frequency_aware = false;
+        state.device_clock = false;
+        run(state, {1, middle, last});
+    }
+    run(make_state(1), {});
+    auto state = make_state(7);
+    state.ids = {0, 1, 2, 3, 4, 5, 6, 7, 8, 7};
+    run(state, {});
+    state = make_state(96);
+    state.ids = {96, 97, 98};
+    for (int32_t slot : {7, 95}) {
+        state.slot_for_expert[slot] = state.expert_for_slot[slot] = -1;
+        state.last_used[slot] = 0;
+    }
+    run(state, {7, 95, 0});
+    state = make_state(96);
+    state.step = 64;
+    state.frequency_epoch.assign(state.frequency_epoch.size(), 4);
+    state.frequency[94] = 8;
+    state.frequency_epoch[94] = 2;
+    state.frequency[48] = 2;
+    state.frequency[96] = UINT32_MAX;
+    run(state, {48, 94, 1});
+    for (uint32_t failure = 0; failure < 9; ++failure) {
+        state = make_state(257);
+        switch (failure) {
+            case 0: state.ids[1] = -1; break;
+            case 1: state.ids[1] = state.slot_for_expert.size(); break;
+            case 2: state.slot_for_expert[0] = state.expert_for_slot.size(); break;
+            case 3: state.expert_for_slot[255] = state.slot_for_expert.size(); break;
+            case 4: state.slot_for_expert[255] = 1; break;
+            case 5: state.frequency_epoch[255] = 1; break;
+            case 6: state.frequency_epoch[0] = 1; break;
+            case 7: state.step = UINT64_MAX; break;
+            case 8: state.clock = UINT64_MAX; break;
+        }
+        const auto before = state;
+        CHECK(ggml_cuda_moe_hybrid_select_for_test(state));
+        CHECK(state.selection.status != 0);
+        CHECK(state.slot_for_expert == before.slot_for_expert && state.expert_for_slot == before.expert_for_slot);
+    }
+    for (bool combined : {false, true}) {
+        for (uint32_t quota : {0u, 1u, 3u}) {
+            state = make_state(96);
+            state.packet_enabled = true;
+            state.combine_gpu = combined && ggml_cuda_moe_hybrid_can_combine_gpu(true, true, state.expert_for_slot.size(), state.ids.size());
+            state.direct_gather = combined;
+            CHECK(state.combine_gpu == combined);
+            state.packet_epoch = 77;
+            state.gpu_miss_quota = state.quota = quota;
+            CHECK(ggml_cuda_moe_hybrid_select_for_test(state));
+            CHECK(state.selection.status == 0 && state.selection.epoch == 77 && state.selection.route_count == 6);
+            CHECK(state.selection.resident_count == 2 && state.selection.transfer_count == quota &&
+                  state.selection.cpu_count == 3 - quota && state.selection.distinct_count == 5 && state.selection.gpu_count == 2 + quota);
+            const int32_t * classes = state.packet_values.data() + state.ids.size() * 7;
+            const int32_t * rows = state.packet_values.data() + state.ids.size() * 8;
+            const std::vector<int32_t> expected_classes = quota == 0 ? std::vector<int32_t>{0, 2, 2, 0, 2, 2} :
+                quota == 1 ? std::vector<int32_t>{0, 1, 1, 0, 2, 2} : std::vector<int32_t>{0, 1, 1, 0, 1, 1};
+            const std::vector<int32_t> expected_rows = quota == 0 ? std::vector<int32_t>{0, 1, 1, 1, 4, 5} :
+                quota == 1 ? std::vector<int32_t>{0, 0, 0, 1, 4, 5} : std::vector<int32_t>{0, 0, 0, 1, 1, 2};
+            CHECK(std::equal(expected_classes.begin(), expected_classes.end(), classes));
+            CHECK(std::equal(expected_rows.begin(), expected_rows.end(), rows));
+            for (uint32_t row = 0; row < quota; ++row) {
+                CHECK(state.packet_values[state.ids.size() * 2 + row] == int32_t(96 + row));
+                CHECK(state.packet_values[state.ids.size() * 3 + row] == int32_t(row));
+                CHECK(state.packet_values[state.ids.size() * 4 + row] == int32_t(1 + row));
+                if (combined) {
+                    CHECK(state.residents[state.selection.resident_count + row] == int32_t(1 + row));
+                }
+            }
+        }
+    }
+    state = make_state(1);
+    state.packet_enabled = true;
+    state.gpu_miss_quota = state.quota;
+    state.combine_gpu = ggml_cuda_moe_hybrid_can_combine_gpu(true, true, state.expert_for_slot.size(), state.ids.size());
+    CHECK(!state.combine_gpu);
+    const auto full = state;
+    CHECK(ggml_cuda_moe_hybrid_select_for_test(state));
+    CHECK(state.selection.status == 0 && state.selection.admissions == 0 && state.selection.transfer_count == 3 &&
+          state.selection.resident_count == 1 && state.selection.gpu_count == 4 && state.admitted_slots.empty());
+    CHECK(state.slot_for_expert == full.slot_for_expert && state.expert_for_slot == full.expert_for_slot);
+    for (uint32_t row = 0; row < state.selection.transfer_count; ++row) {
+        CHECK(state.packet_values[state.ids.size() * 4 + row] == -1);
+    }
+    for (uint32_t failure : {0u, 1u}) {
+        state = make_state(7);
+        state.packet_enabled = state.combine_gpu = state.direct_gather = true;
+        state.gpu_miss_quota = state.quota;
+        state.gather_status = failure;
+        for (size_t words : {7u, 17u, 9u}) {
+            std::vector<uint8_t> source(state.slot_for_expert.size() * words * 16);
+            for (size_t byte = 0; byte < source.size(); ++byte) {
+                source[byte] = uint8_t(byte * 13 + words);
+            }
+            state.gather_sources.push_back(std::move(source));
+        }
+        CHECK(ggml_cuda_moe_hybrid_select_for_test(state) && state.gather_status == failure);
+        CHECK(state.admitted_experts.size() == 3 && state.gather_outputs.size() == state.gather_sources.size());
+        for (size_t bank = 0; bank < state.gather_outputs.size(); ++bank) {
+            const auto & source = state.gather_sources[bank];
+            const size_t stride = source.size() / state.slot_for_expert.size();
+            std::vector<uint8_t> expected(state.expert_for_slot.size() * stride, 0xa5);
+            for (size_t miss = 0; miss < state.admitted_experts.size(); ++miss) {
+                const int32_t expert = state.admitted_experts[miss], slot = state.admitted_slots[miss];
+                CHECK(state.slot_for_expert[expert] == -1 && state.expert_for_slot[slot] == -1);
+                if (failure == 0) {
+                    memcpy(expected.data() + size_t(slot) * stride, source.data() + size_t(expert) * stride, stride);
+                }
+            }
+            CHECK(state.gather_outputs[bank] == expected);
+        }
+    }
+    state = make_state(96);
+    state.packet_enabled = true;
+    state.packet_epoch = 0;
+    CHECK(ggml_cuda_moe_hybrid_select_for_test(state) && state.selection.status != 0);
+    fprintf(stderr, "test-moe-cache: hybrid cooperative selection ordering and rejection OK\n");
+}
+
 void test_grouped_decode(int device) {
+    test_hybrid_selection(device);
     test_grouped_decode_independent_rows(device);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);

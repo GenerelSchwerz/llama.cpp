@@ -189,7 +189,7 @@ public:
     //
 
     bool next()  override;
-    bool apply() override;
+    bool apply(bool graph_reserve = false) override;
 
     //
     // llama_memory_hybrid_idx_context specific API
@@ -214,6 +214,7 @@ public:
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
+    uint32_t n_pool_graph = 0;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

@@ -1,5 +1,7 @@
 #include "llama-memory.h"
 
+#include <algorithm>
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 
@@ -56,4 +58,13 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
     }
 
     return false;
+}
+
+uint32_t llama_memory_graph_extent(uint32_t required, uint32_t capacity, uint32_t padding) {
+    GGML_ASSERT(capacity > 0 && padding > 0 && required <= capacity);
+    uint32_t extent = std::min(padding, capacity);
+    while (extent < required) {
+        extent = uint32_t(std::min<uint64_t>(capacity, uint64_t(extent) * 2));
+    }
+    return extent;
 }

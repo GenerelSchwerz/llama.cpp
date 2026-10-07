@@ -274,13 +274,13 @@ bool llama_memory_hybrid_iswa_context::next() {
     return true;
 }
 
-bool llama_memory_hybrid_iswa_context::apply() {
+bool llama_memory_hybrid_iswa_context::apply(bool graph_reserve) {
     assert(!llama_memory_status_is_fail(status));
 
     bool res = true;
 
-    res = res & ctx_attn->apply();
-    res = res & ctx_recr->apply();
+    res = res & ctx_attn->apply(graph_reserve);
+    res = res & ctx_recr->apply(graph_reserve);
 
     return res;
 }

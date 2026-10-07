@@ -1,5 +1,8 @@
 #include "ggml.h"
 #include "llama.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
+#include "../src/llama-sampler.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -8,6 +11,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -89,6 +95,134 @@ static void test_dist_singleton_rng() {
 
     llama_sampler_free(singleton);
     llama_sampler_free(control);
+}
+
+struct sampler_input_graph {
+    ggml_context * ctx;
+    ggml_backend_buffer_t buffer;
+    llama_sampler_backend_inputs inputs;
+    std::vector<ggml_tensor *> uniforms;
+
+    sampler_input_graph(llama_sampler * sampler, int rows, ggml_backend_t backend) {
+        ctx = ggml_init({ 1024 * 1024, nullptr, true });
+        GGML_ASSERT(ctx);
+        auto * graph = ggml_new_graph(ctx);
+        if (sampler->iface->backend_reset) {
+            sampler->iface->backend_reset(sampler);
+        }
+        for (int row = 0; row < rows; ++row) {
+            llama_sampler_data data = { ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16), nullptr, nullptr, nullptr };
+            sampler->iface->backend_apply(sampler, ctx, graph, &data);
+        }
+        inputs = llama_sampler_backend_prepare_inputs(sampler);
+        GGML_ASSERT(inputs.can_reuse());
+        buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        GGML_ASSERT(buffer);
+        ggml_backend_buffer_clear(buffer, 0);
+        for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (std::strncmp(tensor->name, "uniform_", 8) == 0) {
+                uniforms.push_back(tensor);
+            }
+        }
+    }
+
+    ~sampler_input_graph() {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+
+    std::vector<float> randoms() const {
+        std::vector<float> result(uniforms.size());
+        for (size_t i = 0; i < uniforms.size(); ++i) {
+            ggml_backend_tensor_get(uniforms[i], &result[i], 0, sizeof(float));
+        }
+        return result;
+    }
+};
+
+static void test_backend_retained_inputs() {
+    auto * backend = ggml_backend_cpu_init();
+    GGML_ASSERT(backend);
+    auto * buft = ggml_backend_get_default_buffer_type(backend);
+    {
+        auto * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        auto * inner = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        const llama_logit_bias biases[] = { { 3, 1.25f }, { 7, -2.0f } };
+        llama_sampler_chain_add(inner, llama_sampler_init_logit_bias(16, 2, biases));
+        llama_sampler_chain_add(inner, llama_sampler_init_dist(4242));
+        llama_sampler_chain_add(sampler, inner);
+        GGML_ASSERT(sampler->iface->backend_init(sampler, buft, 4));
+        {
+            std::vector<std::unique_ptr<sampler_input_graph>> graphs;
+            for (int rows : { 4, 2, 1 }) {
+                graphs.emplace_back(new sampler_input_graph(sampler, rows, backend));
+            }
+            std::mt19937 rng(4242);
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            for (int active : { 0, 1, 2, 0, 2, 1, 0 }) {
+                std::vector<std::vector<float>> previous;
+                for (const auto & graph : graphs) {
+                    previous.push_back(graph->randoms());
+                }
+                llama_sampler_backend_begin(sampler);
+                graphs[active]->inputs.set_input();
+                auto expected_rng = rng;
+                for (float value : graphs[active]->randoms()) {
+                    GGML_ASSERT(value == (float) dist(expected_rng));
+                }
+                for (int other = 0; other < (int) graphs.size(); ++other) {
+                    if (other != active) {
+                        GGML_ASSERT(previous[other] == graphs[other]->randoms());
+                    }
+                }
+                auto * bias = ggml_get_tensor(graphs[active]->ctx, "logit_bias");
+                auto * indices = ggml_get_tensor(graphs[active]->ctx, "logit_idxs");
+                float values[2];
+                int32_t ids[2];
+                ggml_backend_tensor_get(bias, values, 0, sizeof(values));
+                ggml_backend_tensor_get(indices, ids, 0, sizeof(ids));
+                GGML_ASSERT(values[0] == 1.25f && values[1] == -2.0f && ids[0] == 3 && ids[1] == 7);
+                auto * saved = llama_sampler_clone(sampler);
+                llama_sampler_accept(sampler, 3);
+                llama_sampler_copy(saved, sampler);
+                llama_sampler_free(saved);
+                // Commit one row; unused draws and the restored accept must not advance the next replay.
+                llama_sampler_accept(sampler, 3);
+                dist(rng);
+            }
+            llama_sampler_free(llama_sampler_chain_remove(inner, 0));
+            GGML_ASSERT(!graphs[0]->inputs.can_reuse());
+            llama_sampler_free(llama_sampler_chain_remove(sampler, 0));
+            GGML_ASSERT(!graphs[0]->inputs.can_reuse());
+        }
+        llama_sampler_free(sampler);
+    }
+    {
+        auto * sampler = llama_sampler_init_penalties(16, 4, 1.1f, 0.2f, 0.1f);
+        GGML_ASSERT(sampler->iface->backend_init(sampler, buft, 1));
+        {
+            sampler_input_graph first(sampler, 1, backend);
+            sampler_input_graph second(sampler, 1, backend);
+            int32_t accepted = 0;
+            for (auto * graph : { &first, &second, &first }) {
+                llama_sampler_accept(sampler, 3);
+                graph->inputs.set_input();
+                int32_t ids[4], counts[4];
+                ggml_backend_tensor_get(ggml_get_tensor(graph->ctx, "penalties_token_ids"), ids, 0, sizeof(ids));
+                ggml_backend_tensor_get(ggml_get_tensor(graph->ctx, "penalties_counts"), counts, 0, sizeof(counts));
+                GGML_ASSERT(ids[0] == 3 && counts[0] == ++accepted);
+                for (int i = 1; i < 4; ++i) {
+                    GGML_ASSERT(counts[i] == 0);
+                }
+            }
+        }
+        llama_sampler_free(sampler);
+    }
+    llama_sampler_i custom_iface = {};
+    custom_iface.backend_set_input = [](llama_sampler *) {};
+    llama_sampler custom = { &custom_iface, nullptr };
+    GGML_ASSERT(!llama_sampler_backend_prepare_inputs(&custom).can_reuse());
+    ggml_backend_free(backend);
 }
 
 static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
@@ -361,6 +495,7 @@ int main(void) {
     ggml_time_init();
 
     test_dist_singleton_rng();
+    test_backend_retained_inputs();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

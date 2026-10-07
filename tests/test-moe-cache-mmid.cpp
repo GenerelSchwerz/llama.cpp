@@ -1,4 +1,151 @@
 #include "test-moe-cache.h"
+#include "ggml-cuda/quantize.cuh"
+
+void test_mmid_route_maps(bool benchmark) {
+    ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+    CHECK(backend != nullptr);
+    cudaStream_t stream;
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const int shapes[][3] = {{8, 2, 32}, {128, 6, 512}, {128, 8, 2048}, {512, 10, 4}, {512, 10, 32}, {512, 10, 512}, {128, 3, 512}, {128, 65, 33}};
+    auto run = [&](int experts, int used, int tokens, int channels, int pattern, bool inverse, bool timing, int ids_stride = -1, int input_stride = -1) {
+        const int stride_ids = ids_stride < 0 ? used + 3 : ids_stride;
+        const int stride_input = input_stride < 0 ? channels + 2 : input_stride;
+        const int routes = tokens*used;
+        constexpr int guard = 16;
+        constexpr int32_t sentinel = -717171;
+        std::vector<int32_t> ids((tokens - 1)*stride_ids + used, sentinel);
+        auto fill_ids = [&](int shift) {
+            for (int row = 0; row < tokens; ++row) {
+                for (int col = 0; col < used; ++col) {
+                    ids[row*stride_ids + col] = (row*7 + (pattern == 0 ? col : pattern == 1 ? col/2 : 0) + shift) % experts;
+                }
+            }
+        };
+        fill_ids(0);
+        std::vector<int32_t> expected_src(routes + 2*guard, sentinel), expected_dst(routes + 2*guard, sentinel);
+        std::vector<int32_t> expected_bounds(experts + 1 + 2*guard, sentinel);
+        int32_t * device_ids = nullptr;
+        int32_t * device_src = nullptr;
+        int32_t * device_dst = nullptr;
+        int32_t * device_bounds = nullptr;
+        CUDA_OK(cudaMalloc(&device_ids, ids.size()*sizeof(int32_t)));
+        CUDA_OK(cudaMalloc(&device_src, expected_src.size()*sizeof(int32_t)));
+        CUDA_OK(cudaMalloc(&device_dst, expected_dst.size()*sizeof(int32_t)));
+        CUDA_OK(cudaMalloc(&device_bounds, expected_bounds.size()*sizeof(int32_t)));
+        auto launch = [&]() {
+            ggml_cuda_launch_mm_ids_helper(device_ids, device_src + guard, device_dst + guard, device_bounds + guard,
+                experts, tokens, used, channels, stride_ids, stride_input, inverse, stream);
+        };
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        launch();
+        CUDA_OK(cudaStreamEndCapture(stream, &graph));
+        CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        for (int shift : {0, 3}) {
+            fill_ids(shift);
+            std::fill(expected_src.begin(), expected_src.end(), sentinel);
+            std::fill(expected_dst.begin(), expected_dst.end(), sentinel);
+            std::fill(expected_bounds.begin(), expected_bounds.end(), sentinel);
+            CUDA_OK(cudaMemcpyAsync(device_ids, ids.data(), ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_OK(cudaMemcpyAsync(device_src, expected_src.data(), expected_src.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_OK(cudaMemcpyAsync(device_dst, expected_dst.data(), expected_dst.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_OK(cudaMemcpyAsync(device_bounds, expected_bounds.data(), expected_bounds.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_OK(cudaStreamSynchronize(stream));
+            int compact = 0;
+            for (int expert = 0; expert < experts; ++expert) {
+                expected_bounds[guard + expert] = compact;
+                for (int row = 0; row < tokens; ++row) {
+                    for (int col = 0; col < used; ++col) {
+                        if (ids[row*stride_ids + col] != expert) {
+                            continue;
+                        }
+                        const int route = row*used + col;
+                        expected_dst[guard + compact] = route;
+                        expected_src[guard + (inverse ? route : compact)] = inverse ? compact : row*stride_input + col % channels;
+                        ++compact;
+                    }
+                }
+            }
+            CHECK(compact == routes);
+            expected_bounds[guard + experts] = compact;
+            CUDA_OK(cudaGraphLaunch(executable, stream));
+            std::vector<int32_t> actual_src(expected_src.size()), actual_dst(expected_dst.size()), actual_bounds(expected_bounds.size());
+            CUDA_OK(cudaMemcpyAsync(actual_src.data(), device_src, actual_src.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_OK(cudaMemcpyAsync(actual_dst.data(), device_dst, actual_dst.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_OK(cudaMemcpyAsync(actual_bounds.data(), device_bounds, actual_bounds.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_OK(cudaStreamSynchronize(stream));
+            CHECK(actual_src == expected_src);
+            CHECK(actual_dst == expected_dst);
+            CHECK(actual_bounds == expected_bounds);
+        }
+        if (timing) {
+            cudaEvent_t start, stop;
+            CUDA_OK(cudaEventCreate(&start));
+            CUDA_OK(cudaEventCreate(&stop));
+            for (int i = 0; i < 10; ++i) {
+                launch();
+            }
+            CUDA_OK(cudaStreamSynchronize(stream));
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                constexpr int iterations = 100;
+                CUDA_OK(cudaEventRecord(start, stream));
+                for (int i = 0; i < iterations; ++i) {
+                    launch();
+                }
+                CUDA_OK(cudaEventRecord(stop, stream));
+                CUDA_OK(cudaEventSynchronize(stop));
+                float milliseconds = 0.0f;
+                CUDA_OK(cudaEventElapsedTime(&milliseconds, start, stop));
+                fprintf(stderr, "mmid-map experts=%d used=%d tokens=%d inverse=%d repeat=%d us=%.6f\n", experts, used, tokens, inverse, repeat, milliseconds*1000/iterations);
+            }
+            CUDA_OK(cudaEventDestroy(start));
+            CUDA_OK(cudaEventDestroy(stop));
+        }
+        CUDA_OK(cudaGraphExecDestroy(executable));
+        CUDA_OK(cudaGraphDestroy(graph));
+        CUDA_OK(cudaFree(device_ids));
+        CUDA_OK(cudaFree(device_src));
+        CUDA_OK(cudaFree(device_dst));
+        CUDA_OK(cudaFree(device_bounds));
+    };
+    if (benchmark) {
+        for (const auto & shape : shapes) {
+            for (bool inverse : {false, true}) {
+                run(shape[0], shape[1], shape[2], shape[1], 0, inverse, true);
+            }
+        }
+    } else {
+        for (int used : {1, 2, 3, 4, 6, 8, 10, 16, 32, 33, 65}) {
+            for (int tokens : {1, 3, 33}) {
+                std::vector<int> channel_counts = {1, used};
+                if (used > 2 && used % 2 == 0) {
+                    channel_counts.push_back(used/2);
+                }
+                for (int channels : channel_counts) {
+                    for (int pattern : {0, 1, 2}) {
+                        for (bool inverse : {false, true}) {
+                            run(std::max(used + 3, 8), used, tokens, channels, pattern, inverse, false);
+                        }
+                    }
+                }
+            }
+        }
+        cudaDeviceProp properties;
+        CUDA_OK(cudaGetDeviceProperties(&properties, 0));
+        const int shared_tokens = properties.sharedMemPerBlockOptin/sizeof(int32_t);
+        for (bool inverse : {false, true}) {
+            run(3, 8, 33, 2, 1, inverse, false);
+            run(4, 4, 32769, 1, 1, inverse, false);
+            run(8, 4, 33, 2, 1, inverse, false, 0, 0);
+            run(8, 4, 33, 2, 1, inverse, false, 2, 1);
+            run(4, 4, shared_tokens, 1, 1, inverse, false);
+            run(4, 4, shared_tokens + 1, 1, 1, inverse, false);
+        }
+        fprintf(stderr, "mmid-map: unique/repeated IDs, generic/tail routes, strides, broadcast, inverse, canaries and capture refresh passed\n");
+    }
+    CUDA_OK(cudaStreamDestroy(stream));
+}
 
 struct cached_fusion_test_graph {
     ggml_context_ptr weights;
@@ -196,7 +343,8 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         int64_t n_out,
         int64_t n_used,
         int64_t n_tokens,
-        int64_t n_experts) {
+        int64_t n_experts,
+        int64_t n_channels) {
     constexpr int64_t N_IN = 256;
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
@@ -217,7 +365,7 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
     const int64_t weight_ne[] = {N_IN, n_out, n_experts};
     ggml_tensor * weight = ggml_new_tensor(result.weights.get(), weight_type, 3, weight_ne);
     ggml_set_name(weight, "test.paths.ffn_up_exps.weight");
-    const int64_t input_ne[] = {N_IN, 1, n_tokens};
+    const int64_t input_ne[] = {N_IN, n_channels, n_tokens};
     ggml_tensor * input = ggml_new_tensor(result.nodes.get(), GGML_TYPE_F32, 3, input_ne);
     ggml_set_name(input, "test.paths.input");
     const int64_t ids_ne[] = {n_used, n_tokens};
@@ -1526,7 +1674,627 @@ static void test_mmid_direct_source_view_case(
     CHECK(memcmp(expected[2].data(), actual[2].data(), expected[2].size() * sizeof(float)) == 0);
 }
 
+static void test_mmid_bounded_active_count(int device) {
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    CHECK(backend != nullptr);
+    auto graph = build_cached_mmid_path_test_graph(
+        backend.get(), ggml_backend_cuda_buffer_type(device), GGML_TYPE_Q4_0, 256, 2, 1, 4);
+    for (size_t i = 0; i < 2; ++i) {
+        const auto bytes = cached_fusion_test_data(graph.leaves[i], 1601 + i);
+        ggml_backend_tensor_set(graph.leaves[i], bytes.data(), 0, bytes.size());
+    }
+    const std::array<int32_t, 2> ids = {1, 3};
+    ggml_backend_tensor_set(graph.ids, ids.data(), 0, sizeof(ids));
+    CHECK(ggml_backend_graph_compute(backend.get(), graph.graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend.get());
+    const auto expected = active_grouped_tensor_values(graph.output);
+    const std::vector<float> sentinel(expected.size(), -19001.25f);
+    uint32_t * control = nullptr;
+    CUDA_OK(cudaMalloc(&control, 2 * sizeof(uint32_t)));
+
+    const auto run = [&](uint32_t count, const std::array<int32_t, 2> & routes, uint32_t status, uint32_t written) {
+        const std::array<uint32_t, 2> initial = {count, 0};
+        CUDA_OK(cudaMemcpy(control, initial.data(), sizeof(initial), cudaMemcpyHostToDevice));
+        ggml_backend_tensor_set(graph.ids, routes.data(), 0, sizeof(routes));
+        ggml_backend_tensor_set(graph.output, sentinel.data(), 0, ggml_nbytes(graph.output));
+        CHECK(ggml_cuda_mmid_bounded_compute_for_test(backend.get(), graph.output, control, control + 1));
+        ggml_backend_synchronize(backend.get());
+        uint32_t observed = 0;
+        CUDA_OK(cudaMemcpy(&observed, control + 1, sizeof(observed), cudaMemcpyDeviceToHost));
+        CHECK(observed == status);
+        const auto actual = active_grouped_tensor_values(graph.output);
+        for (size_t value = 0; value < actual.size(); ++value) {
+            const uint32_t route = value / graph.output->ne[0];
+            CHECK(actual[value] == ((written & (1u << route)) ? expected[value] : sentinel[value]));
+        }
+    };
+    run(2, ids, 0, 3);
+    run(0, {-1, INT_MAX}, 0, 0);
+    run(1, {1, INT_MAX}, 0, 1);
+    run(3, ids, 1, 0);
+    run(2, {-1, 3}, 1, 2);
+    run(2, {4, 3}, 1, 2);
+
+    ggml_backend_tensor_set(graph.output, sentinel.data(), 0, ggml_nbytes(graph.output));
+    ggml_tensor multirow = *graph.output;
+    multirow.ne[2] = 2;
+    CHECK(!ggml_cuda_mmid_bounded_compute_for_test(backend.get(), &multirow, control, control + 1));
+    ggml_backend_synchronize(backend.get());
+    CHECK(active_grouped_tensor_values(graph.output) == sentinel);
+    CUDA_OK(cudaFree(control));
+    fprintf(stderr, "test-moe-cache: bounded MMVQ active count and rejection OK\n");
+}
+
+static void test_mmid_owned_route_maps(int device) {
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    CHECK(backend != nullptr);
+    const cudaStream_t stream = ggml_cuda_mmid_execution_stream_for_test(backend.get());
+    constexpr int experts = 7;
+    constexpr int guard = 16;
+    constexpr int sentinel = -19223;
+    size_t runs = 0;
+    for (int used : {1, 3, 4, 65}) {
+        for (int rows : {1, 3, 33}) {
+            for (int variant = 0; variant < (used == 1 ? 1 : 2); ++variant) {
+                const int channels = variant == 0 ? 1 : used;
+                const int routes = rows*used;
+                const int stride_ids = used + 3;
+                const int stride_input = channels + 2;
+                int32_t * ids_device = nullptr;
+                int32_t * source_map = nullptr;
+                int32_t * destination_map = nullptr;
+                int32_t * bounds = nullptr;
+                uint8_t * owners_device = nullptr;
+                uint32_t * control = nullptr;
+                CUDA_OK(cudaMalloc(&ids_device, rows*stride_ids*sizeof(int32_t)));
+                CUDA_OK(cudaMalloc(&source_map, (routes+2*guard)*sizeof(int32_t)));
+                CUDA_OK(cudaMalloc(&destination_map, (routes+2*guard)*sizeof(int32_t)));
+                CUDA_OK(cudaMalloc(&bounds, (experts+1+2*guard)*sizeof(int32_t)));
+                CUDA_OK(cudaMalloc(&owners_device, routes));
+                CUDA_OK(cudaMalloc(&control, 2*sizeof(uint32_t)));
+                ggml_cuda_mmid_execution execution;
+                execution.route_owners = owners_device;
+                execution.active_rows = control;
+                execution.status = control + 1;
+                execution.row_capacity = rows;
+                execution.routes_per_row = used;
+                execution.expert_count = experts;
+                execution.owner = 1;
+                for (bool inverse : {false, true}) {
+                    cudaGraph_t graph = nullptr;
+                    cudaGraphExec_t executable = nullptr;
+                    CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                    ggml_cuda_launch_mm_ids_helper(ids_device, source_map+guard, destination_map+guard, bounds+guard,
+                        experts, rows, used, channels, stride_ids, stride_input, inverse, stream, &execution);
+                    CUDA_OK(cudaStreamEndCapture(stream, &graph));
+                    CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+                    for (int frame = 0; frame < 5; ++frame) {
+                        const uint32_t active = frame == 0 ? 0 : (frame == 1 ? 1 : (frame == 3 ? rows+1 : rows));
+                        const std::array<uint32_t, 2> initial = {active, 0};
+                        std::vector<int32_t> ids(rows*stride_ids, -1);
+                        std::vector<uint8_t> owners(routes);
+                        bool invalid = false;
+                        for (int route = 0; route < routes; ++route) {
+                            owners[route] = (route + frame) % 3;
+                            if (active <= uint32_t(rows) && uint32_t(route/used) < active && owners[route] == 1) {
+                                ids[(route/used)*stride_ids + route%used] = (route/2 + frame) % experts;
+                                if (frame == 4 && !invalid) {
+                                    ids[(route/used)*stride_ids + route%used] = experts;
+                                    invalid = true;
+                                }
+                            }
+                        }
+                        std::vector<int32_t> expected_source(routes+2*guard, sentinel), expected_destination(routes+2*guard, sentinel);
+                        std::vector<int32_t> expected_bounds(experts+1+2*guard, sentinel);
+                        std::fill_n(expected_source.begin()+guard, routes, inverse ? -1 : 0);
+                        std::fill_n(expected_destination.begin()+guard, routes, 0);
+                        int sorted = 0;
+                        for (int expert = 0; expert < experts; ++expert) {
+                            expected_bounds[guard+expert] = sorted;
+                            for (int route = 0; route < routes; ++route) {
+                                if (ids[(route/used)*stride_ids + route%used] != expert) { continue; }
+                                expected_destination[guard+sorted] = route;
+                                expected_source[guard+(inverse ? route : sorted)] = inverse ? sorted : (route/used)*stride_input + (route%used)%channels;
+                                ++sorted;
+                            }
+                        }
+                        expected_bounds[guard+experts] = sorted;
+                        const std::vector<int32_t> untouched(routes+2*guard, sentinel), bounds_untouched(experts+1+2*guard, sentinel);
+                        CUDA_OK(cudaMemcpyAsync(control, initial.data(), sizeof(initial), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaMemcpyAsync(ids_device, ids.data(), ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaMemcpyAsync(owners_device, owners.data(), owners.size(), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaMemcpyAsync(source_map, untouched.data(), untouched.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaMemcpyAsync(destination_map, untouched.data(), untouched.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaMemcpyAsync(bounds, bounds_untouched.data(), bounds_untouched.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                        CUDA_OK(cudaGraphLaunch(executable, stream));
+                        CUDA_OK(cudaStreamSynchronize(stream));
+                        std::vector<int32_t> actual_source(expected_source.size()), actual_destination(expected_destination.size()), actual_bounds(expected_bounds.size());
+                        uint32_t status = 0;
+                        CUDA_OK(cudaMemcpy(actual_source.data(), source_map, actual_source.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        CUDA_OK(cudaMemcpy(actual_destination.data(), destination_map, actual_destination.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        CUDA_OK(cudaMemcpy(actual_bounds.data(), bounds, actual_bounds.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        CUDA_OK(cudaMemcpy(&status, control+1, sizeof(status), cudaMemcpyDeviceToHost));
+                        if (actual_source != expected_source || actual_destination != expected_destination || actual_bounds != expected_bounds) {
+                            fprintf(stderr, "owned map mismatch used=%d rows=%d channels=%d inverse=%d frame=%d status=%u\n", used, rows, channels, inverse, frame, status);
+                            const auto report = [](const char * name, const std::vector<int32_t> & actual, const std::vector<int32_t> & expected) {
+                                for (size_t i = 0; i < actual.size(); ++i) {
+                                    if (actual[i] != expected[i]) {
+                                        fprintf(stderr, "%s first mismatch index=%zu actual=%d expected=%d\n", name, i, actual[i], expected[i]);
+                                        break;
+                                    }
+                                }
+                            };
+                            report("source", actual_source, expected_source);
+                            report("destination", actual_destination, expected_destination);
+                            report("bounds", actual_bounds, expected_bounds);
+                        }
+                        CHECK(actual_source == expected_source && actual_destination == expected_destination && actual_bounds == expected_bounds);
+                        CHECK(status == (frame == 3 ? 1u : (invalid ? 2u : 0u)));
+                        ++runs;
+                    }
+                    CUDA_OK(cudaGraphExecDestroy(executable));
+                    CUDA_OK(cudaGraphDestroy(graph));
+                }
+                CUDA_OK(cudaFree(control));
+                CUDA_OK(cudaFree(owners_device));
+                CUDA_OK(cudaFree(bounds));
+                CUDA_OK(cudaFree(destination_map));
+                CUDA_OK(cudaFree(source_map));
+                CUDA_OK(cudaFree(ids_device));
+            }
+        }
+    }
+    fprintf(stderr, "test-moe-cache: owned logical maps %zu capture replays, unused addressing and guards OK\n", runs);
+}
+
+static void test_mmid_source_type_refresh(int device) {
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    CHECK(backend && cpu);
+    auto graph = build_cached_mmid_path_test_graph(backend.get(), ggml_backend_cuda_buffer_type(device), GGML_TYPE_F16, 64, 4, 33, 4, 4);
+    auto reference = build_cached_mmid_path_test_graph(cpu.get(), ggml_backend_cpu_buffer_type(), GGML_TYPE_F16, 64, 4, 33, 4, 4);
+    graph.graph->uid = 0;
+    const ggml_tensor original = *graph.leaves[0];
+    std::vector<int32_t> ids(ggml_nelements(graph.ids));
+    for (size_t i = 0; i < ids.size(); ++i) { ids[i] = (i/4 + i%4)%4; }
+    std::vector<float> input(ggml_nelements(graph.leaves[1]));
+    std::vector<float> weights(ggml_nelements(graph.leaves[0]));
+    for (size_t i = 0; i < input.size(); ++i) { input[i] = 0.03125f*(int(i%17)-8); }
+    for (size_t i = 0; i < weights.size(); ++i) { weights[i] = 0.03125f*(int(i%13)-6); }
+    for (auto * value : {&graph, &reference}) {
+        ggml_backend_tensor_set(value->ids, ids.data(), 0, ggml_nbytes(value->ids));
+        ggml_backend_tensor_set(value->leaves[1], input.data(), 0, ggml_nbytes(value->leaves[1]));
+    }
+    size_t runs = 0;
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        std::vector<uint16_t> encoded(weights.size());
+        if (type == GGML_TYPE_F16) {
+            ggml_fp32_to_fp16_row(weights.data(), reinterpret_cast<ggml_fp16_t *>(encoded.data()), encoded.size());
+        } else {
+            ggml_fp32_to_bf16_row_ref(weights.data(), reinterpret_cast<ggml_bf16_t *>(encoded.data()), encoded.size());
+        }
+        for (auto * value : {&graph, &reference}) {
+            value->leaves[0]->type = type;
+            ggml_backend_tensor_set(value->leaves[0], encoded.data(), 0, ggml_nbytes(value->leaves[0]));
+        }
+        CHECK(graph.leaves[0]->data == original.data);
+        CHECK(memcmp(graph.leaves[0]->ne, original.ne, sizeof(original.ne)) == 0);
+        CHECK(memcmp(graph.leaves[0]->nb, original.nb, sizeof(original.nb)) == 0);
+        CHECK(ggml_backend_graph_compute(cpu.get(), reference.graph) == GGML_STATUS_SUCCESS);
+        const auto expected = active_grouped_tensor_values(reference.output);
+        for (int replay = 0; replay < 8; ++replay) {
+            CHECK(ggml_backend_graph_compute(backend.get(), graph.graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_synchronize(backend.get());
+            CHECK(active_grouped_tensor_values(graph.output) == expected);
+            ++runs;
+        }
+    }
+    fprintf(stderr, "test-moe-cache: retained source type refresh %zu exact executions OK\n", runs);
+}
+
+static void test_mmid_scatter_packing(int device) {
+    CUDA_OK(cudaSetDevice(device));
+    cudaStream_t stream = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    constexpr int tokens = 5, used = 4, rows = tokens*used;
+    constexpr size_t guard = 256;
+    constexpr uint8_t sentinel = 0xa7;
+    size_t checks = 0;
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q2_K, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        const bool fp4 = type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4;
+        const auto layout = ggml_cuda_mmq_get_packing_layout(fp4 ? GGML_PREC_Q4 : GGML_PREC_Q8);
+        const size_t block_bytes = layout.block_bytes;
+        const size_t block_values = layout.block_values;
+        for (int width : {256, 512, 768}) {
+            const int padded = GGML_PAD(width, layout.row_alignment);
+            const int stride = width + 8;
+            for (bool aligned : {false, true}) {
+                if (type != GGML_TYPE_NVFP4 && aligned) { continue; }
+                const size_t offset = aligned ? 0 : 4;
+                std::vector<float> input(tokens*stride + offset);
+                for (size_t i = 0; i < input.size(); ++i) { input[i] = 0.03125f*(int(i%29) - 14); }
+                std::vector<int32_t> inverse(rows);
+                for (int route = 0; route < rows; ++route) { inverse[route] = route*7%rows; }
+                const size_t payload_bytes = size_t(padded)/block_values*rows*block_bytes;
+                std::vector<uint8_t> initial(payload_bytes + 2*guard, sentinel);
+                std::vector<float> initial_scale(rows + 2*16, -7117.25f);
+                float * source = nullptr, * scale = nullptr;
+                int32_t * indices = nullptr;
+                uint8_t * packed = nullptr;
+                CUDA_OK(cudaMalloc(&source, input.size()*sizeof(float)));
+                CUDA_OK(cudaMalloc(&indices, inverse.size()*sizeof(int32_t)));
+                CUDA_OK(cudaMalloc(&packed, initial.size()));
+                CUDA_OK(cudaMalloc(&scale, initial_scale.size()*sizeof(float)));
+                CUDA_OK(cudaMemcpyAsync(source, input.data(), input.size()*sizeof(float), cudaMemcpyHostToDevice, stream));
+                const auto launch = [&](bool masked, const float * x) {
+                    if (fp4) {
+                        quantize_scatter_mmq_fp4_cuda(x, indices, packed + guard, scale + 16, type, aligned,
+                            width, stride, padded, tokens, rows, used, stream, masked);
+                    } else {
+                        quantize_scatter_mmq_q8_1_cuda(x, indices, packed + guard, type,
+                            width, stride, padded, tokens, rows, used, stream, masked);
+                    }
+                };
+                const auto reset = [&](const std::vector<int32_t> & map) {
+                    CUDA_OK(cudaMemcpyAsync(indices, map.data(), map.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    CUDA_OK(cudaMemcpyAsync(packed, initial.data(), initial.size(), cudaMemcpyHostToDevice, stream));
+                    CUDA_OK(cudaMemcpyAsync(scale, initial_scale.data(), initial_scale.size()*sizeof(float), cudaMemcpyHostToDevice, stream));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                };
+                reset(inverse);
+                launch(false, source + offset);
+                std::vector<uint8_t> reference(initial.size());
+                std::vector<float> reference_scale(initial_scale.size());
+                CUDA_OK(cudaMemcpyAsync(reference.data(), packed, reference.size(), cudaMemcpyDeviceToHost, stream));
+                CUDA_OK(cudaMemcpyAsync(reference_scale.data(), scale, reference_scale.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_OK(cudaStreamSynchronize(stream));
+                for (int pattern = 0; pattern < 4; ++pattern) {
+                    auto selected = inverse;
+                    std::vector<bool> written(rows, false);
+                    for (int route = 0; route < rows; ++route) {
+                        const bool keep = pattern == 0 || (pattern == 1 && route%2 == 0) ||
+                            (pattern == 2 && route/used%2 == 0 && route%used == 1);
+                        if (keep) { written[selected[route]] = true; } else { selected[route] = -1; }
+                    }
+                    reset(selected);
+                    launch(true, pattern == 3 ? nullptr : source + offset);
+                    auto expected = initial;
+                    auto expected_scale = initial_scale;
+                    for (int row = 0; row < rows; ++row) {
+                        if (!written[row]) { continue; }
+                        for (size_t block = 0; block < size_t(padded)/block_values; ++block) {
+                            const size_t start = guard + (block*rows + row)*block_bytes;
+                            std::copy_n(reference.data() + start, block_bytes, expected.data() + start);
+                        }
+                        if (type == GGML_TYPE_NVFP4) { expected_scale[16 + row] = reference_scale[16 + row]; }
+                    }
+                    std::vector<uint8_t> actual(initial.size());
+                    std::vector<float> actual_scale(initial_scale.size());
+                    CUDA_OK(cudaMemcpyAsync(actual.data(), packed, actual.size(), cudaMemcpyDeviceToHost, stream));
+                    CUDA_OK(cudaMemcpyAsync(actual_scale.data(), scale, actual_scale.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                    CHECK(actual == expected && actual_scale == expected_scale);
+                    ++checks;
+                }
+                CUDA_OK(cudaFree(scale));
+                CUDA_OK(cudaFree(packed));
+                CUDA_OK(cudaFree(indices));
+                CUDA_OK(cudaFree(source));
+            }
+        }
+    }
+    CUDA_OK(cudaStreamDestroy(stream));
+    fprintf(stderr, "test-moe-cache: scatter packing %zu exact byte/scale/guard checks, missing-row activation reads suppressed OK\n", checks);
+}
+
+void test_mmid_execution_binding(int device) {
+    test_mmid_scatter_packing(device);
+    test_mmid_source_type_refresh(device);
+    test_mmid_owned_route_maps(device);
+    test_mmid_bounded_active_count(device);
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    CHECK(backend != nullptr);
+    const cudaStream_t stream = ggml_cuda_mmid_execution_stream_for_test(backend.get());
+    constexpr int experts = 7;
+    constexpr int used = 4;
+    constexpr int ids_stride = used + 3;
+    size_t runs = 0;
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        const bool quantized = ggml_is_quantized(type);
+        for (int projection_rows : {64, 51}) {
+            if (quantized && projection_rows != 64) { continue; }
+            for (int rows : {1, 3, 8, 33, 128}) {
+                if (!quantized && rows > 33) { continue; }
+                if (quantized && rows > 8 && !(ggml_cuda_mmid_source_capability_for(type).flags & GGML_CUDA_MMID_SOURCE_MMQ)) { continue; }
+                if ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) && rows <= 8) { continue; }
+                for (int channels : {1, 2, used}) {
+                    auto graph = build_cached_mmid_path_test_graph(
+                        backend.get(), ggml_backend_cuda_buffer_type(device), type, quantized ? 51 : projection_rows, used, rows, experts, channels);
+                    const bool flat_reference = quantized && rows > 8;
+                    auto reference = build_cached_mmid_path_test_graph(
+                        backend.get(), ggml_backend_cuda_buffer_type(device), type, projection_rows,
+                        flat_reference ? 1 : used, flat_reference ? rows*used : (quantized ? rows : std::max(rows, 33)),
+                        experts, flat_reference ? 1 : channels);
+                    auto * weight = graph.leaves[0];
+                    const size_t expert_bytes = weight->nb[2];
+                    uint32_t * control = nullptr;
+                    uint8_t * owners_device = nullptr;
+                    int32_t * ids_device = nullptr;
+                    void ** sources_device = nullptr;
+                    char * pool = nullptr;
+                    CUDA_OK(cudaMalloc(&control, 2*sizeof(uint32_t)));
+                    CUDA_OK(cudaMalloc(&owners_device, rows*used));
+                    CUDA_OK(cudaMalloc(&ids_device, rows*ids_stride*sizeof(int32_t)));
+                    CUDA_OK(cudaMalloc(&sources_device, experts*sizeof(void *)));
+                    CUDA_OK(cudaMalloc(&pool, 2*expert_bytes));
+                    ggml_tensor ids_view = *graph.ids;
+                    ids_view.data = ids_device;
+                    ids_view.nb[1] = ids_stride*sizeof(int32_t);
+                    ids_view.nb[2] = ids_view.nb[3] = rows*ids_view.nb[1];
+                    ggml_tensor weight_view = *weight;
+                    ggml_tensor output = *graph.output;
+                    output.src[0] = &weight_view;
+                    output.src[2] = &ids_view;
+                    ggml_cuda_mmid_resources resources;
+                    CHECK(ggml_cuda_mmid_requirements(device, &output, resources));
+                    if (!quantized && projection_rows == 51) { CHECK(resources.consumer == GGML_CUDA_MMID_CONSUMER_MMVF && resources.pool_bytes == 0); }
+                    void * workspace = nullptr;
+                    if (resources.pool_bytes) { CUDA_OK(cudaMalloc(&workspace, resources.pool_bytes)); }
+                    size_t pool_peak = 0;
+                    ggml_tensor renamed = weight_view;
+                    memset(renamed.name, 0, sizeof(renamed.name));
+                    output.src[0] = &renamed;
+                    ggml_cuda_mmid_resources anonymous;
+                    CHECK(ggml_cuda_mmid_requirements(device, &output, anonymous));
+                    CHECK(anonymous.consumer == resources.consumer && anonymous.pool_bytes == resources.pool_bytes);
+                    output.src[0] = &weight_view;
+                    const auto unchanged = resources;
+                    ggml_tensor invalid_layout = ids_view;
+                    invalid_layout.nb[1] = SIZE_MAX;
+                    output.src[2] = &invalid_layout;
+                    CHECK(!ggml_cuda_mmid_requirements(device, &output, resources));
+                    CHECK(resources.consumer == unchanged.consumer && resources.pool_bytes == unchanged.pool_bytes);
+                    output.src[2] = &ids_view;
+                    auto invalid_precision = output;
+                    ggml_set_op_params_i32(&invalid_precision, 3, GGML_PREC_F32);
+                    CHECK(!ggml_cuda_mmid_requirements(device, &invalid_precision, resources));
+                    CHECK(resources.consumer == unchanged.consumer && resources.pool_bytes == unchanged.pool_bytes);
+                    if (resources.consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
+                        ggml_set_op_params_i32(&invalid_precision, 3, INT32_MAX);
+                        CHECK(!ggml_cuda_mmid_requirements(device, &invalid_precision, resources));
+                        CHECK(resources.consumer == unchanged.consumer && resources.pool_bytes == unchanged.pool_bytes);
+                    }
+                    size_t overflow = SIZE_MAX - 8;
+                    CHECK(!ggml_cuda_mmid_pool_reserve(overflow, 1, sizeof(int32_t)) && overflow == SIZE_MAX - 8);
+                    CHECK(!ggml_cuda_mmid_pool_reserve(overflow, SIZE_MAX, sizeof(int32_t)) && overflow == SIZE_MAX - 8);
+                    const std::vector<float> sentinel(ggml_nelements(graph.output), -19001.25f);
+                    ggml_cuda_mmid_execution execution;
+                    execution.route_owners = owners_device;
+                    execution.expert_sources = reinterpret_cast<const void * const *>(sources_device);
+                    execution.active_rows = control;
+                    execution.status = control + 1;
+                    execution.row_capacity = rows;
+                    execution.routes_per_row = used;
+                    execution.expert_count = experts;
+                    execution.owner = 1;
+                    if (resources.pool_bytes) {
+                        pool_peak = SIZE_MAX;
+                        CHECK(!ggml_cuda_mmid_pool_compute_for_test(backend.get(), &output, execution, workspace, resources.pool_bytes - 1, &pool_peak));
+                        CHECK(pool_peak == SIZE_MAX);
+                        CHECK(!ggml_cuda_mmid_pool_compute_for_test(backend.get(), &output, execution, static_cast<char *>(workspace) + 1, resources.pool_bytes, &pool_peak));
+                        CHECK(pool_peak == SIZE_MAX);
+                    }
+                    cudaGraph_t captured = nullptr;
+                    cudaGraphExec_t executable = nullptr;
+                    for (int frame = 0; frame < 2; ++frame) {
+                        const auto weights = cached_fusion_test_data(weight, 1701 + frame);
+                        const auto input = cached_fusion_test_data(graph.leaves[1], 1721 + frame);
+                        ggml_backend_tensor_set(weight, weights.data(), 0, weights.size());
+                        ggml_backend_tensor_set(graph.leaves[1], input.data(), 0, input.size());
+                        std::vector<uint8_t> reference_weights(ggml_nbytes(reference.leaves[0]), 0);
+                        for (int expert = 0; expert < experts; ++expert) {
+                            memcpy(reference_weights.data() + expert*reference.leaves[0]->nb[2], weights.data() + expert*expert_bytes, expert_bytes);
+                        }
+                        ggml_backend_tensor_set(reference.leaves[0], reference_weights.data(), 0, reference_weights.size());
+                        std::vector<uint8_t> reference_input(ggml_nbytes(reference.leaves[1]), 0);
+                        if (flat_reference) {
+                            const size_t width_bytes = graph.leaves[1]->nb[1];
+                            for (int row = 0; row < rows; ++row) {
+                                for (int column = 0; column < used; ++column) {
+                                    memcpy(reference_input.data() + size_t(row*used + column)*width_bytes,
+                                        input.data() + size_t(row*channels + column%channels)*width_bytes, width_bytes);
+                                }
+                            }
+                        } else {
+                            std::copy(input.begin(), input.end(), reference_input.begin());
+                        }
+                        ggml_backend_tensor_set(reference.leaves[1], reference_input.data(), 0, reference_input.size());
+                        const int cached_first = 1 + frame;
+                        const int cached_second = 5 + frame;
+                        std::vector<int32_t> ids(rows*used);
+                        std::vector<uint8_t> owners(rows*used);
+                        for (size_t route = 0; route < ids.size(); ++route) {
+                            const int column = route % used;
+                            ids[route] = column == 1 ? cached_second : (column == 3 ? 3*frame : cached_first);
+                            owners[route] = column == 3 ? 0 : 1 + ((route/used + column + frame) % 2);
+                        }
+                        std::vector<int32_t> reference_ids(ggml_nelements(reference.ids), 0);
+                        std::copy(ids.begin(), ids.end(), reference_ids.begin());
+                        ggml_backend_tensor_set(reference.ids, reference_ids.data(), 0, reference_ids.size()*sizeof(int32_t));
+                        CHECK(ggml_backend_graph_compute(backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+                        if (!quantized && projection_rows == 51) {
+                            ggml_backend_synchronize(backend.get());
+                            const auto ordinary_values = active_grouped_tensor_values(reference.output);
+                            for (int row = 0; row < reference.output->ne[2]; row += 8) {
+                                auto input_view = *reference.leaves[1];
+                                auto route_view = *reference.ids;
+                                auto result_view = *reference.output;
+                                const int count = std::min<int64_t>(8, reference.output->ne[2] - row);
+                                input_view.data = static_cast<char *>(input_view.data) + row*input_view.nb[2];
+                                input_view.ne[2] = count;
+                                route_view.data = static_cast<char *>(route_view.data) + row*route_view.nb[1];
+                                route_view.ne[1] = count;
+                                result_view.data = static_cast<char *>(result_view.data) + row*result_view.nb[2];
+                                result_view.ne[2] = count;
+                                result_view.src[1] = &input_view;
+                                result_view.src[2] = &route_view;
+                                CHECK(ggml_cuda_mmid_vector_compute_for_test(backend.get(), &result_view));
+                            }
+                            ggml_backend_synchronize(backend.get());
+                            const auto vector_values = active_grouped_tensor_values(reference.output);
+                            double squared = 0, denominator = 0;
+                            for (size_t value = 0; value < vector_values.size(); ++value) {
+                                const double delta = vector_values[value] - ordinary_values[value];
+                                squared += delta*delta;
+                                denominator += double(ordinary_values[value])*ordinary_values[value];
+                            }
+                            const double nmse = squared/std::max(denominator, 1e-30);
+                            fprintf(stderr, "test-moe-cache: vector original generic oracle type=%s rows=%d channels=%d frame=%d nmse=%.9g\n", ggml_type_name(type), rows, channels, frame, nmse);
+                            ggml_backend_ptr cpu(ggml_backend_cpu_init());
+                        CHECK(cpu != nullptr);
+                        ggml_backend_cpu_set_n_threads(cpu.get(), 2);
+                        auto cpu_reference = build_cached_mmid_path_test_graph(cpu.get(), ggml_backend_cpu_buffer_type(),
+                            GGML_TYPE_F32, projection_rows, used, reference.output->ne[2], experts, channels);
+                        std::vector<float> cpu_weights(ggml_nelements(cpu_reference.leaves[0]));
+                        if (type == GGML_TYPE_F32) { memcpy(cpu_weights.data(), reference_weights.data(), reference_weights.size()); }
+                        else { ggml_get_type_traits(type)->to_float(reference_weights.data(), cpu_weights.data(), cpu_weights.size()); }
+                        ggml_backend_tensor_set(cpu_reference.leaves[0], cpu_weights.data(), 0, cpu_weights.size()*sizeof(float));
+                        ggml_backend_tensor_set(cpu_reference.leaves[1], reference_input.data(), 0, reference_input.size());
+                        ggml_backend_tensor_set(cpu_reference.ids, reference_ids.data(), 0, reference_ids.size()*sizeof(int32_t));
+                        CHECK(ggml_backend_graph_compute(cpu.get(), cpu_reference.graph) == GGML_STATUS_SUCCESS);
+                        const auto cpu_values = active_grouped_tensor_values(cpu_reference.output);
+                        squared = denominator = 0;
+                        for (size_t value = 0; value < vector_values.size(); ++value) {
+                            const double delta = vector_values[value] - cpu_values[value];
+                            squared += delta*delta;
+                            denominator += double(cpu_values[value])*cpu_values[value];
+                        }
+                        const double cpu_nmse = squared/std::max(denominator, 1e-30);
+                        fprintf(stderr, "test-moe-cache: vector full CPU oracle type=%s rows=%d channels=%d frame=%d nmse=%.9g\n", ggml_type_name(type), rows, channels, frame, cpu_nmse);
+                        CHECK(cpu_nmse <= (type == GGML_TYPE_F16 ? 1e-5 : 1e-10));
+                        }
+                        ggml_backend_synchronize(backend.get());
+                        const auto reference_values = active_grouped_tensor_values(reference.output);
+                        std::vector<float> expected(sentinel.size());
+                        for (size_t route = 0; route < ids.size(); ++route) {
+                            std::copy_n(reference_values.data() + route*reference.output->ne[0], output.ne[0], expected.data() + route*output.ne[0]);
+                        }
+                        std::vector<void *> sources(experts, nullptr);
+                        sources[cached_first] = pool + frame*expert_bytes;
+                        sources[cached_second] = pool + (1-frame)*expert_bytes;
+                        for (int expert : {cached_first, cached_second}) {
+                            CUDA_OK(cudaMemcpy(sources[expert], weights.data() + expert*expert_bytes, expert_bytes, cudaMemcpyHostToDevice));
+                        }
+                        const auto run = [&](uint32_t active, uint8_t owner, bool table, uint32_t failure, bool replay) {
+                            execution.owner = owner;
+                            execution.expert_sources = table ? reinterpret_cast<const void * const *>(sources_device) : nullptr;
+                            weight_view.data = table ? nullptr : weight->data;
+                            std::vector<int32_t> padded_ids(rows*ids_stride, INT_MAX);
+                            std::vector<void *> current_sources = sources;
+                            std::vector<bool> written(ids.size(), false);
+                            size_t first = ids.size();
+                            for (size_t route = 0; route < ids.size(); ++route) {
+                                written[route] = active <= uint32_t(rows) && route/used < active && owners[route] == owner;
+                                if (written[route] && first == ids.size()) { first = route; }
+                                padded_ids[(route/used)*ids_stride + route%used] = written[route] ? ids[route] : -1;
+                            }
+                            if (failure == 2) {
+                                CHECK(first < ids.size());
+                                padded_ids[(first/used)*ids_stride + first%used] = frame == 0 ? -1 : experts;
+                                written[first] = false;
+                            }
+                            if (failure == 4) {
+                                CHECK(first < ids.size());
+                                current_sources[ids[first]] = nullptr;
+                                for (size_t route = 0; route < ids.size(); ++route) {
+                                    if (ids[route] == ids[first]) { written[route] = false; }
+                                }
+                            }
+                            const std::array<uint32_t, 2> initial = {active, 0};
+                            CUDA_OK(cudaMemcpyAsync(control, initial.data(), sizeof(initial), cudaMemcpyHostToDevice, stream));
+                            CUDA_OK(cudaMemcpyAsync(owners_device, owners.data(), owners.size(), cudaMemcpyHostToDevice, stream));
+                            CUDA_OK(cudaMemcpyAsync(ids_device, padded_ids.data(), padded_ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                            CUDA_OK(cudaMemcpyAsync(sources_device, current_sources.data(), sources.size()*sizeof(void *), cudaMemcpyHostToDevice, stream));
+                            CUDA_OK(cudaMemcpyAsync(graph.output->data, sentinel.data(), ggml_nbytes(graph.output), cudaMemcpyHostToDevice, stream));
+                            if (replay) {
+                                CUDA_OK(cudaGraphLaunch(executable, stream));
+                            } else {
+                                CHECK(ggml_cuda_mmid_pool_compute_for_test(backend.get(), &output, execution, workspace, resources.pool_bytes, &pool_peak));
+                            }
+                            ggml_backend_synchronize(backend.get());
+                            CHECK(pool_peak == resources.pool_bytes);
+                            uint32_t observed = 0;
+                            CUDA_OK(cudaMemcpy(&observed, control + 1, sizeof(observed), cudaMemcpyDeviceToHost));
+                            CHECK(observed == failure);
+                            const auto actual = active_grouped_tensor_values(graph.output);
+                            for (size_t value = 0; value < actual.size(); ++value) {
+                                const float wanted = written[value/output.ne[0]] ? expected[value] : sentinel[value];
+                                if (actual[value] != wanted) {
+                                    fprintf(stderr, "test-moe-cache: binding difference type=%s rows=%d channels=%d frame=%d active=%u owner=%u table=%d failure=%u replay=%d route=%zu feature=%zu expected=%.9g actual=%.9g\n",
+                                        ggml_type_name(type), rows, channels, frame, active, owner, table, failure, replay,
+                                        value/output.ne[0], value%output.ne[0], wanted, actual[value]);
+                                }
+                                CHECK(actual[value] == wanted);
+                            }
+                            ++runs;
+                        };
+                        const auto partial_owners = owners;
+                        owners.assign(ids.size(), 1);
+                        execution.route_owners = nullptr;
+                        execution.active_rows = nullptr;
+                        run(rows, 1, false, 0, false);
+                        execution.route_owners = owners_device;
+                        execution.active_rows = control;
+                        owners.assign(ids.size(), 0);
+                        run(rows, 1, false, 0, false);
+                        owners = partial_owners;
+                        run(0, 1, true, 0, false);
+                        run(1, 1, true, 0, false);
+                        run(rows, 2, true, 0, false);
+                        run(rows+1, 1, true, 1, false);
+                        run(rows, 1, true, 2, false);
+                        run(rows, 1, true, 4, false);
+                        run(rows, 1, true, 0, false);
+                        if (frame == 0) {
+                            CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                            CHECK(ggml_cuda_mmid_pool_compute_for_test(backend.get(), &output, execution, workspace, resources.pool_bytes, &pool_peak));
+                            CUDA_OK(cudaStreamEndCapture(stream, &captured));
+                            CUDA_OK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+                        }
+                        run(frame == 0 ? 1 : rows, 1, true, 0, true);
+                        auto invalid = execution;
+                        ++invalid.expert_count;
+                        ggml_backend_tensor_set(graph.output, sentinel.data(), 0, ggml_nbytes(graph.output));
+                        CHECK(!ggml_cuda_mmid_execution_compute(backend.get(), &output, invalid));
+                        weight_view.type = GGML_TYPE_COUNT;
+                        CHECK(!ggml_cuda_mmid_execution_compute(backend.get(), &output, execution));
+                        weight_view.type = weight->type;
+                        ggml_tensor invalid_input = *graph.leaves[1];
+                        invalid_input.type = GGML_TYPE_F16;
+                        output.src[1] = &invalid_input;
+                        CHECK(!ggml_cuda_mmid_execution_compute(backend.get(), &output, execution));
+                        output.src[1] = graph.leaves[1];
+                        ggml_backend_synchronize(backend.get());
+                        CHECK(active_grouped_tensor_values(graph.output) == sentinel);
+                    }
+                    if (workspace) { CUDA_OK(cudaFree(workspace)); }
+                    CUDA_OK(cudaGraphExecDestroy(executable));
+                    CUDA_OK(cudaGraphDestroy(captured));
+                    CUDA_OK(cudaFree(pool));
+                    CUDA_OK(cudaFree(sources_device));
+                    CUDA_OK(cudaFree(ids_device));
+                    CUDA_OK(cudaFree(owners_device));
+                    CUDA_OK(cudaFree(control));
+                    fprintf(stderr, "test-moe-cache: routed binding type=%s rows=%d channels=%d OK\n", ggml_type_name(type), rows, channels);
+                }
+            }
+        }
+        }
+    fprintf(stderr, "test-moe-cache: routed matrix binding %zu executions, changed source/ID/input/owner images and capture replay OK\n", runs);
+}
+
 void test_mmid_direct_source_view(int device) {
+    test_mmid_bounded_active_count(device);
     struct test_case {
         ggml_type type;
         int64_t n_tokens;

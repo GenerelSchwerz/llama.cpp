@@ -2,6 +2,7 @@
 #include "top-k.cuh"
 
 #include <cstdlib>
+#include <cstring>
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -283,4 +284,66 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #endif // defined(GGML_USE_HIP)
 #endif
+}
+
+bool ggml_cuda_top_k_prepare_resources(int device, const ggml_tensor * dst, ggml_cuda_source_sort_resources & resources) {
+    using namespace ggml_cuda_source_sort_detail;
+    resources = {};
+    ggml_cuda_source_sort_resources measured;
+    int ncols = 0, nrows = 0;
+    if (!metadata(device, dst, GGML_OP_TOP_K, measured, ncols, nrows)) { return false; }
+    const int k = int(dst->ne[0]);
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) { return false; }
+#ifdef CUB_TOP_K_AVAILABLE
+    const char * segmented = nrows > 1 ? std::getenv("GGML_CUDA_TOPK_SEGMENTED") : nullptr;
+    mix(measured.identity, segmented != nullptr);
+    if (segmented) {
+        for (const unsigned char * p = reinterpret_cast<const unsigned char *>(segmented); *p; ++p) { mix(measured.identity, *p); }
+    }
+    const bool use_top_k = !segmented || segmented[0] != '1' || segmented[1] != '\0';
+    mix(measured.identity, use_top_k);
+    if (use_top_k) {
+        auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
+            cuda::execution::output_ordering::unsorted);
+        auto stream_env = cuda::stream_ref{cudaStream_t(nullptr)};
+        auto env = cuda::std::execution::env{stream_env, requirements};
+        auto indices = cuda::make_counting_iterator(0);
+        size_t temp = 0;
+        if (DeviceTopK::MaxPairs(nullptr, temp, static_cast<const float *>(dst->src[0]->data), cuda::discard_iterator(),
+                indices, static_cast<int *>(dst->data), ncols, k, env) != cudaSuccess || !add(measured.pool_bytes, temp)) { return false; }
+        mix(measured.identity, temp); resources = measured; return true;
+    }
+#else
+    mix(measured.identity, 0);
+#endif
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+    if (ncols > 1024) {
+        const int blocks = std::min((ncols + 1023) / 1024, 64);
+        if (nrows > prop.maxGridSize[0] / blocks || prop.maxThreadsPerBlock < 256 ||
+                size_t(nrows) > SIZE_MAX / sizeof(top_k_radix_state) ||
+                size_t(nrows) > SIZE_MAX / size_t(blocks) / 256 / sizeof(int) ||
+                !add(measured.pool_bytes, size_t(nrows) * sizeof(top_k_radix_state)) ||
+                !add(measured.pool_bytes, size_t(nrows) * blocks * 256 * sizeof(int))) { return false; }
+        mix(measured.identity, blocks); resources = measured; return true;
+    }
+#endif
+    ggml_tensor sorting = *dst;
+    sorting.op = GGML_OP_ARGSORT; sorting.op_params[0] = GGML_SORT_ORDER_DESC;
+    memcpy(sorting.ne, dst->src[0]->ne, sizeof(sorting.ne));
+    size_t stride = sizeof(int);
+    for (int i = 0; i < 4; ++i) { sorting.nb[i] = stride; stride *= size_t(sorting.ne[i]); }
+    ggml_cuda_source_sort_resources sorter;
+    if (!ggml_cuda_argsort_prepare_resources(device, &sorting, sorter)) { return false; }
+#ifdef GGML_CUDA_USE_CUB
+    const int chunk = argsort_f32_i32_cuda_cub_chunk_nrows(dst->src[0]->nb[1], nrows);
+#else
+    const int chunk = nrows;
+#endif
+    if (ncols > INT32_MAX / chunk || !add(measured.pool_bytes, size_t(ncols) * chunk * sizeof(int)) ||
+            sorter.pool_bytes > SIZE_MAX - measured.pool_bytes) { return false; }
+    measured.pool_bytes += sorter.pool_bytes;
+    mix(measured.identity, chunk); mix(measured.identity, sorter.identity);
+    mix(measured.identity, measured.pool_bytes);
+    resources = measured; return true;
 }

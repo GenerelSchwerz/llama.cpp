@@ -20,6 +20,8 @@ This maintained [llama.cpp](https://github.com/ggml-org/llama.cpp) fork adds an 
 
 The [feature guide](docs/fork-features.md) lists eligibility, defaults, and fallback behavior.
 
+Experimental [generic CPU/GPU MoE execution](docs/moe-hybrid.md) adds an explicit source executor, model-bound statistics and optional residency adaptation. Ordinary execution remains the default; platform and concurrency qualification is limited.
+
 ## Measured results
 
 Selected single-request decode results from the [full benchmark comparison](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase):

@@ -227,12 +227,16 @@ std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t 
 
     if (tensor->type == GGML_TYPE_F32) {
         memcpy(bytes.data(), values.data(), bytes.size());
+    } else if (tensor->type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(values.data(), reinterpret_cast<ggml_fp16_t *>(bytes.data()), values.size());
     } else if (tensor->type == GGML_TYPE_BF16) {
         ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t *>(bytes.data()), values.size());
     } else {
         CHECK(ggml_is_quantized(tensor->type));
         const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
-        CHECK(ggml_quantize_chunk(tensor->type, values.data(), bytes.data(), 0, nrows, tensor->ne[0], nullptr) == bytes.size());
+        std::vector<float> imatrix;
+        if (ggml_quantize_requires_imatrix(tensor->type)) { imatrix.assign(tensor->ne[0], 1.0f); }
+        CHECK(ggml_quantize_chunk(tensor->type, values.data(), bytes.data(), 0, nrows, tensor->ne[0], imatrix.empty() ? nullptr : imatrix.data()) == bytes.size());
     }
     return bytes;
 }

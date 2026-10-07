@@ -11,6 +11,9 @@
 
 #include <cstdint>
 #include <utility>
+#include "ggml-backend-impl.h"
+#include <cstring>
+#include <vector>
 
 template <typename T>
 static __device__ __forceinline__ float t2f32(T val) {
@@ -477,4 +480,203 @@ void ggml_cuda_op_soft_max_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(max_bias == 0.0f);
 
     soft_max_back_f32_cuda(src0_d, src1_d, dst_d, ncols, nrows, scale, stream);
+}
+
+namespace {
+void source_softmax_mix(uint64_t & identity, uint64_t value) {
+    identity = (identity ^ value) * 1099511628211ULL;
+}
+
+bool source_softmax_add(size_t & total, size_t bytes) {
+    if (bytes > SIZE_MAX - 255) { return false; }
+    bytes = (bytes + 255) & ~size_t(255);
+    if (bytes > SIZE_MAX - total) { return false; }
+    total += bytes;
+    return true;
+}
+
+bool source_softmax_tensor(const ggml_tensor * tensor, uint64_t & identity) {
+    if (!tensor || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16)) { return false; }
+    size_t stride = tensor->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+    uint64_t span = stride;
+    for (int i = 0; i < 4; ++i) {
+        if (tensor->ne[i] <= 0 || tensor->nb[i] > INT64_MAX ||
+                (tensor->ne[i] != 1 && tensor->nb[i] != stride) ||
+                uint64_t(tensor->ne[i]) > uint64_t(INT64_MAX) / stride ||
+                uint64_t(tensor->ne[i]) > SIZE_MAX / stride) { return false; }
+        const uint64_t count = uint64_t(tensor->ne[i] - 1);
+        if (count && tensor->nb[i] > (uint64_t(INT64_MAX) - span) / count) { return false; }
+        span += count * tensor->nb[i];
+        stride *= size_t(tensor->ne[i]);
+        source_softmax_mix(identity, uint64_t(tensor->ne[i])); source_softmax_mix(identity, tensor->nb[i]);
+    }
+    source_softmax_mix(identity, uint64_t(tensor->type));
+    const auto * params = reinterpret_cast<const unsigned char *>(tensor->op_params);
+    for (size_t i = 0; i < sizeof(tensor->op_params); ++i) { source_softmax_mix(identity, params[i]); }
+    return span <= SIZE_MAX;
+}
+}
+
+bool ggml_cuda_softmax_prepare_resources(int device, const ggml_tensor * dst, ggml_cuda_source_softmax_resources & resources) {
+    resources = {};
+    int selected = -1;
+    if (device < 0 || device >= ggml_cuda_info().device_count || cudaGetDevice(&selected) != cudaSuccess || selected != device ||
+            !dst || dst->op != GGML_OP_SOFT_MAX || !dst->src[0] || dst->type != GGML_TYPE_F32 || dst->src[0]->type != GGML_TYPE_F32) { return false; }
+    const auto * src = dst->src[0];
+    const auto * mask = dst->src[1];
+    const auto * sinks = dst->src[2];
+    uint64_t identity = 14695981039346656037ULL;
+    if (!source_softmax_tensor(src, identity) || !source_softmax_tensor(dst, identity)) { return false; }
+    for (int i = 0; i < 4; ++i) { if (src->ne[i] != dst->ne[i]) { return false; } }
+    for (int i = 3; i < GGML_MAX_SRC; ++i) { if (dst->src[i]) { return false; } }
+    source_softmax_mix(identity, mask != nullptr); source_softmax_mix(identity, sinks != nullptr);
+    if (mask && (!mask->data || !source_softmax_tensor(mask, identity) || mask->ne[0] != src->ne[0] ||
+            mask->ne[1] < src->ne[1] || src->ne[2] % mask->ne[2] || src->ne[3] % mask->ne[3])) { return false; }
+    if (sinks && (!sinks->data || sinks->type != GGML_TYPE_F32 || !source_softmax_tensor(sinks, identity) ||
+            sinks->ne[0] != src->ne[2])) { return false; }
+    float scale, max_bias;
+    memcpy(&scale, dst->op_params, sizeof(float));
+    memcpy(&max_bias, reinterpret_cast<const char *>(dst->op_params) + sizeof(float), sizeof(float));
+    if (!std::isfinite(scale) || !std::isfinite(max_bias) || (max_bias > 0 && !mask)) { return false; }
+    uint64_t rows = 1;
+    for (int i = 1; i < 4; ++i) {
+        if (uint64_t(src->ne[i]) > uint64_t(INT32_MAX) / rows) { return false; }
+        rows *= uint64_t(src->ne[i]);
+    }
+    if (src->ne[0] > INT32_MAX) { return false; }
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || prop.warpSize != WARP_SIZE) { return false; }
+    for (int i = 0; i < 3; ++i) {
+        if (prop.maxGridSize[i] <= 0) { return false; }
+        source_softmax_mix(identity, uint64_t(prop.maxGridSize[i]));
+    }
+    const auto & info = ggml_cuda_info().devices[device];
+    if (!info.smpbo || info.nsm <= 0) { return false; }
+    int nth = WARP_SIZE;
+    while (nth < src->ne[0] && nth < CUDA_SOFT_MAX_BLOCK_SIZE) { nth *= 2; }
+    const size_t cols = size_t(src->ne[0]);
+    if (cols > SIZE_MAX - 2 * WARP_SIZE || cols + 2 * WARP_SIZE > SIZE_MAX / sizeof(float)) { return false; }
+    const size_t shared = ((cols + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE + WARP_SIZE) * sizeof(float);
+    const bool use_shared = shared <= info.smpbo;
+    const bool cooperative = !use_shared && info.supports_cooperative_launch &&
+        uint64_t(cols) / rows > 8192 && !mask && !sinks && scale == 1.0f && max_bias == 0.0f;
+    if (!cooperative) {
+        if (nth > prop.maxThreadsPerBlock || nth > prop.maxThreadsDim[0] || cols > size_t(INT32_MAX - nth)) { return false; }
+        for (int i = 0; i < 3; ++i) { if (src->ne[i + 1] > prop.maxGridSize[i]) { return false; } }
+    }
+    size_t pool_bytes = 0;
+    int active_blocks = 0;
+    if (cooperative) {
+        const int threads = WARP_SIZE * 8;
+        if (info.nsm >= threads || threads > prop.maxThreadsPerBlock || threads > prop.maxThreadsDim[0] ||
+                info.nsm > prop.maxGridSize[0] || uint64_t(info.nsm) * threads * 4 > uint64_t(INT32_MAX) - cols ||
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, soft_max_f32_parallelize_cols, threads, 0) != cudaSuccess ||
+                active_blocks < 1) { return false; }
+        // The runtime requests float elements, with sizeof(float) in the element count.
+        if (size_t(info.nsm) > SIZE_MAX / (sizeof(float) * sizeof(float)) ||
+                !source_softmax_add(pool_bytes, size_t(info.nsm) * sizeof(float) * sizeof(float)) ||
+                !source_softmax_add(pool_bytes, size_t(info.nsm) * sizeof(float) * sizeof(float))) { return false; }
+    } else if (!use_shared && WARP_SIZE * sizeof(float) > prop.sharedMemPerBlock) { return false; }
+    for (uint64_t value : {uint64_t(device), uint64_t(info.cc), uint64_t(info.nsm), uint64_t(info.smpbo),
+            uint64_t(info.supports_cooperative_launch), uint64_t(prop.maxThreadsPerBlock), uint64_t(prop.maxThreadsDim[0]),
+            uint64_t(prop.sharedMemPerBlock), uint64_t(prop.warpSize), uint64_t(nth), uint64_t(shared),
+            uint64_t(use_shared ? 0 : cooperative ? 1 : 2), uint64_t(active_blocks), uint64_t(pool_bytes)}) { source_softmax_mix(identity, value); }
+#ifdef USE_CUDA_GRAPH
+    source_softmax_mix(identity, 1);
+#else
+    source_softmax_mix(identity, 0);
+#endif
+    resources.pool_bytes = pool_bytes; resources.identity = identity;
+    return true;
+}
+
+namespace {
+struct source_softmax_test_pool : ggml_cuda_pool {
+    char * data;
+    size_t capacity, used = 0, peak = 0;
+    source_softmax_test_pool(void * data, size_t capacity) : data(static_cast<char *>(data)), capacity(capacity) {}
+    void * alloc(size_t bytes, size_t * actual) override {
+        size_t aligned = 0;
+        if (!source_softmax_add(aligned, bytes) || aligned > capacity - used) { throw std::bad_alloc(); }
+        *actual = aligned;
+        void * result = data + used;
+        used += aligned; peak = std::max(peak, used);
+        return result;
+    }
+    void free(void * ptr, size_t bytes) override {
+        GGML_ASSERT(bytes <= used && ptr == data + used - bytes);
+        used -= bytes;
+    }
+};
+}
+
+bool ggml_cuda_source_softmax_capture_for_test(int device, ggml_tensor * dst,
+        ggml_backend_buffer * scratch, size_t capacity, ggml_cuda_source_softmax_test_result & result) {
+    result = {};
+    ggml_cuda_source_softmax_resources resources;
+    if (!ggml_cuda_softmax_prepare_resources(device, dst, resources) || capacity < resources.pool_bytes ||
+            !scratch || scratch->buft != ggml_backend_cuda_buffer_type(device) || capacity > ggml_backend_buffer_get_size(scratch) ||
+            reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch)) % 256) { return false; }
+    const auto work = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch));
+    if (capacity > UINTPTR_MAX - work) { return false; }
+    const auto out = reinterpret_cast<uintptr_t>(dst->data);
+    const auto out_bytes = ggml_nbytes(dst);
+    if (!out || out_bytes > UINTPTR_MAX - out) { return false; }
+    for (const auto * tensor : {static_cast<const ggml_tensor *>(dst), static_cast<const ggml_tensor *>(dst->src[0]),
+            static_cast<const ggml_tensor *>(dst->src[1]), static_cast<const ggml_tensor *>(dst->src[2])}) {
+        if (!tensor) { continue; }
+        if (!tensor->buffer || tensor->buffer->buft != ggml_backend_cuda_buffer_type(device)) { return false; }
+        const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(tensor->buffer));
+        const auto p = reinterpret_cast<uintptr_t>(tensor->data);
+        const auto bytes = ggml_backend_buffer_get_size(tensor->buffer), span = ggml_nbytes(tensor);
+        if (!p || p % ggml_type_size(tensor->type) || p < base || p - base > bytes || span > bytes - (p - base) ||
+                span > UINTPTR_MAX - p || (work < p + span && p < work + capacity) ||
+                (tensor != dst && out < p + span && p < out + out_bytes)) { return false; }
+    }
+    ggml_backend_cuda_context context(device);
+    auto pool = std::make_unique<source_softmax_test_pool>(reinterpret_cast<void *>(work), capacity);
+    auto * measured = pool.get();
+    context.pools[device][0] = std::move(pool);
+    const auto stream = context.stream();
+    ggml_cuda_op_soft_max(context, dst);
+    if (cudaStreamSynchronize(stream) != cudaSuccess || measured->used) { return false; }
+    result.eager_peak = measured->peak; measured->peak = 0;
+    std::vector<float> eager(out_bytes / sizeof(float));
+    if (cudaMemcpy(eager.data(), dst->data, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { return false; }
+#ifdef USE_CUDA_GRAPH
+    struct capture_guard {
+        cudaStream_t stream;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        bool capturing = false;
+        ~capture_guard() {
+            if (capturing) { (void) cudaStreamEndCapture(stream, &graph); }
+            if (exec) { (void) cudaGraphExecDestroy(exec); }
+            if (graph) { (void) cudaGraphDestroy(graph); }
+        }
+    } capture{stream};
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { return false; }
+    capture.capturing = true;
+    ggml_cuda_op_soft_max(context, dst);
+    const auto ended = cudaStreamEndCapture(stream, &capture.graph);
+    capture.capturing = false;
+    if (ended != cudaSuccess || !capture.graph || measured->used ||
+            cudaGraphInstantiate(&capture.exec, capture.graph, nullptr, nullptr, 0) != cudaSuccess) { return false; }
+    result.capture_peak = measured->peak;
+    std::vector<float> replayed(eager.size());
+    for (int replay = 0; replay < 2; ++replay) {
+        if (cudaMemsetAsync(dst->data, 0xff, out_bytes, stream) != cudaSuccess || cudaGraphLaunch(capture.exec, stream) != cudaSuccess ||
+                cudaStreamSynchronize(stream) != cudaSuccess ||
+                cudaMemcpy(replayed.data(), dst->data, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                memcmp(eager.data(), replayed.data(), out_bytes)) { return false; }
+        ++result.replays;
+    }
+#endif
+    if (capacity <= SIZE_MAX - 256) {
+        size_t actual = 0;
+        bool rejected = false;
+        try { (void) measured->alloc(capacity + 256, &actual); } catch (const std::bad_alloc &) { rejected = true; }
+        if (!rejected || measured->used) { return false; }
+    }
+    return result.eager_peak <= capacity && result.capture_peak <= capacity;
 }

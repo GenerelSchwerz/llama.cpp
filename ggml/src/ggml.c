@@ -54,6 +54,28 @@
 
 #define UNUSED GGML_UNUSED
 
+#ifdef _MSC_VER
+static volatile long long g_ggml_allocation_count = 0;
+#else
+static uint64_t g_ggml_allocation_count = 0;
+#endif
+
+static void ggml_count_allocation(void) {
+#ifdef _MSC_VER
+    _InterlockedIncrement64(&g_ggml_allocation_count);
+#else
+    __atomic_fetch_add(&g_ggml_allocation_count, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+uint64_t ggml_allocation_count(void) {
+#ifdef _MSC_VER
+    return (uint64_t) _InterlockedCompareExchange64(&g_ggml_allocation_count, 0, 0);
+#else
+    return __atomic_load_n(&g_ggml_allocation_count, __ATOMIC_RELAXED);
+#endif
+}
+
 uint64_t ggml_graph_next_uid(void) {
 #ifdef _MSC_VER
 #if defined(_WIN32)
@@ -337,7 +359,11 @@ void * ggml_aligned_malloc(size_t size) {
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-    return _aligned_malloc(size, alignment);
+    void * result = _aligned_malloc(size, alignment);
+    if (result != NULL) {
+        ggml_count_allocation();
+    }
+    return result;
 #else
     if (size == 0) {
         GGML_LOG_WARN("Behavior may be unexpected when allocating 0 bytes for ggml_aligned_malloc!\n");
@@ -381,6 +407,7 @@ void * ggml_aligned_malloc(size_t size) {
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
     }
+    ggml_count_allocation();
     return aligned_memory;
 #endif
 }
@@ -413,6 +440,7 @@ inline static void * ggml_malloc(size_t size) {
         GGML_LOG_ERROR("%s: failed to allocate %6.2f MB\n", __func__, size/(1024.0*1024.0));
         GGML_ABORT("fatal error");
     }
+    ggml_count_allocation();
     return result;
 }
 
@@ -427,6 +455,7 @@ inline static void * ggml_calloc(size_t num, size_t size) {
         GGML_LOG_ERROR("%s: failed to allocate %6.2f MB\n", __func__, size/(1024.0*1024.0));
         GGML_ABORT("fatal error");
     }
+    ggml_count_allocation();
     return result;
 }
 
@@ -983,6 +1012,10 @@ struct ggml_context {
     struct ggml_object * objects_begin;
     struct ggml_object * objects_end;
 };
+
+size_t ggml_context_overhead(void) {
+    return sizeof(struct ggml_context);
+}
 
 //
 // data types

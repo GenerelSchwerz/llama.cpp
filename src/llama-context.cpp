@@ -1,8 +1,12 @@
 #include "llama-context.h"
+#include "llama-draft-vocab.h"
+#include "ggml-moe-source-program.h"
 #include "llama-staged-input.h"
+#include "../ggml/src/moe-fidelity-config.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -21,8 +25,10 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -33,6 +39,163 @@
 // llama_context
 //
 
+std::vector<std::vector<int32_t>> llama_moe_profile_parse(
+        const uint8_t * data, size_t bytes, const std::vector<uint32_t> & expert_counts) {
+    const auto reject = [](const char * reason) { throw std::runtime_error(std::string("MoE STRP profile: ") + reason); };
+    if (!data || bytes < 24 || bytes > 64 * 1024 * 1024 || memcmp(data, "STRP", 4)) { reject("invalid extent or magic"); }
+    const auto u32 = [&](size_t offset) {
+        return uint32_t(data[offset]) | uint32_t(data[offset + 1]) << 8 |
+            uint32_t(data[offset + 2]) << 16 | uint32_t(data[offset + 3]) << 24;
+    };
+    const uint32_t layers = u32(8), experts = u32(12), slots = u32(16), pairs = u32(20);
+    if (u32(4) != 1 || layers == 0 || layers > 65536 || layers != expert_counts.size() ||
+            experts == 0 || experts > 65536 || !pairs || slots > pairs) { reject("unsupported header or layer geometry"); }
+    uint64_t total = 0;
+    uint32_t maximum = 0;
+    for (const auto count : expert_counts) {
+        total += count;
+        maximum = std::max(maximum, count);
+    }
+    if (maximum != experts || total > (1u << 22) || pairs > total) { reject("expert geometry or pair count mismatch"); }
+    const uint64_t pair_end = 24ull + 4ull * pairs;
+    const uint64_t table_bytes = 4ull * layers * experts;
+    if (bytes != pair_end && bytes != pair_end + table_bytes) { reject("truncated file or unknown trailing data"); }
+    std::vector<std::vector<int32_t>> ranks(layers), indices(layers);
+    for (uint32_t layer = 0; layer < layers; ++layer) { indices[layer].assign(expert_counts[layer], -1); }
+    for (uint32_t i = 0; i < pairs; ++i) {
+        const size_t offset = 24 + size_t(i) * 4;
+        const uint32_t layer = uint32_t(data[offset]) | uint32_t(data[offset + 1]) << 8;
+        const uint32_t expert = uint32_t(data[offset + 2]) | uint32_t(data[offset + 3]) << 8;
+        if (layer >= layers || expert >= expert_counts[layer] || indices[layer][expert] != -1) { reject("invalid or duplicate pair"); }
+        indices[layer][expert] = i;
+        ranks[layer].push_back(expert);
+    }
+    if (bytes != pair_end) {
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            for (uint32_t expert = 0; expert < experts; ++expert) {
+                const uint32_t expected = expert < expert_counts[layer] ? uint32_t(indices[layer][expert]) : UINT32_MAX;
+                if (u32(size_t(pair_end) + (size_t(layer) * experts + expert) * 4) != expected) { reject("invalid historical slot-index table"); }
+            }
+        }
+    }
+    return ranks;
+}
+
+llama_moe_profile_statistics llama_moe_profile_statistics_parse(
+        const uint8_t * data, size_t bytes, const std::vector<llama_moe_source_group> & sources) {
+    const auto reject = [](const char * reason) { throw std::runtime_error(std::string("MoE source statistics: ") + reason); };
+    if (!data || bytes < 24 || bytes > 64 * 1024 * 1024 || memcmp(data, "GGUF", 4)) { reject("invalid extent or magic"); }
+    const auto u64 = [&](size_t offset, uint32_t width = 8) {
+        uint64_t result = 0;
+        for (uint32_t i = 0; i < width; ++i) { result |= uint64_t(data[offset + i]) << (8 * i); }
+        return result;
+    };
+    if (u64(4, 4) != 3 || u64(8) != 0 || u64(16) > 32) { reject("unsupported GGUF metadata header"); }
+    gguf_context_ptr metadata(gguf_init_from_buffer(data, bytes, {true, nullptr}));
+    if (!metadata) { reject("invalid metadata"); }
+    const size_t end = gguf_get_data_offset(metadata.get()), alignment = gguf_get_alignment(metadata.get());
+    if (end > bytes || alignment > 64 * 1024 * 1024) { reject("invalid metadata extent or alignment"); }
+    const size_t padding = (alignment - end % alignment) % alignment;
+    if (end != bytes && (bytes - end != padding || !std::all_of(data + end, data + bytes, [](uint8_t value) { return value == 0; }))) {
+        reject("invalid metadata padding or trailing data");
+    }
+    const auto key = [&](const char * name, gguf_type type) {
+        const auto index = gguf_find_key(metadata.get(), name);
+        if (index < 0 || gguf_get_kv_type(metadata.get(), index) != type) { reject("missing or mistyped field"); }
+        return index;
+    };
+    const auto array = [&](const char * name, gguf_type type, size_t count) {
+        const auto index = key(name, GGUF_TYPE_ARRAY);
+        if (gguf_get_arr_type(metadata.get(), index) != type || gguf_get_arr_n(metadata.get(), index) != count) { reject("array type or length mismatch"); }
+        return gguf_get_arr_data(metadata.get(), index);
+    };
+    if (gguf_get_val_u32(metadata.get(), key("moe.profile.version", GGUF_TYPE_UINT32)) != 1) { reject("unsupported statistics version"); }
+    const auto domain_key = key("moe.profile.source_domains", GGUF_TYPE_ARRAY);
+    const size_t n_sources = gguf_get_arr_n(metadata.get(), domain_key);
+    if (!n_sources || n_sources > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || n_sources > SIZE_MAX / 4) {
+        reject("source count exceeds shared capacity");
+    }
+    const auto * domains = static_cast<const uint32_t *>(array("moe.profile.source_domains", GGUF_TYPE_UINT32, n_sources));
+    const auto * types = static_cast<const uint32_t *>(array("moe.profile.source_types", GGUF_TYPE_UINT32, n_sources));
+    const auto * shapes = static_cast<const int64_t *>(array("moe.profile.source_shapes", GGUF_TYPE_INT64, n_sources * 4));
+    const auto * observations = static_cast<const uint64_t *>(array("moe.profile.observations", GGUF_TYPE_UINT64, n_sources));
+    const auto * offsets = static_cast<const uint64_t *>(array("moe.profile.expert_offsets", GGUF_TYPE_UINT64, n_sources + 1));
+    const auto * name_offsets = static_cast<const uint64_t *>(array("moe.profile.source_name_offsets", GGUF_TYPE_UINT64, n_sources + 1));
+    const auto names_key = key("moe.profile.source_name_bytes", GGUF_TYPE_ARRAY);
+    const auto counts_key = key("moe.profile.expert_counts", GGUF_TYPE_ARRAY);
+    const auto provenance_key = key("moe.profile.provenance", GGUF_TYPE_ARRAY);
+    const auto n_names = gguf_get_arr_n(metadata.get(), names_key);
+    const auto n_counts = gguf_get_arr_n(metadata.get(), counts_key);
+    const auto n_provenance = gguf_get_arr_n(metadata.get(), provenance_key);
+    if (!n_names || n_counts > (1u << 22) || !n_provenance || n_provenance > 4096) { reject("data count exceeds statistics capacity"); }
+    const auto * names = static_cast<const uint8_t *>(array("moe.profile.source_name_bytes", GGUF_TYPE_UINT8, n_names));
+    const auto * counts = static_cast<const uint64_t *>(array("moe.profile.expert_counts", GGUF_TYPE_UINT64, n_counts));
+    const auto * provenance = static_cast<const uint8_t *>(array("moe.profile.provenance", GGUF_TYPE_UINT8, n_provenance));
+    if (name_offsets[0] || name_offsets[n_sources] != n_names || offsets[0] || offsets[n_sources] != n_counts ||
+            memchr(provenance, 0, n_provenance)) { reject("invalid offsets or provenance"); }
+
+    llama_moe_profile_statistics result;
+    result.provenance.assign(reinterpret_cast<const char *>(provenance), n_provenance);
+    std::map<uint32_t, std::unordered_map<const ggml_tensor *, size_t>> source_indices;
+    std::unordered_map<std::string, std::map<uint32_t, size_t>> name_indices;
+    uint64_t model_experts = 0;
+    for (const auto & source : sources) {
+        for (const auto & bank : source.banks) {
+            if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) { continue; }
+            if (!bank.tensor || bank.names.empty() || bank.tensor->ne[2] <= 0 || bank.tensor->ne[2] > INT32_MAX) { reject("source identity or expert geometry unavailable"); }
+            auto & indices = source_indices[source.domain];
+            const auto inserted = indices.emplace(bank.tensor, result.sources.size());
+            if (inserted.second) {
+                if (uint64_t(bank.tensor->ne[2]) > (1u << 22) - model_experts) { reject("model expert count exceeds statistics capacity"); }
+                model_experts += bank.tensor->ne[2];
+                result.sources.push_back({bank.tensor, source.domain, 0, {}});
+            }
+            const size_t index = inserted.first->second;
+            for (const auto & name : bank.names) {
+                if (name.empty() || name.size() > 4096 || name.find('\0') != std::string::npos) { reject("invalid loader source name"); }
+                auto & aliases = name_indices[name];
+                const auto alias = aliases.emplace(source.domain, index);
+                if (!alias.second && alias.first->second != index) { alias.first->second = SIZE_MAX; }
+            }
+        }
+    }
+    if (result.sources.empty()) { reject("model has no returned expert sources"); }
+    for (size_t i = 0; i < n_sources; ++i) {
+        if (name_offsets[i] >= name_offsets[i + 1] || name_offsets[i + 1] > n_names || name_offsets[i + 1] - name_offsets[i] > 4096 ||
+                offsets[i] > offsets[i + 1] || offsets[i + 1] > n_counts) { reject("invalid source extent"); }
+        const auto * begin = names + size_t(name_offsets[i]);
+        const auto name_size = size_t(name_offsets[i + 1] - name_offsets[i]);
+        if (memchr(begin, 0, name_size)) { reject("embedded source name terminator"); }
+        const std::string name(reinterpret_cast<const char *>(begin), name_size);
+        const auto named = name_indices.find(name);
+        if (named == name_indices.end()) { reject("unknown loader source name"); }
+        const auto identity = named->second.find(domains[i]);
+        if (identity == named->second.end() || identity->second == SIZE_MAX) { reject("unknown or ambiguous source domain"); }
+        auto & bound = result.sources[identity->second];
+        const auto * tensor = bound.tensor;
+        if (types[i] != uint32_t(tensor->type) || offsets[i + 1] - offsets[i] != uint64_t(tensor->ne[2]) ||
+                !std::equal(tensor->ne, tensor->ne + GGML_MAX_DIMS, shapes + i * 4)) { reject("source type or shape mismatch"); }
+        uint64_t total = 0;
+        for (uint64_t index = offsets[i]; index < offsets[i + 1]; ++index) {
+            if (counts[index] > UINT64_MAX - total) { reject("observation count overflow"); }
+            total += counts[index];
+        }
+        if (total != observations[i]) { reject("observation total mismatch"); }
+        const auto * first = counts + size_t(offsets[i]);
+        const auto * last = counts + size_t(offsets[i + 1]);
+        if (!bound.counts.empty()) {
+            if (bound.observations != total || !std::equal(bound.counts.begin(), bound.counts.end(), first)) { reject("contradictory source aliases"); }
+        } else {
+            bound.observations = total;
+            bound.counts.assign(first, last);
+        }
+    }
+    for (const auto & source : result.sources) {
+        if (source.counts.empty()) { reject("profile omits a returned expert source"); }
+    }
+    return result;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -40,6 +203,20 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool moe_hybrid_required_for_context(const char * mode, llama_context_type context_type) {
+    if (mode != nullptr && strcmp(mode, "required") != 0 && strcmp(mode, "off") != 0) {
+        throw std::runtime_error("GGML_MOE_HYBRID must be off or required");
+    }
+    GGML_UNUSED(context_type);
+    return mode != nullptr && strcmp(mode, "required") == 0;
+}
+
+static bool moe_hybrid_execution_supported(bool required, uint32_t domain, uint32_t row_semantics) {
+    constexpr bool main_speculative_supported = true;
+    return !required || domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
+        row_semantics != GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE || main_speculative_supported;
 }
 
 static uint64_t graph_execution_next_owner_namespace() {
@@ -79,7 +256,7 @@ static bool graph_supports_required_grouped_execution(ggml_backend_sched_t sched
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         auto * node = ggml_graph_node(gf, i);
         // Splitting can replace a cached bank with a transfer tensor. Check every MMID owner.
-        if (node->op != GGML_OP_MUL_MAT_ID) {
+        if (node->op != GGML_OP_MUL_MAT_ID || ggml_is_empty(node)) {
             continue;
         }
         participating = true;
@@ -465,6 +642,15 @@ bool llama_speculative_grouped_intent_test_access::backend_supported(ggml_backen
     return backend_supports_required_grouped_execution(backend);
 }
 
+bool llama_speculative_grouped_intent_test_access::hybrid_required(const char * mode, llama_context_type context_type) {
+    return moe_hybrid_required_for_context(mode, context_type);
+}
+
+bool llama_speculative_grouped_intent_test_access::hybrid_execution_supported(
+        bool required, uint32_t domain, uint32_t row_semantics) {
+    return moe_hybrid_execution_supported(required, domain, row_semantics);
+}
+
 bool llama_speculative_grouped_intent_test_access::graph_supported(ggml_backend_sched_t sched, ggml_cgraph * gf) {
     return graph_supports_required_grouped_execution(sched, gf);
 }
@@ -729,7 +915,9 @@ const ggml_backend_moe_candidate_snapshot_v2 & llama_moe_candidate_snapshot::get
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              const char * profile_path,
+              const char * profile_adaptation) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -739,6 +927,122 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
     graph_execution_owner_namespace = graph_execution_next_owner_namespace();
+    const char * moe_hybrid = getenv("GGML_MOE_HYBRID_METADATA");
+    moe_hybrid_metadata = moe_hybrid != nullptr && atoi(moe_hybrid) != 0;
+    const char * hybrid_mode = getenv("GGML_MOE_HYBRID");
+    moe_hybrid_required = moe_hybrid_required_for_context(hybrid_mode, params.ctx_type);
+    moe_source_graph_capacity = params.moe_source_graph_capacity;
+    moe_hybrid_metadata |= moe_hybrid_required;
+    if (moe_hybrid_required) {
+        if (const char * executor = getenv("GGML_MOE_HYBRID_EXECUTOR")) {
+            const bool source_executor = strcmp(executor, "source") == 0;
+            if (strcmp(executor, "eager") != 0 && strcmp(executor, "fidelity") != 0 && !source_executor) {
+                throw std::runtime_error("GGML_MOE_HYBRID_EXECUTOR must be eager, source or fidelity");
+            }
+            moe_hybrid_executor = strcmp(executor, "fidelity") == 0 || source_executor ?
+                GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY : GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_EAGER;
+            if (source_executor && !ggml_moe_fidelity_selection().valid) {
+                throw std::runtime_error("source hybrid execution requires a finite GGML_MOE_SOURCE_GPU_MISS_FRACTION in [0,1] and compatible pipeline settings");
+            }
+            if (moe_hybrid_executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY && !source_executor) {
+                const char * live_experiment = getenv("GGML_MOE_FIDELITY_LIVE_EXPERIMENT");
+                if (live_experiment == nullptr || strcmp(live_experiment, "1") != 0) {
+                    throw std::runtime_error("fidelity hybrid execution requires GGML_MOE_FIDELITY_LIVE_EXPERIMENT=1");
+                }
+            }
+        }
+        if (const char * batch = getenv("GGML_MOE_HYBRID_RESIDENT_BATCH")) {
+            if (strcmp(batch, "off") != 0 && strcmp(batch, "on") != 0) {
+                throw std::runtime_error("GGML_MOE_HYBRID_RESIDENT_BATCH must be off or on");
+            }
+            moe_hybrid_resident_batch = strcmp(batch, "on") == 0;
+        }
+        if (const char * admission = getenv("GGML_MOE_HYBRID_ADMISSION")) {
+            if (strcmp(admission, "off") != 0 && strcmp(admission, "demand") != 0) {
+                throw std::runtime_error("GGML_MOE_HYBRID_ADMISSION must be off or demand");
+            }
+            moe_hybrid_demand_admission = strcmp(admission, "demand") == 0;
+        }
+        if (const char * quota = getenv("GGML_MOE_HYBRID_GPU_MISSES")) {
+            char * end = nullptr;
+            const unsigned long long value = strtoull(quota, &end, 10);
+            if (quota[0] < '0' || quota[0] > '9' || *end != '\0' || value > UINT32_MAX) {
+                throw std::runtime_error("GGML_MOE_HYBRID_GPU_MISSES must be an unsigned 32-bit integer");
+            }
+            moe_hybrid_gpu_misses = value;
+        }
+        if (const char * quota = getenv("GGML_MOE_HYBRID_ADMISSION_MISSES")) {
+            char * end = nullptr;
+            const unsigned long long value = strtoull(quota, &end, 10);
+            if (quota[0] < '0' || quota[0] > '9' || *end != '\0' || value > UINT32_MAX) {
+                throw std::runtime_error("GGML_MOE_HYBRID_ADMISSION_MISSES must be an unsigned 32-bit integer");
+            }
+            moe_hybrid_admission_misses = value;
+        }
+        if (moe_hybrid_admission_misses == UINT32_MAX) {
+            moe_hybrid_admission_misses = moe_hybrid_gpu_misses;
+        }
+        if (moe_hybrid_admission_misses > moe_hybrid_gpu_misses) {
+            throw std::runtime_error("GGML_MOE_HYBRID_ADMISSION_MISSES must not exceed GGML_MOE_HYBRID_GPU_MISSES");
+        }
+    }
+
+    const char * path = profile_path;
+    const char * adapt = profile_adaptation;
+    if (!profile_path && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        path = getenv("GGML_MOE_EXPERT_PROFILE");
+        adapt = getenv("GGML_MOE_HYBRID_PROFILE_ADAPT");
+    }
+    if (adapt && (!profile_path || strcmp(adapt, "off"))) {
+        if ((strcmp(adapt, "occurrence") && strcmp(adapt, "occurrence-sync")) || !source_core_enabled() || !path) {
+            throw std::runtime_error("MoE profile adaptation requires occurrence or occurrence-sync, a profile and generic source execution");
+        }
+        moe_hybrid_profile_adapt = !strcmp(adapt, "occurrence") ? 2 : 1;
+    }
+    if (path) {
+        if (!*path || (moe_hybrid_required && !source_core_enabled()) || model.moe_expert_cache_slots() <= 0) {
+            throw std::runtime_error("GGML_MOE_EXPERT_PROFILE requires a positive cache capacity and a supported grouped executor");
+        }
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        const auto extent = file ? file.tellg() : std::streampos(-1);
+        if (extent < 24 || extent > 64 * 1024 * 1024) { throw std::runtime_error("MoE profile file is unavailable or too large"); }
+        std::vector<uint8_t> bytes(static_cast<size_t>(extent));
+        file.seekg(0);
+        if (!file.read(reinterpret_cast<char *>(bytes.data()), bytes.size())) { throw std::runtime_error("MoE profile read failed"); }
+        if (!memcmp(bytes.data(), "GGUF", 4)) {
+            moe_profile_statistics = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), model.moe_sources());
+            for (const auto & source : moe_profile_statistics.sources) {
+                moe_statistics.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+            }
+            LLAMA_LOG_INFO("moe-profile: file=%s sources=%zu identity=source-name/domain/type/shape policy=canonical byte-weighted statistics use runtime capacities\n", path, moe_statistics.size());
+        } else {
+            std::vector<uint32_t> counts(model.hparams.n_layer(), 0);
+            std::vector<const ggml_tensor *> down(counts.size(), nullptr);
+            for (const auto & source : model.moe_sources()) {
+                if (source.layer >= 0 && size_t(source.layer) >= counts.size()) { continue; }
+                if (source.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY || !source.route_present ||
+                        source.layer < 0 || size_t(source.layer) >= counts.size() || counts[source.layer]) {
+                    throw std::runtime_error("STRP profile cannot bind ambiguous routing layer identities");
+                }
+                for (const auto & bank : source.banks) {
+                    if (bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) { down[source.layer] = bank.tensor; }
+                }
+                if (!down[source.layer] || down[source.layer]->ne[2] <= 0 || down[source.layer]->ne[2] > 65536) {
+                    throw std::runtime_error("STRP profile requires a valid routing expert geometry");
+                }
+                counts[source.layer] = down[source.layer]->ne[2];
+            }
+            moe_profile_ranks = llama_moe_profile_parse(bytes.data(), bytes.size(), counts);
+            for (size_t layer = 0; layer < counts.size(); ++layer) {
+                if (!counts[layer]) { continue; }
+                if (moe_profile_ranks[layer].size() < std::min<uint32_t>(std::max(model.moe_expert_cache_slots(model.dev_layer(layer)), 0), counts[layer])) {
+                    throw std::runtime_error("STRP profile has insufficient ranked experts for the requested layer capacity");
+                }
+                moe_profiles.push_back({down[layer], moe_profile_ranks[layer].data(), uint32_t(moe_profile_ranks[layer].size())});
+            }
+            LLAMA_LOG_INFO("moe-profile: file=%s groups=%zu identity=geometry-only policy=static ranked IDs use runtime capacities\n", path, moe_profiles.size());
+        }
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1163,6 +1467,35 @@ llama_context::llama_context(
         }
     }
 
+    if (source_core_enabled() && moe_statistics.empty() && moe_profiles.empty() &&
+            params.ctx_other && params.ctx_other->source_core_enabled() &&
+            &params.ctx_other->model == &model) {
+        llama_moe_profile_statistics statistics;
+        uint32_t adaptation = 0;
+        {
+            auto & parent = *params.ctx_other;
+            std::unique_lock<std::timed_mutex> publication_lock(parent.moe_source_publication_mutex, std::try_to_lock);
+            if (!publication_lock.owns_lock()) { throw std::runtime_error("cannot snapshot an active source profile publication"); }
+            std::lock_guard<std::mutex> caller_lock(parent.moe_source_mutex);
+            if (parent.moe_source_callers || parent.moe_source_closed.load() || parent.moe_source_poisoned.load() || parent.moe_profile_failed) {
+                throw std::runtime_error("cannot inherit source statistics from an unavailable context");
+            }
+            statistics = parent.moe_profile_statistics;
+            adaptation = parent.moe_hybrid_profile_adapt;
+        }
+        if (!statistics.sources.empty()) {
+            std::vector<ggml_backend_moe_source_statistics_v1> views;
+            views.reserve(statistics.sources.size());
+            for (const auto & source : statistics.sources) {
+                views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+            }
+            if (!initialize_moe_statistics(views)) { throw std::runtime_error("cannot install inherited source statistics"); }
+            moe_hybrid_profile_adapt = adaptation;
+            LLAMA_LOG_INFO("moe-profile: inherited sources=%zu identity=same-model-object adaptation=%u storage=context-owned\n",
+                moe_statistics.size(), moe_hybrid_profile_adapt);
+        }
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -1175,6 +1508,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    GGML_ASSERT(close_source_core_checked() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1207,6 +1541,20 @@ llama_context::~llama_context() {
     if (sched_buffer_borrower != nullptr && sched_buffer_borrower->sched_buffer_owner == this) {
         sched_buffer_borrower->sched_buffer_owner = nullptr;
         sched_buffer_borrower->sched_buffers_shared = false;
+    }
+}
+
+bool llama_context::set_mtp_draft_vocab(const char * path) {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || mtp_draft_vocab || mtp_draft_vocab_locked || workspace_in_flight) {
+        LLAMA_LOG_ERROR("%s: configure an MTP context before its first decode\n", __func__);
+        return false;
+    }
+    try {
+        mtp_draft_vocab = std::make_unique<llama_draft_vocab>(model, path);
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
     }
 }
 
@@ -1376,11 +1724,7 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
     GGML_ASSERT(capacity > 0);
     required = std::max(1u, std::min(required, capacity));
 
-    uint32_t result = std::min(256u, capacity);
-    while (result < required) {
-        result = uint32_t(std::min<uint64_t>(capacity, uint64_t(result) * 2));
-    }
-    return result;
+    return llama_memory_graph_extent(required, capacity, 256u);
 }
 
 llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
@@ -1431,6 +1775,7 @@ llama_context * llama_context::shared_workspace_peer() const {
 }
 
 void llama_context::reset_sched_workspace() {
+    GGML_ASSERT(reset_source_core_checked() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
     sched.reset();
     cparams.flash_attn_causal_prefix_supported = false;
     for (auto & res : gf_res_prev) {
@@ -1440,6 +1785,7 @@ void llama_context::reset_sched_workspace() {
     gf_res_prev_active = nullptr;
     sched_buffer_generation = 0;
     sched_shrink_generation = 0;
+    sched_source_retirement_epoch = 0;
     sched_buffers_shared = false;
     workspace_in_flight = false;
     sched_reserved_tokens = 0;
@@ -1470,6 +1816,7 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 
     // A backing generation change invalidates cached graph addresses.
     if (generation != sched_buffer_generation) {
+        GGML_ASSERT(reset_source_core_checked() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
         synchronize();
         ggml_backend_sched_reset(sched.get());
         for (auto & res : gf_res_prev) {
@@ -1531,6 +1878,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
     }
 
+    GGML_ASSERT(reset_source_core_checked() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
     synchronize();
     refresh_moe_candidates();
 
@@ -1737,6 +2085,156 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 }
 
+bool llama_context::initialize_moe_profile() {
+    if (source_core_enabled()) { return !moe_profile_failed; }
+    return initialize_moe_placement(moe_profiles, moe_statistics);
+}
+
+bool llama_context::initialize_moe_profile(const std::vector<ggml_backend_moe_static_profile_v1> & profiles) {
+    return initialize_moe_placement(profiles, {});
+}
+
+bool llama_context::initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics) {
+    return initialize_moe_placement({}, statistics);
+}
+
+bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics) {
+    if (profiles.empty() && statistics.empty()) { return true; }
+    if (profiles.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || (!profiles.empty() && !statistics.empty()) ||
+            statistics.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS ||
+            !ggml_moe_source_statistics_valid(statistics.data(), uint32_t(statistics.size()))) { return false; }
+    if (source_core_enabled()) {
+        std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::try_to_lock);
+        if (!publication_lock.owns_lock()) { return false; }
+        std::lock_guard<std::mutex> caller_lock(moe_source_mutex);
+        if (moe_source_callers || moe_source_closed.load() || moe_source_poisoned.load() || moe_profile_failed ||
+                !moe_source_graph_variants.empty() || ggml_backend_sched_moe_source_selected_v1(sched.get())) { return false; }
+        try {
+            std::map<uint32_t, std::unordered_set<const ggml_tensor *>> known;
+            size_t expected = 0;
+            for (const auto & source : model.moe_sources()) {
+                for (const auto & bank : source.banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor &&
+                            known[source.domain].insert(bank.tensor).second) { ++expected; }
+                }
+            }
+            const auto known_tensor = [&](const ggml_tensor * tensor) {
+                return std::any_of(known.begin(), known.end(), [&](const auto & domain) { return domain.second.count(tensor) != 0; });
+            };
+            std::vector<std::vector<int32_t>> ranks;
+            std::vector<ggml_backend_moe_static_profile_v1> profile_views;
+            std::unordered_set<const ggml_tensor *> ranked;
+            uint64_t rank_count = 0;
+            ranks.reserve(profiles.size()); profile_views.reserve(profiles.size());
+            for (const auto & profile : profiles) {
+                if (!profile.down || !known_tensor(profile.down) || !profile.experts || !profile.n_experts ||
+                        profile.down->ne[2] <= 0 || profile.down->ne[2] > 65536 ||
+                        profile.n_experts > uint64_t(profile.down->ne[2]) ||
+                        profile.n_experts > (1u << 22) - rank_count || !ranked.insert(profile.down).second) { return false; }
+                rank_count += profile.n_experts;
+                std::vector<uint8_t> seen(profile.down->ne[2], 0);
+                for (uint32_t index = 0; index < profile.n_experts; ++index) {
+                    const int32_t expert = profile.experts[index];
+                    if (expert < 0 || expert >= profile.down->ne[2] || seen[expert]++) { return false; }
+                }
+                ranks.emplace_back(profile.experts, profile.experts + profile.n_experts);
+                profile_views.push_back({profile.down, ranks.back().data(), profile.n_experts});
+            }
+            llama_moe_profile_statistics owned;
+            std::vector<ggml_backend_moe_source_statistics_v1> statistic_views;
+            owned.sources.reserve(statistics.size()); statistic_views.reserve(statistics.size());
+            if (!statistics.empty() && statistics.size() != expected) { return false; }
+            for (const auto & source : statistics) {
+                const auto domain = known.find(source.domain);
+                if (domain == known.end() || !domain->second.count(source.tensor)) { return false; }
+                owned.sources.push_back({source.tensor, source.domain, source.observations,
+                    std::vector<uint64_t>(source.counts, source.counts + source.n_experts)});
+                statistic_views.push_back({source.tensor, owned.sources.back().counts.data(), source.observations, source.n_experts, source.domain});
+            }
+            owned.provenance = "Caller-supplied statistics validated against the canonical source catalog";
+            moe_profile_ranks = std::move(ranks);
+            moe_profiles = std::move(profile_views);
+            moe_profile_statistics = std::move(owned);
+            moe_statistics = std::move(statistic_views);
+            LLAMA_LOG_INFO("moe-profile: stored source configuration ranks=%zu statistics=%zu application=next-graph-prepare\n",
+                moe_profiles.size(), moe_statistics.size());
+            return true;
+        } catch (...) { return false; }
+    }
+    if (moe_profile_failed || cparams.n_seq_max != 1) {
+        LLAMA_LOG_ERROR("moe-profile: GPU initialization requires a single quiescent request\n");
+        return false;
+    }
+    synchronize();
+    refresh_moe_candidates();
+    std::vector<std::vector<ggml_backend_moe_static_profile_v1>> per_owner(backends.size());
+    std::vector<ggml_backend_moe_profile_initialize_v1_t> endpoints(backends.size(), nullptr);
+    std::vector<std::vector<ggml_backend_moe_source_statistics_v1>> per_owner_statistics(backends.size());
+    std::vector<ggml_backend_moe_statistics_initialize_v1_t> statistics_endpoints(backends.size(), nullptr);
+    for (const auto & source : statistics) {
+        if (!source.tensor || !source.tensor->buffer || !source.counts || !source.n_experts) { return false; }
+        if (!is_moe_cached_tensor(source.tensor)) { continue; }
+        auto * device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(source.tensor->buffer));
+        bool found = false;
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (!device || ggml_backend_get_device(backends[i].get()) != device) { continue; }
+            auto * reg = ggml_backend_dev_backend_reg(device);
+            statistics_endpoints[i] = reinterpret_cast<ggml_backend_moe_statistics_initialize_v1_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V1_PROC_NAME));
+            if (!statistics_endpoints[i]) { return false; }
+            per_owner_statistics[i].push_back(source); found = true; break;
+        }
+        if (!found) { return false; }
+    }
+    for (const auto & profile : profiles) {
+        if (!profile.down || !profile.down->buffer || !profile.experts || !profile.n_experts) { return false; }
+        auto * buffer_type = ggml_backend_buffer_get_type(profile.down->buffer);
+        auto * device = ggml_backend_buft_get_device(buffer_type);
+        if (!device) { return false; }
+        bool found = false;
+        for (size_t i = 0; i < backends.size(); ++i) {
+            auto * backend = backends[i].get();
+            if (ggml_backend_get_device(backend) != device) { continue; }
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            endpoints[i] = reinterpret_cast<ggml_backend_moe_profile_initialize_v1_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_PROFILE_INITIALIZE_V1_PROC_NAME));
+            if (!endpoints[i]) { return false; }
+            per_owner[i].push_back(profile);
+            found = true;
+            break;
+        }
+        if (!found) { return false; }
+    }
+    ggml_backend_moe_source_owner_v1 owner = {};
+    ggml_backend_moe_source_lease_v1 lease = {};
+    lease.struct_size = sizeof(lease);
+    lease.abi_version = GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION;
+    if (!model.moe_source_owner_v1(&owner) || !owner.retain || !owner.release ||
+            owner.retain(&owner, owner.generation, &lease) != GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK) { return false; }
+    const int64_t start = ggml_time_us();
+    uint64_t total = 0;
+    bool ok = true;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (per_owner[i].empty() && per_owner_statistics[i].empty()) { continue; }
+        uint64_t bytes = 0;
+        const bool applied = per_owner_statistics[i].empty() ?
+            endpoints[i](backends[i].get(), per_owner[i].data(), per_owner[i].size(), 0, &bytes) :
+            statistics_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_statistics[i].size(), 0, &bytes);
+        if (!applied) { ok = false; break; }
+        total += bytes;
+    }
+    const bool released = owner.release(&lease) == GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK;
+    moe_profile_failed = !ok || !released;
+    fprintf(stderr, "moe-profile: GPU update ranks=%zu statistics=%zu copied_bytes=%llu wall_us=%lld success=%d policy=frequency-aware live replacement\n",
+        profiles.size(), statistics.size(), (unsigned long long) total, (long long) (ggml_time_us() - start), !moe_profile_failed);
+    return !moe_profile_failed;
+}
+
+bool llama_moe_profile_initialize(llama_context * ctx) {
+    return ctx && ctx->initialize_moe_profile();
+}
+
 void llama_context::refresh_moe_candidates() {
     if (!moe_candidate_refresh_pending) {
         return;
@@ -1781,25 +2279,18 @@ void llama_context::refresh_moe_layer_owners() {
     std::vector<ggml_backend_t> owners(model.layers.size(), nullptr);
     bool                        participating = false;
     bool                        supported     = true;
-    for (const auto & source : model.moe_sources()) {
-        if (source.layer < 0 || size_t(source.layer) >= owners.size()) {
-            continue;
-        }
-        bool cached = false;
-        for (const auto & bank : source.banks) {
-            cached = cached || is_moe_cached_tensor(bank.tensor);
-        }
-        if (!cached) {
+    for (const auto & use : model.tensor_uses()) {
+        if (use.layer < 0 || size_t(use.layer) >= owners.size() || !is_moe_cached_tensor(use.tensor)) {
             continue;
         }
         participating = true;
         for (const auto & backend : backends) {
-            if (ggml_backend_get_device(backend.get()) == model.dev_layer(source.layer)) {
-                owners[source.layer] = backend.get();
+            if (ggml_backend_get_device(backend.get()) == model.dev_layer(use.layer)) {
+                owners[use.layer] = backend.get();
                 break;
             }
         }
-        supported = supported && backend_supports_required_grouped_execution(owners[source.layer]);
+        supported = supported && backend_supports_required_grouped_execution(owners[use.layer]);
     }
     const bool capability_changed            = moe_required_grouped_execution_supported != (participating && supported);
     moe_required_grouped_execution_supported = participating && supported;
@@ -1807,6 +2298,7 @@ void llama_context::refresh_moe_layer_owners() {
         return;
     }
     if (sched) {
+        if (reset_source_core_checked() != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { return; }
         ggml_backend_sched_synchronize(sched.get());
         ggml_backend_sched_reset(sched.get());
         for (auto & res : gf_res_prev) {
@@ -1825,42 +2317,277 @@ void llama_context::refresh_moe_layer_owners() {
 }
 
 void llama_context::place_moe_regions(llm_graph_result * res) {
-    if (model.moe_expert_cache_slots() <= 0 || model.split_mode() != LLAMA_SPLIT_MODE_LAYER || !loras->empty()) {
+    if (model.moe_expert_cache_slots() <= 0 || model.split_mode() != LLAMA_SPLIT_MODE_LAYER ||
+            (!moe_hybrid_metadata && !loras->empty())) {
         return;
     }
     const auto & sources = model.moe_sources();
     for (auto & region : res->get_moe_regions()) {
-        if (region.layer < 0 || size_t(region.layer) >= moe_layer_owners.size() || !is_moe_cached_tensor(region.down)) {
+        if (region.layer < 0 || size_t(region.layer) >= moe_layer_owners.size()) {
             continue;
         }
-        for (uint32_t index = 0; index < sources.size() && index < GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS; ++index) {
-            const auto & source = sources[index];
-            if (source.layer != region.layer || source.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID) {
+        uint32_t semantic_group = UINT32_MAX;
+        uint32_t domain = 0;
+        bool valid = true;
+        for (auto * node : region.body_operations) {
+            if (!node || node->op != GGML_OP_MUL_MAT_ID || !is_moe_cached_tensor(node->src[0])) {
                 continue;
             }
-            for (const auto & bank : source.banks) {
-                if (bank.tensor == region.down && bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
-                    region.semantic_group = index;
-                    region.domain         = source.domain;
+            bool matched = false;
+            for (uint32_t index = 0; index < sources.size() && index < GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS; ++index) {
+                const auto & source = sources[index];
+                if (source.layer != region.layer || source.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID) {
+                    continue;
+                }
+                for (const auto & bank : source.banks) {
+                    if (bank.tensor != node->src[0] || bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        continue;
+                    }
+                    if (matched || (semantic_group != UINT32_MAX && domain != source.domain)) { valid = false; }
+                    if (semantic_group == UINT32_MAX) { semantic_group = index; domain = source.domain; }
+                    matched = true;
                 }
             }
+            if (!matched) { valid = false; }
+            if (!valid) { break; }
         }
         auto * owner = moe_layer_owners[region.layer];
-        if (region.semantic_group == UINT32_MAX || !backend_supports_required_grouped_execution(owner)) {
+        if (!valid || semantic_group == UINT32_MAX || !backend_supports_required_grouped_execution(owner)) {
             continue;
         }
         const bool placed = region.place(sched.get(), owner);
+        if (placed) { region.semantic_group = semantic_group; region.domain = domain; }
         LLAMA_LOG_INFO("moe-placement: layer=%d semantic_group=%u domain=%u owner=%s placed=%d operations=%zu\n",
-                       region.layer, region.semantic_group, region.domain, ggml_backend_name(owner), placed,
+                       region.layer, semantic_group, domain, ggml_backend_name(owner), placed,
                        region.operations.size());
     }
 }
 
+
+bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_decode,
+        const ggml_graph_execution_certificate * certificate) {
+    std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
+    if (source_core_enabled()) {
+        publication_lock.lock();
+        if (moe_source_closed.load() || moe_source_poisoned.load()) { return false; }
+    }
+    if (!moe_hybrid_metadata) {
+        return true;
+    }
+    if (moe_hybrid_required && ((!source_core_enabled() && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.n_seq_max != 1)) ||
+            cparams.pipeline_parallel || cparams.cb_eval != nullptr || (!source_core_enabled() && sched_buffer_owner != nullptr) ||
+            res->get_moe_regions().empty())) {
+        if (source_core_enabled()) {
+            if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
+            if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
+            LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=context-capability effects_started=0\n");
+            return true;
+        }
+        LLAMA_LOG_ERROR("moe-hybrid: unsupported context or missing MoE regions\n");
+        return false;
+    }
+    if (moe_hybrid_required && !hybrid_decode) {
+        return true;
+    }
+    if (hybrid_decode && source_core_enabled()) {
+        for (const auto & region : res->get_moe_regions()) {
+            auto * reg = region.backend ? ggml_backend_dev_backend_reg(ggml_backend_get_device(region.backend)) : nullptr;
+            if (!reg || !ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_SOURCE_CORE_V1_PROC_NAME)) {
+                if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
+                if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
+                LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=backend-capability effects_started=0\n");
+                return true;
+            }
+        }
+    }
+    uint64_t allocator_generation = 0;
+    uint64_t shrink_generation = 0;
+    ggml_backend_sched_get_buffer_state(sched.get(), &allocator_generation, &shrink_generation);
+    if (allocator_generation == 0) {
+        LLAMA_LOG_ERROR("moe-hybrid-metadata: allocator generation unavailable; enable phase-aware workspace\n");
+        return false;
+    }
+    uint32_t hybrid_region_count = 0;
+    uint32_t hybrid_prepared_region_count = 0;
+    if (hybrid_decode) {
+        const auto measure = [&](const llm_graph_result & graph, uint32_t & count, uint32_t & prepared_count) {
+            const auto & regions = graph.get_moe_regions();
+            if (regions.size() > UINT32_MAX) {
+                LLAMA_LOG_ERROR("moe-hybrid: region count exceeds the scheduler interface\n");
+                return false;
+            }
+            uint64_t prepared = 0;
+            count = 0;
+            for (const auto & region : regions) {
+                if (region.route == nullptr || region.route->ne[0] <= 0 || uint64_t(region.route->ne[0]) > UINT32_MAX ||
+                        region.route->ne[1] <= 0 || uint64_t(region.route->ne[1]) > UINT32_MAX ||
+                        uint64_t(region.route->ne[0]) > UINT32_MAX / uint64_t(region.route->ne[1])) {
+                    LLAMA_LOG_ERROR("moe-hybrid: route geometry exceeds the scheduler interface layer=%d\n", region.layer);
+                    return false;
+                }
+                const uint64_t projections = source_core_enabled() ? std::max<size_t>(1,
+                    std::count_if(region.body_operations.begin(), region.body_operations.end(),
+                        [](const ggml_tensor * node) { return node && node->op == GGML_OP_MUL_MAT_ID && !ggml_is_empty(node); })) : 1;
+                const uint64_t region_capacity = std::max<uint64_t>(region.route->ne[0] + 1, projections);
+                if (projections > UINT32_MAX || count > UINT32_MAX - projections || prepared > UINT32_MAX - region_capacity) {
+                    LLAMA_LOG_ERROR("moe-hybrid: prepared region capacity exceeds the scheduler interface layer=%d\n", region.layer);
+                    return false;
+                }
+                count += projections;
+                prepared += region_capacity;
+            }
+            prepared_count = prepared;
+            return true;
+        };
+        if (!measure(*res, hybrid_region_count, hybrid_prepared_region_count)) { return false; }
+        if (source_core_enabled() && gf_res_reserve) {
+            uint32_t reserved_count = 0, reserved_prepared = 0;
+            if (!measure(*gf_res_reserve, reserved_count, reserved_prepared)) { return false; }
+            hybrid_region_count = std::max(hybrid_region_count, reserved_count);
+            hybrid_prepared_region_count = std::max(hybrid_prepared_region_count, reserved_prepared);
+        }
+    }
+    for (auto & region : res->get_moe_regions()) {
+        if (!region.builder_cut_closed || region.has_lora) {
+            region.finalized_metadata.reset();
+            if (hybrid_decode) {
+                if (source_core_enabled()) {
+                    if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
+                    if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
+                    LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=expert-cut-capability layer=%d effects_started=0\n", region.layer);
+                    return true;
+                }
+                LLAMA_LOG_ERROR("moe-hybrid: unsupported region cut layer=%d\n", region.layer);
+                return false;
+            }
+            continue;
+        }
+        if (region.backend == nullptr) {
+            for (auto & clear : res->get_moe_regions()) {
+                clear.finalized_metadata.reset();
+            }
+            LLAMA_LOG_ERROR("moe-hybrid-metadata: required finalization failed layer=%d status=%d\n", region.layer,
+                            GGML_BACKEND_SCHED_REGION_STATUS_V1_NOT_FINALIZED);
+            return false;
+        }
+        const int32_t status = region.finalize_metadata(
+            sched.get(), res->get_gf(), graph_execution_owner_generation, allocator_generation);
+        if (status != GGML_BACKEND_SCHED_REGION_STATUS_V1_OK) {
+            for (auto & clear : res->get_moe_regions()) {
+                clear.finalized_metadata.reset();
+            }
+            LLAMA_LOG_ERROR("moe-hybrid-metadata: required finalization failed layer=%d status=%d\n", region.layer,
+                            status);
+            return false;
+        }
+        if (hybrid_decode) {
+            ggml_backend_moe_source_owner_v1 owner = {};
+            if ((!source_core_enabled() && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.n_seq_max != 1)) ||
+                    cparams.pipeline_parallel || cparams.cb_eval != nullptr || (!source_core_enabled() && sched_buffer_owner != nullptr) ||
+                    !model.moe_source_owner_v1(&owner)) {
+                LLAMA_LOG_ERROR("moe-hybrid: unsupported context or source owner\n");
+                return false;
+            }
+            ggml_backend_moe_hybrid_config_v1 config = {};
+            config.struct_size = sizeof(config);
+            config.n_threads = cparams.n_threads;
+            config.max_regions = hybrid_region_count;
+            config.max_prepared_regions = hybrid_prepared_region_count;
+            if (source_core_enabled()) {
+                const uint64_t variants = uint64_t(std::min(cparams.n_ubatch, std::max(cparams.n_outputs_max, sched_decode_outputs))) + 1;
+                if (config.max_prepared_regions > UINT32_MAX / variants) { return false; }
+                config.max_prepared_regions *= variants;
+            }
+            config.gpu_miss_quota = moe_hybrid_gpu_misses;
+            config.admission_quota = moe_hybrid_demand_admission ? moe_hybrid_admission_misses : 0;
+            config.demand_admission = moe_hybrid_demand_admission;
+            config.resident_batch = moe_hybrid_resident_batch;
+            config.executor = moe_hybrid_executor;
+            config.cpu_flags = GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNKNOWN_THREAD_STACK_BYTES;
+            if (getenv("GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS") != nullptr) {
+                config.cpu_flags |= GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNPROVEN_RUNTIME_ALLOCATIONS;
+            }
+            config.backend = region.backend;
+            config.source_owner = &owner;
+            config.profiles = moe_profiles.empty() ? nullptr : moe_profiles.data();
+            config.n_profiles = moe_profiles.size();
+            config.statistics = moe_statistics.empty() ? nullptr : moe_statistics.data();
+            config.n_statistics = moe_statistics.size();
+            config.profile_adaptation = moe_hybrid_profile_adapt;
+            config.cpu_module_acquire = ggml_backend_moe_cpu_module_acquire_v1;
+            config.module_retain = ggml_backend_moe_module_retain_v1;
+            config.module_release = ggml_backend_moe_module_release_v1;
+            int32_t prepared = ggml_backend_sched_moe_hybrid_configure_v1(sched.get(), &config);
+            if (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+                prepared = region.prepare_hybrid(sched.get(), owner, config.n_threads, certificate);
+                if (source_core_enabled() && (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION ||
+                        prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) {
+                    std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> projections;
+                    prepared = region.prepare_routed_metadata(owner, config.n_threads, projections);
+                    if (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+                        for (const auto & projection : projections) {
+                            auto descriptor = projection->descriptor();
+                            if (certificate) {
+                                descriptor.certificate = *certificate;
+                                descriptor.certificate.source_graph_uid = descriptor.source_graph_uid;
+                                descriptor.certificate.split_graph_uid = descriptor.split_graph_uid;
+                            }
+                            prepared = ggml_backend_sched_moe_hybrid_prepare_v1(sched.get(), &descriptor);
+                            if (prepared != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { break; }
+                        }
+                    }
+                    LLAMA_LOG_INFO("moe-source-operation-preparation: layer=%d projections=%zu status=%d\n", region.layer, projections.size(), prepared);
+                }
+            }
+            if (prepared != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+                if (source_core_enabled() && (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION ||
+                        prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) {
+                    if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
+                    if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
+                    LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=expert-trait-capability layer=%d status=%d effects_started=0\n",
+                        region.layer, prepared);
+                    return true;
+                }
+                LLAMA_LOG_ERROR("moe-hybrid: preparation failed layer=%d status=%d\n", region.layer, prepared);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool llama_context::moe_graph_supports_required_grouped(ggml_cgraph * gf) const {
+    if (moe_source_graph_capacity && gf_res_prev_active && gf_res_prev_active->get_gf() == gf &&
+            gf_res_prev_active->required_grouped_prepared) {
+        const auto & owners = gf_res_prev_active->required_grouped_backends;
+        for (auto * owner : owners) {
+            if (!backend_supports_required_grouped_execution(owner)) { return false; }
+        }
+        return model.moe_expert_cache_slots() > 0 && !owners.empty();
+    }
     return model.moe_expert_cache_slots() > 0 && graph_supports_required_grouped_execution(sched.get(), gf);
 }
 
+void llama_context::prepare_required_grouped_execution(llm_graph_result * res) {
+    if (!moe_source_graph_capacity) { return; }
+    auto * graph = res->get_gf();
+    auto & owners = res->required_grouped_backends;
+    owners.clear();
+    if (model.moe_expert_cache_slots() > 0) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            auto * node = ggml_graph_node(graph, i);
+            if (node->op != GGML_OP_MUL_MAT_ID || ggml_is_empty(node)) { continue; }
+            auto * owner = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+            if (std::find(owners.begin(), owners.end(), owner) == owners.end()) { owners.push_back(owner); }
+        }
+    }
+    res->required_grouped_prepared = true;
+}
+
 void llama_context::synchronize() {
+    if (ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+        GGML_ASSERT(ggml_backend_sched_moe_source_drain_v1(sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+    }
     if (!sched) {
         workspace_in_flight = false;
         return;
@@ -1874,6 +2601,193 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
     ++compute_sync_generation;
 }
+
+bool llama_context::source_core_enabled() const {
+    return moe_hybrid_required && moe_hybrid_executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY &&
+        ggml_moe_fidelity_selection().source_pool;
+}
+
+bool llama_context::begin_source_call() {
+    if (!source_core_enabled()) { return true; }
+    std::lock_guard<std::mutex> lock(moe_source_mutex);
+    if (moe_source_closed.load() || moe_source_poisoned.load() ||
+            (moe_source_callers && moe_source_caller != std::this_thread::get_id())) { return false; }
+    ++moe_source_callers;
+    moe_source_caller = std::this_thread::get_id();
+    return true;
+}
+
+void llama_context::end_source_call() {
+    if (!source_core_enabled()) { return; }
+    std::lock_guard<std::mutex> lock(moe_source_mutex);
+    GGML_ASSERT(moe_source_callers && moe_source_caller == std::this_thread::get_id());
+    if (!--moe_source_callers) { moe_source_caller = {}; }
+    moe_source_condition.notify_all();
+}
+
+int32_t llama_context::reset_source_core_checked(bool all_variants) {
+    if (!source_core_enabled()) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
+    if (!publication_lock.try_lock_for(std::chrono::seconds(5))) {
+        moe_source_poisoned.store(true);
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT;
+    }
+    if (all_variants) {
+        for (auto & variant : moe_source_graph_variants) {
+            const auto status = ggml_backend_sched_moe_source_reset_v1(variant.scheduler.get());
+            if (status) { moe_source_poisoned.store(true); return status; }
+        }
+        moe_source_graph_variants.clear();
+    }
+    if (ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+        const auto status = all_variants ? ggml_backend_sched_moe_source_reset_v1(sched.get()) :
+            ggml_backend_sched_moe_source_reset_graph_v1(sched.get());
+        if (status) { moe_source_poisoned.store(true); return status; }
+    }
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+bool llama_context::select_source_graph_variant(const ggml_graph_execution_certificate & certificate) {
+    const uint32_t rows = certificate.n_rows;
+    if (!source_core_enabled()) { return true; }
+    uint64_t generation = 0, shrink_generation = 0;
+    ggml_backend_sched_get_buffer_state(sched.get(), &generation, &shrink_generation);
+    const auto retirement_epoch = ggml_backend_sched_moe_source_retirement_epoch_v1(sched.get());
+    if (generation != sched_buffer_generation || retirement_epoch != sched_source_retirement_epoch) {
+        if (reset_source_core_checked()) { return false; }
+        for (auto & graph : gf_res_prev) { if (graph) { graph->reset(); } }
+        gf_res_prev_active = nullptr;
+        sched_buffer_generation = generation;
+        sched_shrink_generation = shrink_generation;
+        sched_source_retirement_epoch = retirement_epoch;
+    }
+    const uint32_t width_limit = std::min(cparams.n_ubatch, std::max(cparams.n_outputs_max, sched_decode_outputs));
+    if (!rows || rows > width_limit || graph_reuse_disable ||
+            sampled_inputs_device != use_sampled_input_async) {
+        if (!moe_source_graph_variants.empty() && reset_source_core_checked()) { return false; }
+        return true;
+    }
+    std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
+    if (!publication_lock.try_lock_for(std::chrono::seconds(5))) { moe_source_poisoned.store(true); return false; }
+    if (moe_source_poisoned || moe_source_closed) { return false; }
+    if (!memcmp(&moe_hybrid_graph_certificate, &certificate, sizeof(certificate)) &&
+            gf_res_prev_active && moe_source_active_outputs == n_outputs) { return true; }
+    if (!ggml_backend_sched_moe_source_selected_v1(sched.get()) || !gf_res_prev_active || !moe_hybrid_graph_certificate.n_rows ||
+        (moe_hybrid_graph_certificate.row_semantics != GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+         !(moe_hybrid_graph_certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED))) { return true; }
+
+    try {
+        moe_source_graph_variants.reserve(uint64_t(width_limit) + 1);
+    } catch (const std::exception &) {
+        moe_source_poisoned.store(true);
+        return false;
+    }
+
+    // Each capture keeps its scheduler splits and public tensor backing alive.
+    const auto drained = ggml_backend_sched_moe_source_drain_v1(sched.get());
+    if (drained) { moe_source_poisoned.store(true); return false; }
+    ggml_backend_sched_synchronize(sched.get());
+    workspace_in_flight = false;
+    auto found = std::find_if(moe_source_graph_variants.begin(), moe_source_graph_variants.end(),
+        [&](const auto & variant) { return variant.outputs == n_outputs && !memcmp(&variant.certificate, &certificate, sizeof(certificate)); });
+    moe_source_graph_variant next;
+    if (found == moe_source_graph_variants.end()) {
+        if (moe_source_graph_variants.size() >= width_limit) {
+            auto retired = std::move(moe_source_graph_variants.front());
+            moe_source_graph_variants.erase(moe_source_graph_variants.begin());
+            const auto status = ggml_backend_sched_moe_source_reset_v1(retired.scheduler.get());
+            if (status) {
+                moe_source_graph_variants.insert(moe_source_graph_variants.begin(), std::move(retired));
+                moe_source_poisoned.store(true);
+                return false;
+            }
+        }
+        ggml_backend_sched_t clone = nullptr;
+        const auto status = ggml_backend_sched_moe_source_clone_v1(sched.get(), &clone);
+        if (status) { moe_source_poisoned.store(true); return false; }
+        next.scheduler.reset(clone);
+        ggml_backend_sched_get_buffer_state(clone, &next.buffer_generation, &next.shrink_generation);
+    } else {
+        next = std::move(*found);
+        moe_source_graph_variants.erase(found);
+        uint64_t next_generation = 0, next_shrink = 0;
+        ggml_backend_sched_get_buffer_state(next.scheduler.get(), &next_generation, &next_shrink);
+        const auto next_epoch = ggml_backend_sched_moe_source_retirement_epoch_v1(next.scheduler.get());
+        if (next_generation != next.buffer_generation || next_epoch != next.retirement_epoch) {
+            const auto status = ggml_backend_sched_moe_source_reset_graph_v1(next.scheduler.get());
+            if (status) {
+                moe_source_graph_variants.push_back(std::move(next));
+                moe_source_poisoned.store(true);
+                return false;
+            }
+            for (auto & graph : next.graphs) { if (graph) { graph->reset(); } }
+            next.active = nullptr;
+            next.certificate = {};
+            next.buffer_generation = next_generation;
+            next.shrink_generation = next_shrink;
+            next.retirement_epoch = next_epoch;
+        }
+    }
+    moe_source_graph_variant previous;
+    previous.graphs = std::move(gf_res_prev);
+    previous.scheduler = std::move(sched);
+    previous.active = gf_res_prev_active;
+    previous.certificate = moe_hybrid_graph_certificate;
+    previous.outputs = moe_source_active_outputs;
+    previous.sampled_device = sampled_inputs_device;
+    previous.buffer_generation = sched_buffer_generation;
+    previous.shrink_generation = sched_shrink_generation;
+    previous.retirement_epoch = sched_source_retirement_epoch;
+    moe_source_graph_variants.push_back(std::move(previous));
+    gf_res_prev = std::move(next.graphs);
+    sched = std::move(next.scheduler);
+    gf_res_prev_active = next.active;
+    moe_hybrid_graph_certificate = next.certificate;
+    moe_source_active_outputs = next.outputs;
+    sampled_inputs_device = next.sampled_device;
+    sched_buffer_generation = next.buffer_generation;
+    sched_shrink_generation = next.shrink_generation;
+    sched_source_retirement_epoch = next.retirement_epoch;
+    LLAMA_LOG_DEBUG("moe-source-core-variants: selected_rows=%u sequences=%u domain=%u semantics=%u retained=%zu reused=%u\n",
+        rows, certificate.n_sequences, certificate.domain, certificate.row_semantics,
+        moe_source_graph_variants.size(), unsigned(next.active != nullptr));
+    return true;
+}
+
+int32_t llama_context::close_source_core_checked() {
+    if (!source_core_enabled()) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    const auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    {
+        std::lock_guard<std::mutex> lock(moe_source_mutex);
+        if (moe_source_callers && moe_source_caller == std::this_thread::get_id()) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_BUSY; }
+        moe_source_closed.store(true);
+    }
+    {
+        std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
+        if (!publication_lock.try_lock_until(expiry)) { moe_source_poisoned.store(true); return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT; }
+        if (sched) {
+            auto status = ggml_backend_sched_moe_source_close_v1(sched.get());
+            if (status) { moe_source_poisoned.store(true); return status; }
+            status = ggml_backend_sched_moe_source_drain_v1(sched.get());
+            if (status) { moe_source_poisoned.store(true); return status; }
+        }
+    }
+    {
+        std::unique_lock<std::mutex> lock(moe_source_mutex);
+        if (!moe_source_condition.wait_until(lock, expiry, [&] { return moe_source_callers == 0; })) {
+            moe_source_poisoned.store(true);
+            return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT;
+        }
+    }
+    return reset_source_core_checked();
+}
+
+struct llama_source_call_guard {
+    llama_context & context;
+    bool entered;
+    explicit llama_source_call_guard(llama_context & context) : context(context), entered(context.begin_source_call()) {}
+    ~llama_source_call_guard() { if (entered) { context.end_source_call(); } }
+};
 
 void llama_context::finish_compute(int64_t n_tokens, int64_t elapsed_us) {
     if (n_tokens == 1) {
@@ -1927,12 +2841,35 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+bool llama_context::set_moe_test_hook(ggml_backend_moe_hybrid_test_hook_v1_t hook, void * data) {
+    std::lock_guard<std::mutex> lock(moe_source_mutex);
+    if (!source_core_enabled() || moe_source_callers || moe_source_closed.load() || moe_source_poisoned.load()) { return false; }
+    moe_test_hook = hook;
+    moe_test_hook_data = hook ? data : nullptr;
+    moe_test_hook_set = true;
+    return true;
+}
+
+const llama_moe_test_frame * llama_context::get_moe_test_frame() const {
+    return moe_test_frame;
+}
+
 bool llama_context::shares_workspace_with(const llama_context & other) const {
     return sched_buffer_owner == &other || sched_buffer_borrower == &other;
 }
 
 int llama_context::attach_shared_workspace(llama_context & owner) {
-    if (this == &owner || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+    if (this != &owner && source_core_enabled() && owner.source_core_enabled() &&
+            model.moe_expert_cache_slots() > 0 && owner.model.moe_expert_cache_slots() > 0) {
+        std::scoped_lock lock(moe_source_mutex, owner.moe_source_mutex);
+        if (moe_source_callers || owner.moe_source_callers || moe_source_closed || owner.moe_source_closed ||
+                moe_source_poisoned || owner.moe_source_poisoned) { return -1; }
+        if (!has_evaluated_once && !gf_res_prev_active) {
+            sched_decode_outputs = std::max(sched_decode_outputs, owner.sched_decode_outputs);
+        }
+        return 0;
+    }
+    if (this == &owner ||
             !cparams.phase_aware_workspace || !owner.cparams.phase_aware_workspace ||
             model.hparams.no_alloc || owner.model.hparams.no_alloc ||
             sched_buffer_owner != nullptr || sched_buffer_borrower != nullptr ||
@@ -2045,6 +2982,7 @@ bool llama_context::memory_update(bool optimize, uint32_t n_tokens_req) {
         if (n_tokens_req > 0) {
             sched_reserve(n_tokens_req);
         }
+        if (reset_source_core_checked() != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { return false; }
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
@@ -2431,7 +3369,11 @@ bool llama_context::set_ple_prefetch(bool enabled) {
     if (!set_callback) { return false; }
     synchronize();
     set_callback(backend_cpu, enabled ? +[](const ggml_tensor * table, const ggml_tensor * indices, void * data) {
-        static_cast<const llama_model *>(data)->prefetch_rows(table, indices);
+        const auto * model = static_cast<const llama_model *>(data);
+        // Input setters already prefetch these tables.
+        if (!model->can_prefetch.count(table)) {
+            model->prefetch_rows(table, indices);
+        }
     } : nullptr, enabled ? const_cast<llama_model *>(&model) : nullptr);
     ple_prefetch = enabled;
     LLAMA_LOG_INFO("%s: lazy row prefetch %s for CPU GET_ROWS\n", __func__, enabled ? "enabled" : "disabled");
@@ -2631,15 +3573,23 @@ void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatc
     std::vector<input_storage> inputs;
     size_t size = 0;
     const auto & token_tensors = res->get_inp_token_tensors();
-    for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+    const auto append_input = [&](ggml_tensor * tensor) {
         if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->buffer ||
                 std::find(token_tensors.begin(), token_tensors.end(), tensor) != token_tensors.end()) {
-            continue;
+            return;
         }
         GGML_ASSERT(!tensor->view_src && tensor->buffer && tensor->data);
         GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == sampled_input_backend);
         inputs.push_back({tensor, tensor->buffer, tensor->data, size});
         size = sampled_input_staging_size(size, tensor);
+    };
+    const auto * reuse = std::getenv("GGML_MOE_INPUT_LIST_REUSE");
+    if (source_core_enabled() && (!reuse || strcmp(reuse, "0"))) {
+        for (auto * tensor : res->get_inp_tensors()) { append_input(tensor); }
+    } else {
+        for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+            append_input(tensor);
+        }
     }
 
     if (!stage.buffer || ggml_backend_buffer_get_size(stage.buffer.get()) < size) {
@@ -2708,21 +3658,98 @@ llm_graph_result * llama_context::process_ubatch(
         llama_memory_context_i * mctx,
         ggml_status & ret,
         const llama_graph_execution_intent * execution_intent) {
+    mtp_draft_vocab_locked = true;
+    if (moe_source_poisoned || moe_source_closed) { ret = GGML_STATUS_FAILED; return nullptr; }
     refresh_moe_layer_owners();
-    if (mctx && !mctx->apply()) {
+    if (moe_source_poisoned || moe_source_closed) { ret = GGML_STATUS_FAILED; return nullptr; }
+    const bool hybrid_speculative = moe_hybrid_required && execution_intent != nullptr &&
+        execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        execution_intent->row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+    const bool hybrid_independent = moe_hybrid_required && source_core_enabled() && ubatch.n_tokens > 1 &&
+        !hybrid_speculative && ubatch_has_independent_rows(ubatch);
+    const bool hybrid_auxiliary = moe_hybrid_required && source_core_enabled() && execution_intent != nullptr &&
+        execution_intent->domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+    const uint32_t hybrid_rows = moe_hybrid_required && (ubatch.n_tokens == 1 || hybrid_speculative || hybrid_independent || hybrid_auxiliary) ? ubatch.n_tokens : 0;
+    ggml_graph_execution_certificate requested_certificate = {};
+    if (moe_hybrid_required && !make_graph_execution_certificate(
+            &ubatch, execution_intent, moe_required_grouped_execution_supported, requested_certificate)) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    const bool source_capacity = moe_source_graph_capacity && source_core_enabled() && hybrid_rows != 0 &&
+        std::any_of(model.moe_sources().begin(), model.moe_sources().end(), [](const llama_moe_source_group & source) {
+            return std::any_of(source.banks.begin(), source.banks.end(), [](const llama_moe_source_bank & bank) {
+                return bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && is_moe_cached_tensor(bank.tensor);
+            });
+        });
+    if (mctx && !mctx->apply(source_capacity)) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    if (!select_source_graph_variant(hybrid_rows ? requested_certificate : ggml_graph_execution_certificate{})) { ret = GGML_STATUS_FAILED; return nullptr; }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    // Graph reuse must include the full topology and input compatibility.
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    if (moe_hybrid_required && memcmp(&moe_hybrid_graph_certificate, &requested_certificate, sizeof(requested_certificate))) {
+        gf_res_prev_active = nullptr;
+    }
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && sampled_inputs_device == use_sampled_input_async && res->can_reuse(gparams)) {
+    bool reactivated_mtp = false;
+    if (moe_source_graph_capacity && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            !graph_reuse_disable && !cparams.pipeline_parallel && !cparams.cb_eval &&
+            !use_sampled_input_async && !sampled_inputs_device && gf_res_prev_active != res &&
+            ggml_graph_n_nodes(gf) > 0 && !ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+        uint64_t generation = 0;
+        uint64_t shrink_generation = 0;
+        ggml_backend_sched_get_buffer_state(sched.get(), &generation, &shrink_generation);
+        const size_t index = n_outputs > 0;
+        if (generation != 0 && mtp_graph_buffer_generation[index] == generation &&
+                mtp_graph_shrink_generation[index] == shrink_generation && res->can_reuse(gparams)) {
+            acquire_shared_workspace();
+            ggml_backend_sched_synchronize(sched.get());
+            workspace_in_flight = false;
+            gf_res_prev_active = nullptr;
+            ggml_backend_sched_reset(sched.get());
+            // Scheduler copies belong to its active graph. Restore the original inputs before splitting again.
+            for (const auto & binding : mtp_graph_original_sources[index]) {
+                std::copy(binding.sources.begin(), binding.sources.end(), binding.tensor->src);
+            }
+            // Reallocate scratch tensors; model and memory buffers retain their owners.
+            for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor;
+                    tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+                if (tensor->buffer && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                    tensor->buffer = nullptr;
+                    tensor->data = nullptr;
+                    tensor->extra = nullptr;
+                }
+            }
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            place_moe_regions(res);
+            place_sampled_inputs(res);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            if (!finalize_moe_regions(res, false, nullptr)) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            prepare_required_grouped_execution(res);
+            ggml_backend_sched_get_buffer_state(sched.get(), &mtp_graph_buffer_generation[index],
+                    &mtp_graph_shrink_generation[index]);
+            gf_res_prev_active = res;
+            reactivated_mtp = true;
+            if (std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+                fprintf(stderr, "moe-graph-reuse: reactivate_mtp rows=%u outputs=%d\n", ubatch.n_tokens, n_outputs);
+            }
+        }
+    }
+
+    if (reactivated_mtp || (!graph_reuse_disable && gf_res_prev_active == res && sampled_inputs_device == use_sampled_input_async && res->can_reuse(gparams))) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2735,6 +3762,10 @@ llm_graph_result * llama_context::process_ubatch(
 
         n_reused++;
     } else {
+        if (std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+            fprintf(stderr, "moe-graph-reuse: rebuild rows=%u active=%u sampled_match=%u disabled=%u nodes=%d\n",
+                ubatch.n_tokens, unsigned(gf_res_prev_active == res), unsigned(sampled_inputs_device == use_sampled_input_async), unsigned(graph_reuse_disable), ggml_graph_n_nodes(gf));
+        }
         gf_res_prev_active = nullptr;
         bool rebuild_async = cparams.decode_boundary_overlap && use_sampled_input_async && sampled_inputs_device && !cparams.cb_eval && !cparams.pipeline_parallel;
         for (int i = 0; rebuild_async && i < ggml_graph_n_nodes(gf); ++i) {
@@ -2749,9 +3780,13 @@ llm_graph_result * llama_context::process_ubatch(
             ggml_backend_sched_synchronize(sched.get());
             workspace_in_flight = false;
         }
-        res->reset();
-
-        ggml_backend_sched_reset(sched.get());
+        if (ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+            if (reset_source_core_checked(false) != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { ret = GGML_STATUS_FAILED; return nullptr; }
+            res->reset();
+        } else {
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -2766,6 +3801,26 @@ llm_graph_result * llama_context::process_ubatch(
             return nullptr;
         }
 
+        if (moe_hybrid_metadata && !res->discover_moe_regions(model.moe_sources(), is_moe_cached_tensor)) {
+            LLAMA_LOG_ERROR("%s: incomplete canonical MoE projection coverage\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        if (moe_source_graph_capacity && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && n_outputs == 0 && !gparams.is_reserve && !cparams.cb_eval) {
+                res->retain_state_computation();
+            }
+            auto & bindings = mtp_graph_original_sources[n_outputs > 0];
+            bindings.clear();
+            bindings.reserve(ggml_graph_n_nodes(gf));
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                mtp_graph_sources binding = {};
+                binding.tensor = ggml_graph_node(gf, i);
+                std::copy(std::begin(binding.tensor->src), std::end(binding.tensor->src), binding.sources.begin());
+                bindings.push_back(binding);
+            }
+        }
         place_moe_regions(res);
         place_sampled_inputs(res);
         sampled_inputs_device = use_sampled_input_async;
@@ -2776,6 +3831,25 @@ llm_graph_result * llama_context::process_ubatch(
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (source_core_enabled()) {
+            ggml_backend_sched_get_buffer_state(sched.get(), &sched_buffer_generation, &sched_shrink_generation);
+            sched_source_retirement_epoch = ggml_backend_sched_moe_source_retirement_epoch_v1(sched.get());
+        }
+        ggml_graph_execution_certificate hybrid_certificate = {};
+        if (moe_hybrid_required && (!make_graph_execution_certificate(
+                &ubatch, execution_intent, moe_graph_supports_required_grouped(gf), hybrid_certificate) ||
+                (hybrid_rows != 0 && hybrid_certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC))) {
+            LLAMA_LOG_ERROR("%s: hybrid preparation has no validated execution certificate\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (!finalize_moe_regions(res, hybrid_rows != 0, hybrid_rows != 0 ? &hybrid_certificate : nullptr)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        prepare_required_grouped_execution(res);
+        moe_hybrid_graph_certificate = hybrid_certificate;
+        moe_source_active_outputs = n_outputs;
 
         if (use_sampled_input && !res->can_decode_sampled()) {
             LLAMA_LOG_ERROR("%s: rebuilt graph requires host token inputs\n", __func__);
@@ -2794,6 +3868,11 @@ llm_graph_result * llama_context::process_ubatch(
             }
         }
         gf_res_prev_active = res;
+        if (moe_source_graph_capacity && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            const size_t index = n_outputs > 0;
+            ggml_backend_sched_get_buffer_state(sched.get(), &mtp_graph_buffer_generation[index],
+                    &mtp_graph_shrink_generation[index]);
+        }
     }
 
     // set the input data for the input tensors
@@ -2833,6 +3912,12 @@ llm_graph_result * llama_context::process_ubatch(
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (moe_test_hook_set && hybrid_rows &&
+            !ggml_backend_sched_moe_hybrid_set_test_hook_v1(sched.get(), moe_test_hook, moe_test_hook_data)) {
+        LLAMA_LOG_ERROR("%s: failed to bind context MoE observer to prepared sessions\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch, execution_intent);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2857,6 +3942,8 @@ int32_t llama_context::decode_sampled(llama_seq_id seq_id, llama_pos pos, llama_
 }
 
 int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous) {
+    llama_source_call_guard source_guard(*this);
+    if (!source_guard.entered) { return -3; }
     if (!items || n_items <= 0 || (uint32_t) n_items > n_seq_max() ||
             (uint32_t) n_items > cparams.n_batch || (uint32_t) n_items > cparams.n_ubatch ||
             model.n_devices() != 1 || cparams.pipeline_parallel || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
@@ -2930,7 +4017,7 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
             return decode_sampled_host(items, n_items, sources, previous);
         }
         if (!staged_inputs_checked) {
-            staged_inputs = llama_staged_inputs::create(model, backend, ple_prefetch);
+            staged_inputs = llama_staged_inputs::create(model, backend, ple_prefetch, source_core_enabled());
             staged_inputs_checked = true;
             LLAMA_LOG_INFO("%s: Flash Next staged inputs %s\n", __func__, staged_inputs ? "enabled" : "unavailable, using host inputs");
             if (staged_inputs && ple_prefetch) {
@@ -3058,6 +4145,8 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    llama_source_call_guard source_guard(*this);
+    if (!source_guard.entered) { return -3; }
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -3319,6 +4408,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_execution_intent * intent) {
+    llama_source_call_guard source_guard(*this);
+    if (!source_guard.entered) { return -3; }
+    if (moe_source_poisoned || moe_source_closed) { return -3; }
     llama_graph_execution_intent execution_intent;
     bool has_execution_intent = intent != nullptr;
     if (intent && cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { return -1; }
@@ -3404,6 +4496,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_
     if (intent && !target_verification_intent_valid(intent, balloc->get_batch(), execution_intent)) {
         LLAMA_LOG_ERROR("%s: invalid target verification execution intent\n", __func__);
         return -1;
+    }
+
+    if (!moe_hybrid_execution_supported(moe_hybrid_required, execution_intent.domain, execution_intent.row_semantics)) {
+        LLAMA_LOG_ERROR("%s: required MAIN speculative hybrid execution is not supported\n", __func__);
+        return -3;
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -3564,6 +4661,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_
             has_execution_intent ? &execution_intent : nullptr);
 
         if (!res) {
+            if (moe_hybrid_required) {
+                // A failed hybrid turn can have written KV or recurrent state.
+                if (ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+                    if (reset_source_core_checked() != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
+                        LLAMA_LOG_ERROR("%s: source core drain failed; graph and memory owners retained\n", __func__);
+                        return -3;
+                    }
+                } else {
+                    ggml_backend_sched_synchronize(sched.get());
+                    ggml_backend_sched_reset(sched.get());
+                }
+                memory->clear(true);
+                for (auto & previous : gf_res_prev) { if (previous) { previous->reset(); } }
+                gf_res_prev_active = nullptr;
+                if (gf_res_reserve) { gf_res_reserve->reset(); }
+                moe_hybrid_graph_certificate = {};
+                n_outputs = 0;
+                ++graph_execution_owner_generation;
+                sched_need_reserve = true;
+                LLAMA_LOG_ERROR("%s: failed required target window drained; target memory and graph state invalidated\n", __func__);
+                return -3;
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -4235,6 +5354,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (moe_hybrid_metadata && !res->discover_moe_regions(model.moe_sources(), is_moe_cached_tensor)) {
+        LLAMA_LOG_ERROR("%s: incomplete canonical MoE projection coverage\n", __func__);
+        return nullptr;
+    }
+
     if (cparams.decode_boundary_overlap && n_tokens == n_seqs) {
         size_t size = 0;
         for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
@@ -4291,7 +5415,46 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.staged_inputs =*/ use_sampled_input_async && !is_reserve && ubatch.n_tokens == 1 ? staged_inputs.get() : nullptr,
+        /*.draft_vocab =*/ mtp_draft_vocab.get(),
     };
+}
+
+bool llama_context::make_graph_execution_certificate(
+        const llama_ubatch * ubatch, const llama_graph_execution_intent * execution_intent,
+        bool required_grouped_supported, ggml_graph_execution_certificate & certificate) const {
+    certificate = {};
+    const bool auxiliary = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    const uint32_t flags = required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
+    uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+    uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    uint32_t certificate_flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+    if (execution_intent) {
+        if (!ubatch || !ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
+            LLAMA_LOG_ERROR("%s: ubatch does not match the validated execution intent\n", __func__);
+            return false;
+        }
+        domain = execution_intent->domain;
+        row_semantics = execution_intent->row_semantics;
+        certificate_flags = flags;
+    } else if (ubatch && ubatch_has_independent_rows(*ubatch)) {
+        domain = auxiliary ? speculative_execution_domain(cparams.ctx_type) : GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+        certificate_flags = auxiliary ? flags : GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+    } else if (ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ubatch_has_sequential_spans(*ubatch)) {
+        domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+    } else {
+        if (auxiliary && flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
+            LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE execution shape\n", __func__);
+            return false;
+        }
+        return true;
+    }
+    certificate = {GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC, GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION,
+        sizeof(certificate), certificate_flags, domain, row_semantics, ubatch->n_tokens, ubatch->n_seqs_unq,
+        graph_execution_owner_namespace, graph_execution_owner_generation, 0, 0, {}};
+    return true;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4299,6 +5462,11 @@ ggml_status llama_context::graph_compute(
                    bool   batched,
     const llama_ubatch * ubatch,
     const llama_graph_execution_intent * execution_intent) {
+    if (execution_intent != nullptr && !moe_hybrid_execution_supported(
+            moe_hybrid_required, execution_intent->domain, execution_intent->row_semantics)) {
+        LLAMA_LOG_ERROR("%s: required MAIN speculative hybrid execution is not supported\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -4319,92 +5487,27 @@ ggml_status llama_context::graph_compute(
         workspace_in_flight = true;
     }
 
-    ggml_status status;
-    const bool  required_grouped_supported = moe_graph_supports_required_grouped(gf);
-    if (ubatch != nullptr && execution_intent != nullptr &&
-            execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
-        if (!ubatch_matches_graph_execution_intent(
-                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
-            LLAMA_LOG_ERROR("%s: target verification ubatch does not match the validated intent\n", __func__);
-            return GGML_STATUS_FAILED;
-        }
-        ggml_graph_execution_certificate certificate = {};
-        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
-        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
-        certificate.struct_size = sizeof(certificate);
-        certificate.flags =
-            required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
-        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
-        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
-        certificate.owner_namespace = graph_execution_owner_namespace;
-        certificate.owner_generation = graph_execution_owner_generation;
-        certificate.n_rows = ubatch->n_tokens;
-        certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
-    } else if (ubatch != nullptr && execution_intent != nullptr &&
-            (execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
-             execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP)) {
-        if (!ubatch_matches_graph_execution_intent(
-                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
-            LLAMA_LOG_ERROR("%s: speculative ubatch does not match the validated grouped intent\n", __func__);
-            return GGML_STATUS_FAILED;
-        }
-        ggml_graph_execution_certificate certificate = {};
-        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
-        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
-        certificate.struct_size = sizeof(certificate);
-        certificate.flags =
-            required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
-        certificate.domain = execution_intent->domain;
-        certificate.row_semantics = execution_intent->row_semantics;
-        certificate.owner_namespace = graph_execution_owner_namespace;
-        certificate.owner_generation = graph_execution_owner_generation;
-        certificate.n_rows = ubatch->n_tokens;
-        certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
-    } else if (execution_intent != nullptr) {
-        LLAMA_LOG_ERROR("%s: unsupported graph execution intent\n", __func__);
+    ggml_graph_execution_certificate certificate = {};
+    if (!make_graph_execution_certificate(ubatch, execution_intent, moe_graph_supports_required_grouped(gf), certificate)) {
         return GGML_STATUS_FAILED;
-    } else if (ubatch != nullptr && ubatch_has_independent_rows(*ubatch)) {
-        ggml_graph_execution_certificate certificate = {};
-        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
-        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
-        certificate.struct_size = sizeof(certificate);
-        certificate.owner_namespace = graph_execution_owner_namespace;
-        certificate.owner_generation = graph_execution_owner_generation;
-        certificate.n_rows = ubatch->n_tokens;
-        certificate.n_sequences = ubatch->n_seqs_unq;
-        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
-        switch (cparams.ctx_type) {
-            case LLAMA_CONTEXT_TYPE_DEFAULT: certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;  break;
-            case LLAMA_CONTEXT_TYPE_DRAFT  : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT; break;
-            case LLAMA_CONTEXT_TYPE_MTP    : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;   break;
-        }
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            certificate.flags =
-                required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
-        }
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
-    } else if (ubatch != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ubatch_has_sequential_spans(*ubatch)) {
-        ggml_graph_execution_certificate certificate = {};
-        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
-        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
-        certificate.struct_size = sizeof(certificate);
-        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
-        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
-        certificate.owner_namespace = graph_execution_owner_namespace;
-        certificate.owner_generation = graph_execution_owner_generation;
-        certificate.n_rows = ubatch->n_tokens;
-        certificate.n_sequences = ubatch->n_seqs_unq;
-        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    }
+    const auto compute = [&]() {
+        return certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ?
+            ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate) :
+            ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    };
+    ggml_status status;
+    if (moe_test_hook_set && moe_test_hook) {
+        if (!ubatch || moe_test_frame || moe_test_submission == UINT64_MAX) { return GGML_STATUS_FAILED; }
+        const llama_moe_test_frame frame{ubatch, &certificate, ++moe_test_submission, batched};
+        struct frame_scope {
+            const llama_moe_test_frame * & slot;
+            ~frame_scope() { slot = nullptr; }
+        } scope{moe_test_frame};
+        moe_test_frame = &frame;
+        status = compute();
     } else {
-        if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
-            required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported) !=
-                GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
-            LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE execution shape\n", __func__);
-            return GGML_STATUS_FAILED;
-        }
-        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+        status = compute();
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -5386,6 +6489,7 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
+    if (reset_source_core_checked() != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { return; }
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
@@ -5444,6 +6548,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            if (reset_source_core_checked() != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { break; }
             res->reset();
 
             auto * gf = model.build_graph(gparams);
@@ -5577,6 +6682,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_cpu_pinned               =*/ false,
         /*.recurrent_state_offload     =*/ false,
         /*.phase_aware_workspace       =*/ false,
+        /*.moe_source_graph_capacity   =*/ false,
         /*.live_context_workspace      =*/ false,
         /*.decode_boundary_overlap     =*/ false,
         /*.sampler                     =*/ nullptr,
@@ -5587,9 +6693,11 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+static llama_context * llama_init_from_model_impl(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params,
+                 const char * profile_path,
+                 const char * profile_adaptation) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -5677,7 +6785,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, profile_path, profile_adaptation);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -5694,6 +6802,19 @@ llama_context * llama_init_from_model(
     return nullptr;
 }
 
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
+    return llama_init_from_model_impl(model, params, nullptr, nullptr);
+}
+
+llama_context * llama_init_from_model_with_moe_profile(llama_model * model, llama_context_params params,
+        const char * path, const char * adaptation) {
+    if (!path || !*path) {
+        LLAMA_LOG_ERROR("%s: profile path cannot be empty\n", __func__);
+        return nullptr;
+    }
+    return llama_init_from_model_impl(model, params, path, adaptation);
+}
+
 // deprecated
 llama_context * llama_new_context_with_model(
                  llama_model * model,
@@ -5703,6 +6824,33 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+}
+
+bool llama_set_mtp_draft_vocab(llama_context * ctx, const char * path) {
+    return ctx && ctx->set_mtp_draft_vocab(path);
+}
+
+bool llama_write_mtp_draft_vocab(const llama_model * model, const int32_t * ids, size_t count, const char * path) {
+    try {
+        return model && llama_draft_vocab_write(model->vocab, ids, count, path);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
+int32_t llama_moe_source_context_close_v1(llama_context * ctx) {
+    return ctx ? ctx->close_source_core_checked() : GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID;
+}
+
+int32_t llama_moe_source_context_free_v1(llama_context ** ctx) {
+    if (!ctx) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    if (!*ctx) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    const auto status = (*ctx)->close_source_core_checked();
+    if (status) { return status; }
+    delete *ctx;
+    *ctx = nullptr;
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {
@@ -5883,6 +7031,28 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+bool llama_get_sampled_output_view(llama_context * ctx, int32_t i, llama_sampled_output_view * view) {
+    if (!ctx || !view) {
+        return false;
+    }
+    const auto & selection = ggml_moe_fidelity_selection();
+    if (!selection.valid || !selection.source_pool) {
+        return false;
+    }
+
+    ctx->synchronize();
+    *view = {};
+    view->probs = ctx->get_sampled_probs_ith(i);
+    view->logits = ctx->get_sampled_logits_ith(i);
+    view->candidates = ctx->get_sampled_candidates_ith(i);
+    if (view->probs) {
+        view->probs_count = static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+    } else if (view->logits) {
+        view->logits_count = static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
+    }
+    return true;
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

@@ -2,7 +2,7 @@
 #include "common.cuh"
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), execution_semantic_key_(0), execution_certificate_(), coverage_epoch_(0), coverage_mmid_fingerprint_(0), graph_node_count_(0), coverage_mmid_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
+    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), execution_semantic_key_(0), execution_certificate_(), coverage_epoch_(0), coverage_mmid_fingerprint_(0), graph_node_count_(0), coverage_mmid_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), source_residency_(false), inventory_complete_(false), unknown_reusable_(false) {
     for (auto & index : coverage_diagnostics_.first_node_index) {
         index = UINT32_MAX;
     }
@@ -46,6 +46,7 @@ void ggml_cuda_moe_graph_plan::reset() {
         index = UINT32_MAX;
     }
     initialized_ = false;
+    source_residency_ = false;
     inventory_complete_ = false;
     unknown_reusable_ = false;
 }

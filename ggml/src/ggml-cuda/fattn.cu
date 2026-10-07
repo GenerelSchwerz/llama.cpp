@@ -789,3 +789,72 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
 #endif
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+thread_local ggml_cuda_fattn_resource_query * ggml_cuda_fattn_query = nullptr;
+
+bool ggml_cuda_flash_attn_ext_prepare_resources(ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        ggml_cuda_fattn_resources & resources) {
+    if (ggml_cuda_fattn_query || !dst || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->type != GGML_TYPE_F32 ||
+            ctx.device < 0 || ctx.device >= ggml_cuda_info().device_count || ctx.curr_stream_no < 0 ||
+            ctx.curr_stream_no >= GGML_CUDA_MAX_STREAMS) { return false; }
+    const auto * Q = dst->src[0];
+    const auto * K = dst->src[1];
+    const auto * V = dst->src[2];
+    const auto * mask = dst->src[3];
+    if (!Q || !K || !V || Q->type != GGML_TYPE_F32) { return false; }
+    for (const auto * tensor : {dst, Q, K, V, mask, static_cast<const ggml_tensor *>(dst->src[4])}) {
+        if (!tensor) { continue; }
+        if (tensor->type < 0 || tensor->type >= GGML_TYPE_COUNT) { return false; }
+        uint64_t elements = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0 || tensor->ne[d] > INT32_MAX ||
+                    uint64_t(tensor->ne[d]) > uint64_t(INT64_MAX) / elements || tensor->nb[d] > size_t(INT64_MAX)) { return false; }
+            elements *= tensor->ne[d];
+        }
+        if (tensor == dst && elements > SIZE_MAX / sizeof(float)) { return false; }
+    }
+    if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type) ||
+            (mask && mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I64)) { return false; }
+    if (const auto * sinks = dst->src[4]) {
+        if (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || sinks->ne[0] != Q->ne[2] ||
+                sinks->ne[1] != 1 || sinks->ne[2] != 1 || sinks->ne[3] != 1) { return false; }
+    }
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) ||
+            Q->ne[0] != K->ne[0] || K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] ||
+            K->ne[3] != V->ne[3] || Q->ne[2] % K->ne[2] || Q->ne[3] != K->ne[3]) { return false; }
+    if (!ggml_is_contiguous(dst) || dst->ne[0] != V->ne[0] || dst->ne[1] != Q->ne[2] ||
+            dst->ne[2] != Q->ne[1] || dst->ne[3] != Q->ne[3] ||
+            (mask && (!ggml_is_contiguous(mask) || Q->ne[2] % mask->ne[2] || Q->ne[3] % mask->ne[3] ||
+                (mask->type != GGML_TYPE_I64 && mask->ne[0] < K->ne[1])))) { return false; }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (Q->nb[d] > INT32_MAX) { return false; }
+    }
+    for (const auto * tensor : {K, V}) {
+        for (int d = 1; d < 3; ++d) {
+            if (tensor->nb[d] > INT32_MAX) { return false; }
+            const uint64_t converted = uint64_t(tensor->nb[d]) * ggml_blck_size(tensor->type) * sizeof(half) / ggml_type_size(tensor->type);
+            if (converted > INT32_MAX) { return false; }
+        }
+    }
+    if (mask && (mask->nb[1] > INT32_MAX || mask->nb[2] > INT32_MAX ||
+            (mask->type != GGML_TYPE_I64 && mask->ne[1] < Q->ne[1]))) { return false; }
+    if (!ggml_cuda_flash_attn_ext_supported(ctx.device, dst)) { return false; }
+    int previous_device = 0;
+    if (cudaGetDevice(&previous_device) != cudaSuccess || cudaSetDevice(ctx.device) != cudaSuccess) { return false; }
+    struct device_guard {
+        int device;
+        ~device_guard() { (void) cudaSetDevice(device); }
+    } restore_device{previous_device};
+    const auto stream = ctx.borrowed_stream ? ctx.borrowed_stream : ctx.streams[ctx.device][ctx.curr_stream_no];
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capturing) != cudaSuccess || capturing != cudaStreamCaptureStatusNone) { return false; }
+    ggml_cuda_fattn_resource_query query;
+    struct query_guard {
+        explicit query_guard(ggml_cuda_fattn_resource_query * query) { ggml_cuda_fattn_query = query; }
+        ~query_guard() { ggml_cuda_fattn_query = nullptr; }
+    } restore_query{&query};
+    ggml_cuda_flash_attn_ext(ctx, const_cast<ggml_tensor *>(dst));
+    if (!query.visited || query.failed) { return false; }
+    resources = query.resources;
+    return true;
+}

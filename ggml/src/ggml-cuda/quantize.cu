@@ -1,6 +1,12 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+ggml_cuda_mmq_packing_layout ggml_cuda_mmq_get_packing_layout(ggml_prec precision) {
+    GGML_ASSERT(precision == GGML_PREC_Q8 || precision == GGML_PREC_Q4);
+    if (precision == GGML_PREC_Q4) { return {sizeof(block_fp4_mmq), QK_FP4_MMQ, MATRIX_ROW_PADDING}; }
+    return {sizeof(block_q8_1_mmq), QK8_1_MMQ, MATRIX_ROW_PADDING};
+}
+
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
 // and otherwise falls back to 2 128-bit loads
@@ -123,8 +129,19 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     return static_cast<uint8_t>(biased);
 }
 
+template <bool masked>
+static __device__ __forceinline__ bool mmq_scatter_row_used(const int32_t * ids, int n_expert_used) {
+    if constexpr (masked) {
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            if (ids[size_t(blockIdx.x)*n_expert_used + slot] >= 0) { return true; }
+        }
+        return false;
+    }
+    return true;
+}
+
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter, bool use_aligned_float8>
+template <bool scatter, bool use_aligned_float8, bool masked = false>
 static __global__ void quantize_mmq_nvfp4(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -132,6 +149,9 @@ static __global__ void quantize_mmq_nvfp4(
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
     const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
+
+    static_assert(!masked || scatter);
+    if (!mmq_scatter_row_used<masked>(ids, n_expert_used)) { return; }
 
     int64_t base_idx;
     if constexpr (scatter) {
@@ -184,6 +204,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                    if constexpr (masked) { if (i < 0) { continue; } }
                     scale[i] = warp_amax[0];
                 }
             } else {
@@ -310,6 +331,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                if constexpr (masked) { if (i < 0) { continue; } }
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -334,7 +356,7 @@ static __global__ void quantize_mmq_nvfp4(
 // quantize values in the format mxfp4 is stored which is interleaved nibbles
 // i.e. a block a0-a31 is represented as a0a16,a1a17 ...a15a31
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter>
+template <bool scatter, bool masked = false>
 static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
                                           const int32_t * __restrict__ ids,
                                           void * __restrict__ vy,
@@ -369,6 +391,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     const int base = group_id * 2;
 
     ggml_cuda_pdl_sync();
+    static_assert(!masked || scatter);
+    if (!mmq_scatter_row_used<masked>(ids, n_expert_used)) { return; }
+
     int64_t base_pos;
     if constexpr (scatter) {
         base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
@@ -428,6 +453,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if constexpr (masked) { if (i < 0) { continue; } }
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -454,7 +480,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool masked = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -471,6 +497,9 @@ static __global__ void quantize_mmq_q8_1(
 
     const int64_t i00 = i0;
     ggml_cuda_pdl_sync();
+
+    static_assert(!masked || scatter);
+    if (!mmq_scatter_row_used<masked>(ids, n_expert_used)) { return; }
 
     int64_t base_idx;
     if constexpr (scatter) {
@@ -527,6 +556,7 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if constexpr (masked) { if (i < 0) { continue; } }
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
@@ -603,7 +633,8 @@ void quantize_mmq_q8_1_cuda(
 }
 
 // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
-void quantize_scatter_mmq_q8_1_cuda(
+template <bool masked>
+static void quantize_scatter_mmq_q8_1_cuda_impl(
         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
@@ -615,15 +646,15 @@ void quantize_scatter_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true, masked><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true, masked><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true, masked><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         default:
@@ -632,8 +663,20 @@ void quantize_scatter_mmq_q8_1_cuda(
     }
 }
 
+void quantize_scatter_mmq_q8_1_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream, bool skip_unused) {
+    if (skip_unused) {
+        quantize_scatter_mmq_q8_1_cuda_impl<true>(x, ids_src1_inv, vy, type_src0, ne00, stride_token, ne0, n_tokens, nrows_dst, n_expert_used, stream);
+    } else {
+        quantize_scatter_mmq_q8_1_cuda_impl<false>(x, ids_src1_inv, vy, type_src0, ne00, stride_token, ne0, n_tokens, nrows_dst, n_expert_used, stream);
+    }
+}
+
 // scatter=true reuses the quant kernels: grid over tokens, ids = inverse map (token slot -> compact row)
-void quantize_scatter_mmq_fp4_cuda(
+template <bool masked>
+static void quantize_scatter_mmq_fp4_cuda_impl(
         const float * x, const int32_t * ids_src1_inv, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
         const int64_t ne00, const int64_t stride_token, const int64_t ne0,
         const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
@@ -644,10 +687,10 @@ void quantize_scatter_mmq_fp4_cuda(
         const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
         const dim3 num_blocks(n_tokens, 1, 1);
         if (use_aligned_float8) {
-            quantize_mmq_nvfp4<true, true><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_nvfp4<true, true, masked><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
         } else {
-            quantize_mmq_nvfp4<true, false><<<num_blocks, block_size, 0, stream>>>(
+            quantize_mmq_nvfp4<true, false, masked><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
         }
     } else {
@@ -657,8 +700,19 @@ void quantize_scatter_mmq_fp4_cuda(
         const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
         const dim3 block_size(WARP_SIZE, nwarps, 1);
         const dim3 num_blocks(n_tokens, block_num_y, 1);
-        quantize_mmq_mxfp4<true><<<num_blocks, block_size, 0, stream>>>(
+        quantize_mmq_mxfp4<true, masked><<<num_blocks, block_size, 0, stream>>>(
             x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+    }
+}
+
+void quantize_scatter_mmq_fp4_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream, bool skip_unused) {
+    if (skip_unused) {
+        quantize_scatter_mmq_fp4_cuda_impl<true>(x, ids_src1_inv, vy, scale, type_src0, use_aligned_float8, ne00, stride_token, ne0, n_tokens, nrows_dst, n_expert_used, stream);
+    } else {
+        quantize_scatter_mmq_fp4_cuda_impl<false>(x, ids_src1_inv, vy, scale, type_src0, use_aligned_float8, ne00, stride_token, ne0, n_tokens, nrows_dst, n_expert_used, stream);
     }
 }
 

@@ -663,6 +663,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
+    ggml_build_forward_expand(gf, gate);
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
@@ -700,6 +701,13 @@ public:
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
         res &= cache_safe        == mctx->get_kpool_cache_safe();
+
+        if (!res && std::getenv("GGML_MOE_GRAPH_REUSE_DIAGNOSTIC")) {
+            fprintf(stderr, "moe-graph-reuse: input=kpool saved_kv=%u current_kv=%u saved_pools=%lld current_pools=%u saved_new=%u current_new=%u saved_safe=%u current_safe=%u saved_rows=%lld current_rows=%u\n",
+                n_kv, idx->get_n_kv(), (long long) pool_cells->ne[0], mctx->get_n_kpool(),
+                n_new, mctx->get_n_kpool_new(), unsigned(cache_safe), unsigned(mctx->get_kpool_cache_safe()),
+                (long long) k_idxs->ne[0], params.ubatch.n_tokens);
+        }
 
         return res;
     }

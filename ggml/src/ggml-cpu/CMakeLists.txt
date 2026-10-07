@@ -29,6 +29,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        ggml-cpu/moe-fidelity.cpp
+        ggml-cpu/moe-fidelity.h
+        ggml-cpu/moe-source-pool.cpp
+        ggml-cpu/moe-source-pool.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -57,6 +61,25 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
+
+    if (GGML_SYSTEM_ARCH STREQUAL "x86" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+        foreach(isa avx2 avx512)
+            set(reference_target ${GGML_CPU_NAME}-moe-reference-${isa})
+            add_library(${reference_target} OBJECT
+                ggml-cpu/moe-reference-iq-${isa}.cpp ggml-cpu/moe-reference-q2-${isa}.cpp)
+            target_compile_features(${reference_target} PRIVATE cxx_std_17)
+            target_include_directories(${reference_target} PRIVATE . ../include ggml-cpu)
+            set_target_properties(${reference_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            target_compile_options(${reference_target} PRIVATE -fno-lto -mfma -mf16c)
+            if (isa STREQUAL "avx2")
+                target_compile_options(${reference_target} PRIVATE -mavx2)
+            else()
+                target_compile_options(${reference_target} PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi)
+            endif()
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${reference_target})
+        endforeach()
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_MOE_REFERENCE_X86)
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)

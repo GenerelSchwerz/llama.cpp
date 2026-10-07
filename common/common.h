@@ -334,6 +334,7 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    std::string mtp_draft_vocab; // optional model-bound GGUF vocabulary selection; empty = unrestricted
 
     common_params_model mparams;
 
@@ -344,6 +345,8 @@ struct common_params_speculative_draft {
     int32_t n_moe_expert_cache_slots = 0; // MoE expert cache slots for the draft model; 0 = off
     std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
     std::vector<size_t> moe_expert_cache_byte_budgets;
+    std::string moe_expert_profile;
+    std::string moe_profile_adaptation = "off";
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -390,14 +393,17 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    int32_t lookup_chain = 0; // extra history window capacity with MTP (0 = off)
+    int32_t lookup_chain_min = 3; // minimum matching history suffix
+
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + lookup_chain + 1)
 
     bool has_dft() const {
         return !draft.mparams.empty();
     }
 
     bool is_mtp_rs_capped() const {
-        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
+        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + lookup_chain + 1;
     }
 
     bool has_synth() const {
@@ -414,7 +420,7 @@ struct common_params_speculative {
             return uint32_t(mtp_rs_planes - 1);
         }
 
-        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max) + (has_mtp ? lookup_chain : 0)) : 0u;
     }
 };
 
@@ -549,6 +555,8 @@ struct common_params {
     size_t moe_expert_cache_host_pinned_size = 0;
     std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
     std::vector<size_t> moe_expert_cache_byte_budgets;
+    std::string moe_expert_profile;
+    std::string moe_profile_adaptation = "off";
     bool moe_early_router = false;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
@@ -609,6 +617,7 @@ struct common_params {
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
+    bool moe_source_graph_capacity = false; // reserve hybrid source graph capacity
     bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data

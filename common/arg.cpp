@@ -363,6 +363,12 @@ static std::vector<size_t> parse_moe_cache_byte_budgets(const std::string & valu
 }
 
 static void validate_moe_cache_arguments(const common_params & params) {
+    if (params.moe_expert_profile.empty() && params.moe_profile_adaptation != "off") {
+        throw std::invalid_argument("--moe-profile-adapt requires --moe-expert-profile");
+    }
+    if (params.speculative.draft.moe_expert_profile.empty() && params.speculative.draft.moe_profile_adaptation != "off") {
+        throw std::invalid_argument("--spec-draft-moe-profile-adapt requires --spec-draft-moe-expert-profile");
+    }
     if (!params.moe_expert_cache_byte_budgets.empty() && params.n_moe_expert_cache_slots != 0) {
         throw std::invalid_argument("--moe-expert-cache-mib conflicts with a nonzero --moe-expert-cache-size");
     }
@@ -798,6 +804,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         if (task.on_done) {
             task.on_done();
         }
+    }
+    if (!params.speculative.draft.mtp_draft_vocab.empty() &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == params.speculative.types.end()) {
+        throw std::invalid_argument("--mtp-draft-vocab requires --spec-type draft-mtp");
     }
 }
 
@@ -1487,6 +1497,9 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
 }
 
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    if (const char * capacity = std::getenv("GGML_MOE_SOURCE_GRAPH_CAPACITY")) {
+        params.moe_source_graph_capacity = strcmp(capacity, "1") == 0;
+    }
     // per-example default params
     // we define here to make sure it's included in llama-gen-docs
     if (ex == LLAMA_EXAMPLE_COMPLETION) {
@@ -2566,6 +2579,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
     add_opt(common_arg(
+        {"--moe-source-graph-capacity"},
+        {"--no-moe-source-graph-capacity"},
+        "experimental: reserve hybrid source graph capacity to reduce rebuilds; may change output; has no effect on normal full-GPU execution (default: disabled)",
+        [](common_params & params, bool value) {
+            params.moe_source_graph_capacity = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SOURCE_GRAPH_CAPACITY"));
+    add_opt(common_arg(
         {"--live-context-workspace"},
         {"--no-live-context-workspace"},
         string_format("for supported attention caches, grow the compute workspace reservation with the padded live "
@@ -2965,6 +2986,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_expert_cache_slots = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-expert-profile"}, "FILE",
+        "expert statistics or ranked profile for this model; overrides global profile settings",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) { throw std::invalid_argument("profile path cannot be empty"); }
+            params.moe_expert_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-profile-adapt"}, "MODE",
+        "profile adaptation: off, occurrence or occurrence-sync (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "occurrence" && value != "occurrence-sync") { throw std::invalid_argument("invalid profile adaptation mode"); }
+            params.moe_profile_adaptation = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROFILE_ADAPT"));
     add_opt(common_arg(
         {"--moe-expert-cache-layers"}, "N[,N-M,...]",
         "select the MoE expert layers eligible for caching; absent means all matching expert tensors",
@@ -4410,6 +4447,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
       .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--spec-draft-moe-expert-profile"}, "FILE",
+        "expert statistics or ranked profile for the draft context",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) { throw std::invalid_argument("draft profile path cannot be empty"); }
+            params.speculative.draft.moe_expert_profile = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_PROFILE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-profile-adapt"}, "MODE",
+        "draft profile adaptation: off, occurrence or occurrence-sync (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "occurrence" && value != "occurrence-sync") { throw std::invalid_argument("invalid draft profile adaptation mode"); }
+            params.speculative.draft.moe_profile_adaptation = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_PROFILE_ADAPT"));
+    add_opt(common_arg(
         {"--spec-draft-moe-expert-cache-layers"}, "N[,N-M,...]",
         "select the draft MoE expert layers eligible for caching; absent means all matching expert tensors",
         [](common_params & params, const std::string & value) {
@@ -4508,6 +4563,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--mtp-draft-vocab"}, "FILE",
+        "experimental: model-bound GGUF vocabulary selection for MTP draft projection (default: unrestricted)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_draft_vocab = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_DRAFT_VOCAB"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
@@ -4562,6 +4624,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--spec-lookup-chain"}, "N",
+        "experimental: select history replacement/extension with N extra MTP window slots (0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("lookup chain must be between 0 and 1024");
+            }
+            params.speculative.lookup_chain = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_LOOKUP_CHAIN"));
+    add_opt(common_arg(
+        {"--spec-lookup-chain-min"}, "N",
+        "minimum matching history suffix for replacement/extension (default: 3)",
+        [](common_params & params, int value) {
+            if (value < 3 || value > 1024) {
+                throw std::invalid_argument("lookup chain minimum match must be between 3 and 1024");
+            }
+            params.speculative.lookup_chain_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_LOOKUP_CHAIN_MIN"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

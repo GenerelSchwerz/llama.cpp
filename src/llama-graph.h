@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-sampler.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -17,10 +18,14 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_backend_moe_source_owner_v1;
+struct ggml_backend_moe_hybrid_region_v1;
+struct ggml_backend_moe_cpu_region_query_v1;
 
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
+struct llama_moe_source_group;
 
 struct llama_memory_context_i;
 
@@ -787,6 +792,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, llama_sampler_backend_inputs> inputs;
 };
 
 //
@@ -848,11 +854,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
     class llama_staged_inputs * staged_inputs = nullptr;
+    class llama_draft_vocab * draft_vocab = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
-        if (staged_inputs != other.staged_inputs) {
+        if (staged_inputs != other.staged_inputs || draft_vocab != other.draft_vocab) {
             return false;
         }
         // first check the ubatch
@@ -933,6 +940,69 @@ struct llm_graph_fused_node {
     int il;
 };
 
+struct llm_graph_moe_live_out {
+    ggml_tensor *              tensor = nullptr;
+    std::vector<ggml_tensor *> consumers;
+};
+
+struct llm_graph_moe_finalized_live_out {
+    uint32_t              body_node = UINT32_MAX;
+    std::vector<uint32_t> consumer_nodes;
+};
+
+struct llm_graph_moe_source_identity {
+    const void * witness = nullptr;
+    ggml_type    type    = GGML_TYPE_COUNT;
+    int64_t      ne[GGML_MAX_DIMS] = {};
+    size_t       nb[GGML_MAX_DIMS] = {};
+};
+
+class llm_graph_moe_finalized_snapshot {
+public:
+    const ggml_cgraph * graph() const { return body_graph; }
+    const std::vector<const ggml_tensor *> & nodes() const { return body_nodes; }
+    const std::vector<const ggml_tensor *> & inputs() const { return external_inputs; }
+    const std::vector<llm_graph_moe_source_identity> & input_origins() const { return external_input_origins; }
+    const std::vector<const ggml_tensor *> & dynamic() const { return dynamic_inputs; }
+    const std::vector<llm_graph_moe_finalized_live_out> & outputs() const { return live_outputs; }
+
+    uint64_t source_graph_uid      = 0;
+    uint64_t split_graph_uid       = 0;
+    uint64_t owner_generation      = 0;
+    uint64_t allocator_generation  = 0;
+    uint32_t split_index           = UINT32_MAX;
+    uint32_t first_node_index      = UINT32_MAX;
+    uint32_t last_node_index       = UINT32_MAX;
+    uint32_t tail_node_index       = UINT32_MAX;
+
+private:
+    friend struct llm_graph_moe_region;
+
+    std::vector<uint8_t>              metadata;
+    ggml_context_ptr                  context;
+    ggml_cgraph *                     body_graph = nullptr;
+    std::vector<const ggml_tensor *>  body_nodes;
+    std::vector<const ggml_tensor *>  external_inputs;
+    std::vector<llm_graph_moe_source_identity> external_input_origins;
+    std::vector<const ggml_tensor *>  dynamic_inputs;
+    std::vector<llm_graph_moe_finalized_live_out> live_outputs;
+};
+
+class llm_graph_moe_hybrid_prepared {
+public:
+    llm_graph_moe_hybrid_prepared();
+    ~llm_graph_moe_hybrid_prepared();
+    const ggml_backend_moe_hybrid_region_v1 & descriptor() const;
+
+private:
+    friend struct llm_graph_moe_region;
+    struct bucket;
+    std::vector<std::unique_ptr<bucket>> buckets;
+    std::vector<const ggml_backend_moe_cpu_region_query_v1 *> queries;
+    std::vector<const ggml_backend_moe_cpu_region_query_v1 *> batch_queries;
+    std::unique_ptr<ggml_backend_moe_hybrid_region_v1> region;
+};
+
 struct llm_graph_moe_region {
     int32_t                    layer          = -1;
     uint32_t                   semantic_group = UINT32_MAX;
@@ -940,12 +1010,31 @@ struct llm_graph_moe_region {
     ggml_tensor *              down           = nullptr;
     ggml_tensor *              route          = nullptr;
     ggml_tensor *              output         = nullptr;
+    ggml_tensor *              first_body     = nullptr;
+    ggml_tensor *              body_output    = nullptr;
+    ggml_tensor *              tail_resume    = nullptr;
     bool                       external_route = false;
+    bool                       has_lora       = false;
+    // Complete graph consumers, callbacks, and scheduler must recheck this cut.
+    bool                       builder_cut_closed = false;
     std::vector<ggml_tensor *> operations;
     std::vector<ggml_tensor *> inputs;
+    std::vector<ggml_tensor *>          body_operations;
+    std::vector<ggml_tensor *>          dynamic_inputs;
+    std::vector<llm_graph_moe_live_out> live_outs;
     ggml_backend_t             backend = nullptr;
+    std::shared_ptr<const llm_graph_moe_finalized_snapshot> finalized_metadata;
 
     bool place(ggml_backend_sched_t sched, ggml_backend_t owner);
+    int32_t finalize_metadata(ggml_backend_sched_t sched, const ggml_cgraph * graph,
+                              uint64_t owner_generation, uint64_t allocator_generation);
+    int32_t prepare_hybrid(ggml_backend_sched_t sched,
+                           const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+                           const ggml_graph_execution_certificate * certificate = nullptr) const;
+    int32_t prepare_hybrid_metadata(const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+                                    std::unique_ptr<llm_graph_moe_hybrid_prepared> & prepared) const;
+    int32_t prepare_routed_metadata(const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
+                                    std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> & prepared) const;
 };
 
 class llm_graph_result {
@@ -971,8 +1060,10 @@ public:
 
     bool can_decode_sampled() const;
     const std::vector<ggml_tensor *> & get_inp_token_tensors() const { return inp_token_tensors; }
+    const std::vector<ggml_tensor *> & get_inp_tensors();
     void set_inputs(const llama_ubatch * ubatch, bool skip_token_upload = false);
     void set_outputs(const llm_graph_params & params);
+    void retain_state_computation();
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -991,12 +1082,19 @@ public:
                         ggml_tensor * down,
                         ggml_tensor * route,
                         ggml_tensor * first,
+                        ggml_tensor * body_output,
+                        ggml_tensor * tail_resume,
                         ggml_tensor * output,
+                        std::vector<ggml_tensor *> dynamic_inputs,
+                        bool          has_lora,
                         bool          external_route);
 
     std::vector<llm_graph_moe_region> & get_moe_regions() { return moe_regions; }
 
     const std::vector<llm_graph_moe_region> & get_moe_regions() const { return moe_regions; }
+
+    bool discover_moe_regions(const std::vector<llama_moe_source_group> & sources,
+                              bool (*is_cached)(const ggml_tensor *));
 
     void set_params(const llm_graph_params & params);
 
@@ -1018,6 +1116,9 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
+    std::vector<ggml_backend_t> required_grouped_backends;
+    bool required_grouped_prepared = false;
+
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
@@ -1029,6 +1130,8 @@ public:
 
 private:
     std::vector<ggml_tensor *> inp_token_tensors;
+    std::vector<ggml_tensor *> inp_tensors;
+    size_t inp_tensors_context_used = SIZE_MAX;
     std::vector<llm_graph_moe_region> moe_regions;
 
     // keep a copy of the previous graph parameters
@@ -1137,7 +1240,8 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor ** mm_id = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

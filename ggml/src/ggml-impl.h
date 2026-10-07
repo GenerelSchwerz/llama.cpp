@@ -32,7 +32,9 @@ GGML_API bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor);
 
 void ggml_print_backtrace(void);
 
-uint64_t ggml_graph_next_uid(void);
+GGML_API uint64_t ggml_graph_next_uid(void);
+GGML_API size_t   ggml_context_overhead(void);
+GGML_API uint64_t ggml_allocation_count(void);
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -96,6 +98,46 @@ static bool ggml_op_is_empty(enum ggml_op op) {
         case GGML_OP_TRANSPOSE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Callers must prove alias, storage and backend resource safety. Unknown effects stay live.
+static inline bool ggml_op_is_pure(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_ADD:
+        case GGML_OP_ADD_ID:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
+        case GGML_OP_REPEAT:
+        case GGML_OP_CONCAT:
+        case GGML_OP_CONT:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ROPE:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+        case GGML_OP_CLAMP:
+        case GGML_OP_PAD:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
             return true;
         default:
             return false;

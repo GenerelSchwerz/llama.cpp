@@ -1325,7 +1325,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = params.moe_expert_profile.empty() ? llama_init_from_model(model, cparams) :
+        llama_init_from_model_with_moe_profile(model, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
@@ -1677,7 +1678,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     mparams.moe_early_router_max_rows = mparams.load_mtp ?
-            uint32_t(std::max<int64_t>(1, int64_t(params.speculative.draft.n_max) + 1)) : 1;
+            uint32_t(std::max<int64_t>(1, int64_t(common_speculative_n_max(&params.speculative)) + 1)) : 1;
 
     return mparams;
 }
@@ -1718,6 +1719,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
     cparams.phase_aware_workspace = params.phase_aware_workspace;
+    cparams.moe_source_graph_capacity = params.moe_source_graph_capacity;
     cparams.live_context_workspace = params.live_context_workspace;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

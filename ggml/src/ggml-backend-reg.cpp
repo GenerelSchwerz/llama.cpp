@@ -1,11 +1,13 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-backend-moe.h"
 #include "ggml-backend-dl.h"
 #include "ggml-impl.h"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -110,9 +112,11 @@ static std::string path_str(const fs::path & path) {
 struct ggml_backend_reg_entry {
     ggml_backend_reg_t reg;
     dl_handle_ptr handle;
+    uint64_t pins = 0;
 };
 
 struct ggml_backend_registry {
+    std::mutex module_mutex;
     std::vector<ggml_backend_reg_entry> backends;
     std::vector<ggml_backend_dev_t> devices;
 
@@ -187,6 +191,7 @@ struct ggml_backend_registry {
         if (!reg) {
             return;
         }
+        std::lock_guard<std::mutex> lock(module_mutex);
 
         for (auto & entry : backends) {
             if (entry.reg == reg) {
@@ -264,6 +269,7 @@ struct ggml_backend_registry {
     }
 
     void unload_backend(ggml_backend_reg_t reg, bool silent) {
+        std::lock_guard<std::mutex> lock(module_mutex);
         auto it = std::find_if(backends.begin(), backends.end(),
                                [reg](const ggml_backend_reg_entry & entry) { return entry.reg == reg; });
 
@@ -271,6 +277,10 @@ struct ggml_backend_registry {
             if (!silent) {
                 GGML_LOG_ERROR("%s: backend not found\n", __func__);
             }
+            return;
+        }
+        if (it->pins != 0) {
+            GGML_LOG_WARN("%s: backend has active module leases\n", __func__);
             return;
         }
 
@@ -292,6 +302,51 @@ struct ggml_backend_registry {
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
     return reg;
+}
+
+bool ggml_backend_moe_module_retain_v1(ggml_backend_reg_t reg) try {
+    auto & registry = get_reg();
+    std::lock_guard<std::mutex> lock(registry.module_mutex);
+    for (auto & entry : registry.backends) {
+        if (entry.reg == reg && entry.pins != UINT64_MAX) {
+            ++entry.pins;
+            return true;
+        }
+    }
+    return false;
+} catch (...) {
+    return false;
+}
+
+ggml_backend_reg_t ggml_backend_moe_cpu_module_acquire_v1(void) try {
+    auto & registry = get_reg();
+    std::lock_guard<std::mutex> lock(registry.module_mutex);
+    for (auto & entry : registry.backends) {
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(entry.reg); ++i) {
+            if (ggml_backend_dev_type(ggml_backend_reg_dev_get(entry.reg, i)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    entry.pins != UINT64_MAX) {
+                ++entry.pins;
+                return entry.reg;
+            }
+        }
+    }
+    return nullptr;
+} catch (...) {
+    return nullptr;
+}
+
+bool ggml_backend_moe_module_release_v1(ggml_backend_reg_t reg) try {
+    auto & registry = get_reg();
+    std::lock_guard<std::mutex> lock(registry.module_mutex);
+    for (auto & entry : registry.backends) {
+        if (entry.reg == reg && entry.pins != 0) {
+            --entry.pins;
+            return true;
+        }
+    }
+    return false;
+} catch (...) {
+    return false;
 }
 
 // Internal API

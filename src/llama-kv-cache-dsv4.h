@@ -197,7 +197,7 @@ public:
             std::vector<llama_ubatch> ubatches_write);
 
     bool next() override;
-    bool apply() override;
+    bool apply(bool graph_reserve = false) override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -347,7 +347,7 @@ public:
     //
 
     bool next()  override;
-    bool apply() override;
+    bool apply(bool graph_reserve = false) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

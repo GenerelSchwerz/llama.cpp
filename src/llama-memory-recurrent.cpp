@@ -1475,7 +1475,8 @@ bool llama_memory_recurrent_context::next() {
     return true;
 }
 
-bool llama_memory_recurrent_context::apply() {
+bool llama_memory_recurrent_context::apply(bool graph_reserve) {
+    GGML_UNUSED(graph_reserve);
     assert(!llama_memory_status_is_fail(status));
 
     // no ubatches -> this is an update

@@ -1,9 +1,13 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-moe.h"
+#include "../ggml/src/ggml-moe-source-program.h"
+#include "../ggml/src/ggml-cuda/moe-source-core.cuh"
+#include "../ggml/src/ggml-impl.h"
 #include "common.h"
 #include "fit.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "hash/hash.h"
@@ -13,15 +17,18 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ngram-map.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-batch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-model.h"
 
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -130,8 +137,36 @@ static void usage(char ** argv) {
     LOG("  --test-phase-workspace   Run phase-aware workspace checks\n");
     LOG("  --test-live-context-workspace Run live-context workspace checks\n");
     LOG("  --test-speculative-limits Run speculative limit checks\n");
+    LOG("  --test-mtp-draft-vocab   Run opt-in draft vocabulary checks\n");
     LOG("  --test-moe-cache-selector Run MoE cache selector checks\n");
     LOG("  --test-moe-placement    Run MoE placement checks\n");
+    LOG("  --test-source-uses <model> Check loader source discovery with and without allocation\n");
+    LOG("  --test-source-profile <model> Check GPU profile initialization of original routed sources\n");
+    LOG("  --test-source-statistics Check source statistics identity, coverage and malformed inputs\n");
+    LOG("  --source-statistics-file <file> Write synthetic source statistics for the profile loading fixture\n");
+    LOG("  --test-moe-replay <model> Record or replay identical-token full-logit rows\n");
+    LOG("  --test-source-variants Check sequence-aware source captures against --replay-reference\n");
+    LOG("  --test-source-auxiliary Check actual DRAFT/MTP shared source frontend against --replay-reference\n");
+    LOG("  --auxiliary-uncached-reference Use ordinary uncached arithmetic for the auxiliary numerical control\n");
+    LOG("  --auxiliary-no-output-first Start auxiliary execution without outputs, then grow the live graph\n");
+    LOG("  --auxiliary-source-statistics Install supplied source statistics for actual auxiliary execution\n");
+    LOG("  --auxiliary-source-ranks Install supplied source ranks for actual auxiliary execution\n");
+    LOG("  --auxiliary-inherit-statistics Inherit parent statistics before replacing the parent configuration\n");
+    LOG("  --auxiliary-different-model Use a distinct auxiliary model object with matching geometry\n");
+    LOG("  --auxiliary-profile-file <path> Generate full profile files for automatic parent/child binding\n");
+    LOG("  --auxiliary-explicit-profile-file <path> Bind opposite parent/child profiles through explicit context creation\n");
+    LOG("  --auxiliary-sparse-outputs Request only the final output of a multi-sequence frame\n");
+    LOG("  --auxiliary-parent-active Reject profile snapshots while the parent source call guard is active\n");
+    LOG("  --replay-reference <file> Logit reference file; writes unless --replay-read is set\n");
+    LOG("  --replay-read            Read reference tokens and report full-logit differences\n");
+    LOG("  --replay-prompt-file <file> Bounded prompt text, up to64KiB/4096tokens\n");
+    LOG("  --replay-rows <N>        Full-logit continuation rows, 1..4096 (default:32)\n");
+    LOG("  --replay-split <name>    Provenance: diagnostic, calibration, development or held-out\n");
+    LOG("  --replay-independent-sources Use routed operands without source fusion hints\n");
+    LOG("  --replay-cache-slots <N> MoE replay residency capacity; 0 disables cache (default:32)\n");
+    LOG("  --replay-cpu-oracle     Compare hybrid routed CPU outputs with ordinary CPU operators\n");
+    LOG("  --replay-gpu-oracle     Observe sampled routed outputs with ordinary GPU operators\n");
+    LOG("  --replay-load-mode <mode> Replay loading mode, none or mmap (default:none)\n");
     LOG("  --test-moe-joint-measurement Run MoE joint measurement checks\n");
     LOG("  --fit-tool <path>        Fit tool for joint measurement checks\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
@@ -569,6 +604,1242 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
+static int test_model_source_uses(const char * path) {
+    for (bool no_alloc : {true, false}) {
+        auto params = llama_model_default_params();
+        params.n_gpu_layers = 0;
+        params.no_alloc = no_alloc;
+        params.progress_callback = silent_model_load_progress;
+        llama_model_ptr model(llama_model_load_from_file(path, params));
+        if (!model) { return 1; }
+        std::unordered_set<const ggml_tensor *> tensors;
+        for (const auto & entry : model->tensors_by_name) { tensors.insert(entry.second); }
+        std::unordered_set<const ggml_tensor *> recorded;
+        std::map<const ggml_tensor *, std::vector<std::string>> source_names;
+        size_t routed = 0;
+        for (const auto & use : model->tensor_uses()) {
+            if (!use.tensor || !tensors.count(use.tensor) || use.op < GGML_OP_NONE || use.op >= GGML_OP_COUNT || use.layer < -1 || use.name.empty()) {
+                fprintf(stderr, "test-model-source-uses: invalid returned tensor/op/layer\n");
+                return 1;
+            }
+            recorded.insert(use.tensor);
+            source_names[use.tensor].push_back(use.name);
+            routed += use.op == GGML_OP_MUL_MAT_ID;
+        }
+        for (auto & entry : source_names) {
+            auto & names = entry.second;
+            std::sort(names.begin(), names.end());
+            names.erase(std::unique(names.begin(), names.end()), names.end());
+        }
+        if (recorded != tensors || routed == 0) {
+            fprintf(stderr, "test-model-source-uses: coverage recorded=%zu tensors=%zu routed=%zu\n", recorded.size(), tensors.size(), routed);
+            return 1;
+        }
+        for (const auto & group : model->moe_sources()) {
+            for (const auto & bank : group.banks) {
+                if (!recorded.count(bank.tensor) || bank.names != source_names.at(bank.tensor)) {
+                    fprintf(stderr, "test-model-source-uses: source group tensor missing\n");
+                    return 1;
+                }
+            }
+        }
+        const auto source_groups = model->moe_sources().size();
+        std::map<ggml_tensor *, std::string> display_names;
+        for (const auto & use : model->tensor_uses()) {
+            if (use.op == GGML_OP_MUL_MAT_ID && !display_names.count(use.tensor)) {
+                display_names.emplace(use.tensor, use.tensor->name);
+                ggml_set_name(use.tensor, "shared-truncated-display-name");
+            }
+        }
+        auto layers = std::move(model->layers);
+        model->layers.clear();
+        model->build_moe_sources();
+        std::unordered_set<const ggml_tensor *> routed_tensors;
+        for (const auto & use : model->tensor_uses()) {
+            if (use.op == GGML_OP_MUL_MAT_ID) { routed_tensors.insert(use.tensor); }
+        }
+        std::unordered_set<const ggml_tensor *> catalog;
+        for (const auto & group : model->moe_sources()) {
+            if (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX || group.banks.size() != 1 ||
+                    group.banks[0].role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT ||
+                    group.banks[0].status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE ||
+                    group.banks[0].names != source_names.at(group.banks[0].tensor) ||
+                    !catalog.insert(group.banks[0].tensor).second) {
+                fprintf(stderr, "test-model-source-uses: invalid operation source catalog\n");
+                return 1;
+            }
+        }
+        if (catalog != routed_tensors) {
+            fprintf(stderr, "test-model-source-uses: routed catalog does not cover returned operations\n");
+            return 1;
+        }
+        for (const auto & entry : display_names) { ggml_set_name(entry.first, entry.second.c_str()); }
+        model->layers = std::move(layers);
+        model->build_moe_sources();
+        if (model->moe_sources().size() != source_groups) { return 1; }
+        fprintf(stderr, "test-model-source-uses: no_alloc=%d uses=%zu tensors=%zu routed=%zu exact returned-storage coverage OK\n",
+            no_alloc, model->tensor_uses().size(), tensors.size(), routed);
+        fprintf(stderr, "test-model-source-uses: no_alloc=%d independent routed sources=%zu without layer bank hints OK\n",
+            no_alloc, catalog.size());
+        fprintf(stderr, "test-model-source-uses: no_alloc=%d full loader identities survive colliding display names OK\n", no_alloc);
+    }
+    return 0;
+}
+
+static gguf_context_ptr make_source_profile_statistics(const std::vector<llama_moe_source_group> & sources, bool reverse = false, const llama_moe_profile_statistics * measured = nullptr) {
+    gguf_context_ptr metadata(gguf_init_empty());
+    std::vector<uint8_t> names;
+    std::vector<uint64_t> name_offsets{0}, offsets{0}, observations, counts;
+    std::vector<uint32_t> domains, types;
+    std::vector<int64_t> shapes;
+    std::map<uint32_t, std::unordered_set<const ggml_tensor *>> seen;
+    for (const auto & source : sources) {
+        for (const auto & bank : source.banks) {
+            if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE || !seen[source.domain].insert(bank.tensor).second) { continue; }
+            if (!bank.tensor || bank.names.empty() || bank.tensor->ne[2] <= 0 || counts.size() > (1u << 22) || uint64_t(bank.tensor->ne[2]) > (1u << 22) - counts.size() || domains.size() >= GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { throw std::runtime_error("invalid statistics fixture geometry"); }
+            const auto & name = bank.names.front();
+            if (name.empty() || name.size() > 4096 || name.find('\0') != std::string::npos) { throw std::runtime_error("invalid statistics source name"); }
+            names.insert(names.end(), name.begin(), name.end());
+            name_offsets.push_back(names.size());
+            domains.push_back(source.domain);
+            types.push_back(uint32_t(bank.tensor->type));
+            shapes.insert(shapes.end(), bank.tensor->ne, bank.tensor->ne + GGML_MAX_DIMS);
+            uint64_t total = 0;
+            const llama_moe_profile_source_statistics * actual = nullptr;
+            if (measured) {
+                const auto found = std::find_if(measured->sources.begin(), measured->sources.end(), [&](const auto & value) { return value.tensor == bank.tensor && value.domain == source.domain; });
+                if (found == measured->sources.end() || found->counts.size() != size_t(bank.tensor->ne[2])) { throw std::runtime_error("missing measured source statistics"); }
+                actual = &*found;
+            }
+            for (int64_t i = 0; i < bank.tensor->ne[2]; ++i) {
+                const uint64_t value = actual ? actual->counts[i] : uint64_t(reverse ? bank.tensor->ne[2] - i : i + 1);
+                if (value > UINT64_MAX - total) { throw std::runtime_error("statistics occurrence overflow"); }
+                counts.push_back(value); total += value;
+            }
+            if (actual && total != actual->observations) { throw std::runtime_error("statistics observation mismatch"); }
+            offsets.push_back(counts.size());
+            observations.push_back(total);
+        }
+    }
+    const std::string provenance = measured ? measured->provenance : "Synthetic fixture occurrences; no calibrated quality or content identity claim";
+    if (provenance.empty() || provenance.size() > 4096 || provenance.find('\0') != std::string::npos) { throw std::runtime_error("invalid statistics provenance"); }
+    gguf_set_val_u32(metadata.get(), "moe.profile.version", 1);
+    gguf_set_arr_data(metadata.get(), "moe.profile.source_name_bytes", GGUF_TYPE_UINT8, names.data(), names.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.source_name_offsets", GGUF_TYPE_UINT64, name_offsets.data(), name_offsets.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.source_domains", GGUF_TYPE_UINT32, domains.data(), domains.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.source_types", GGUF_TYPE_UINT32, types.data(), types.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.source_shapes", GGUF_TYPE_INT64, shapes.data(), shapes.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.expert_offsets", GGUF_TYPE_UINT64, offsets.data(), offsets.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.observations", GGUF_TYPE_UINT64, observations.data(), observations.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.expert_counts", GGUF_TYPE_UINT64, counts.data(), counts.size());
+    gguf_set_arr_data(metadata.get(), "moe.profile.provenance", GGUF_TYPE_UINT8, provenance.data(), provenance.size());
+    return metadata;
+}
+
+static std::vector<uint8_t> source_profile_metadata_bytes(const gguf_context * metadata) {
+    std::vector<uint8_t> result(gguf_get_meta_size(metadata));
+    gguf_get_meta_data(metadata, result.data());
+    return result;
+}
+
+struct routed_profile_collector {
+    llama_moe_profile_statistics statistics;
+    std::map<std::pair<uint32_t, const ggml_tensor *>, size_t> source_indices;
+    std::array<uint64_t, 3> ownership_counts = {};
+    uint64_t projections = 0;
+    uint64_t first_epoch = 0;
+    uint64_t last_epoch = 0;
+
+    bool initialize(const std::vector<llama_moe_source_group> & sources) {
+        statistics = {}; source_indices.clear(); ownership_counts = {}; projections = first_epoch = last_epoch = 0;
+        size_t entries = 0;
+        for (const auto & source : sources) {
+            for (const auto & bank : source.banks) {
+                if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) { continue; }
+                const auto identity = std::make_pair(source.domain, static_cast<const ggml_tensor *>(bank.tensor));
+                const auto found = source_indices.find(identity);
+                if (found != source_indices.end()) {
+                    continue;
+                }
+                if (!bank.tensor || bank.names.empty() || bank.tensor->ne[2] <= 0 || uint64_t(bank.tensor->ne[2]) > (1u << 22) - entries ||
+                        statistics.sources.size() >= GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { return false; }
+                entries += size_t(bank.tensor->ne[2]);
+                source_indices.emplace(identity, statistics.sources.size());
+                statistics.sources.push_back({bank.tensor, source.domain, 0, std::vector<uint64_t>(bank.tensor->ne[2], 0)});
+            }
+        }
+        return !statistics.sources.empty();
+    }
+
+    bool observe(uint64_t epoch, const ggml_backend_moe_source_access_v1 * probe) {
+        if (!probe || !probe->source_witness || !probe->source_domain || !probe->source || !probe->route_indices || !probe->expert_ids || !probe->classes ||
+                !probe->n_routes || probe->n_routes > (1u << 22) || !probe->n_distinct || probe->n_distinct > probe->n_routes ||
+                !epoch || projections == UINT64_MAX) { return false; }
+        const auto found = source_indices.find(std::make_pair(probe->source_domain, probe->source_witness));
+        if (found == source_indices.end()) { return false; }
+        auto & source = statistics.sources[found->second];
+        if (probe->source->type != source.tensor->type || std::memcmp(probe->source->ne, source.tensor->ne, sizeof(source.tensor->ne)) ||
+                std::memcmp(probe->source->nb, source.tensor->nb, sizeof(source.tensor->nb)) ||
+                probe->n_distinct > source.counts.size() || probe->n_routes > UINT64_MAX - source.observations) { return false; }
+        std::array<uint64_t, 3> classes = {};
+        for (uint32_t i = 0; i < probe->n_routes; ++i) {
+            const auto index = probe->route_indices[i];
+            if (index >= probe->n_distinct || probe->expert_ids[index] < 0 || size_t(probe->expert_ids[index]) >= source.counts.size() ||
+                    probe->classes[index] < 0 || probe->classes[index] > 2) { return false; }
+            ++classes[probe->classes[index]];
+        }
+        for (size_t i = 0; i < classes.size(); ++i) { if (classes[i] > UINT64_MAX - ownership_counts[i]) { return false; } }
+        for (uint32_t i = 0; i < probe->n_routes; ++i) { ++source.counts[probe->expert_ids[probe->route_indices[i]]]; }
+        for (size_t i = 0; i < classes.size(); ++i) { ownership_counts[i] += classes[i]; }
+        source.observations += probe->n_routes;
+        if (!projections) { first_epoch = epoch; }
+        last_epoch = epoch; ++projections;
+        return true;
+    }
+};
+
+static int test_source_profile_statistics() {
+    const uint64_t small[] = {9, 1, 0}, scaled[] = {900, 100, 0}, other[] = {0, 10, 0}, zero[] = {0, 0, 0};
+    std::vector<ggml_moe_profile_bank_statistics> banks{{small, 10, 9, 3}, {other, 10, 1, 3}};
+    std::vector<int32_t> ranks;
+    if (!ggml_moe_source_rank_statistics(banks, ranks) || ranks != std::vector<int32_t>{0, 1, 2}) { return 1; }
+    banks[0].counts = scaled; banks[0].observations = 1000;
+    if (!ggml_moe_source_rank_statistics(banks, ranks) || ranks != std::vector<int32_t>{0, 1, 2}) { return 1; }
+    banks[0].payload_bytes = 1; banks[1].payload_bytes = 9;
+    if (!ggml_moe_source_rank_statistics(banks, ranks) || ranks != std::vector<int32_t>{1, 0, 2}) { return 1; }
+    for (auto & bank : banks) { bank.counts = zero; bank.observations = 0; }
+    if (!ggml_moe_source_rank_statistics(banks, ranks) || ranks != std::vector<int32_t>{0, 1, 2}) { return 1; }
+    const auto unchanged = ranks;
+    const auto reject_ranking = [&](const std::vector<ggml_moe_profile_bank_statistics> & input) {
+        if (ggml_moe_source_rank_statistics(input, ranks) || ranks != unchanged) { throw std::runtime_error("invalid canonical statistics changed ranking"); }
+    };
+    reject_ranking({});
+    for (uint32_t variant = 0; variant < 8; ++variant) {
+        auto invalid = banks;
+        if (variant == 0) { invalid[0].counts = nullptr; }
+        if (variant == 1) { invalid[0].observations = 1; }
+        if (variant == 2) { invalid[0].payload_bytes = 0; }
+        if (variant == 3) { invalid[0].payload_bytes = UINT64_MAX; }
+        if (variant == 4) { invalid[0].n_experts = 2; }
+        if (variant == 5) { invalid[0].n_experts = (1u << 22) + 1; }
+        if (variant == 6) { invalid.resize(GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS + 1); }
+        const uint64_t overflow[] = {UINT64_MAX, 1, 0};
+        if (variant == 7) { invalid[0].counts = overflow; invalid[0].observations = UINT64_MAX; }
+        reject_ranking(invalid);
+    }
+    fprintf(stderr, "test-source-statistics-ranking: normalized calibration,canonical bank byte costs,zero observations,stable ties,full ranks and invalid-input atomicity OK\n");
+    const ggml_init_params params{ggml_tensor_overhead() * 4, nullptr, true};
+    ggml_context_ptr context(ggml_init(params));
+    auto * a = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, 8, 7, 3);
+    auto * b = ggml_new_tensor_3d(context.get(), GGML_TYPE_F16, 8, 6, 5);
+    ggml_set_name(a, "same-display-name"); ggml_set_name(b, "same-display-name");
+    const std::string long_name(200, 'x');
+    std::vector<llama_moe_source_group> sources{
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX, 1, true,
+            {{a, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, {long_name, "alias-a"}}}, 4},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX, 2, true,
+            {{b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, {"source-b"}}}, 4}};
+    auto metadata = make_source_profile_statistics(sources);
+    const auto bytes = source_profile_metadata_bytes(metadata.get());
+    const auto bound = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), sources);
+    if (bound.sources.size() != 2 || bound.sources[0].tensor != a || bound.sources[1].tensor != b ||
+            bound.sources[0].counts != std::vector<uint64_t>{1, 2, 3} || bound.sources[1].counts != std::vector<uint64_t>{1, 2, 3, 4, 5} ||
+            bound.sources[0].observations != 6 || bound.sources[1].observations != 15 || bound.provenance.empty()) { return 1; }
+    uint32_t rejected = 0;
+    const auto invalid = [&](const std::vector<uint8_t> & input, const std::vector<llama_moe_source_group> & catalog) {
+        try { (void) llama_moe_profile_statistics_parse(input.data(), input.size(), catalog); }
+        catch (const std::runtime_error &) { ++rejected; return; }
+        throw std::runtime_error("invalid statistics fixture accepted");
+    };
+    gguf_context_ptr raw_metadata(gguf_init_from_buffer(bytes.data(), bytes.size(), {true, nullptr}));
+    const auto unpadded_size = gguf_get_data_offset(raw_metadata.get());
+    const auto unpadded = llama_moe_profile_statistics_parse(bytes.data(), unpadded_size, sources);
+    if (unpadded.sources[0].counts != bound.sources[0].counts) { return 1; }
+    for (size_t size = 0; size < unpadded_size; size += 17) { invalid(std::vector<uint8_t>(bytes.begin(), bytes.begin() + size), sources); }
+    if (unpadded_size < bytes.size()) { auto bad_padding = bytes; bad_padding.back() = 1; invalid(bad_padding, sources); }
+    for (size_t offset : {size_t(0), size_t(4), size_t(8), size_t(16)}) {
+        auto input = bytes; input[offset] = 255; invalid(input, sources);
+    }
+    auto trailing = bytes; trailing.push_back(0); invalid(trailing, sources);
+    const std::vector<uint32_t> wrong_domains{1, 1}, wrong_types{GGML_TYPE_F32, GGML_TYPE_F32};
+    const std::vector<uint64_t> wrong_offsets{0, 3, UINT64_MAX}, wrong_observations{6, 16}, wrong_counts{UINT64_MAX, 2, 3, 1, 2, 3, 4, 5};
+    const auto malformed = [&](const char * name, gguf_type type, const void * data, size_t count) {
+        auto changed = make_source_profile_statistics(sources); gguf_set_arr_data(changed.get(), name, type, data, count);
+        invalid(source_profile_metadata_bytes(changed.get()), sources);
+    };
+    malformed("moe.profile.source_domains", GGUF_TYPE_UINT32, wrong_domains.data(), wrong_domains.size());
+    malformed("moe.profile.source_types", GGUF_TYPE_UINT32, wrong_types.data(), wrong_types.size());
+    malformed("moe.profile.expert_offsets", GGUF_TYPE_UINT64, wrong_offsets.data(), wrong_offsets.size());
+    malformed("moe.profile.expert_offsets", GGUF_TYPE_UINT32, wrong_domains.data(), wrong_domains.size());
+    malformed("moe.profile.source_name_offsets", GGUF_TYPE_UINT64, wrong_offsets.data(), wrong_offsets.size());
+    malformed("moe.profile.observations", GGUF_TYPE_UINT64, wrong_observations.data(), wrong_observations.size());
+    malformed("moe.profile.expert_counts", GGUF_TYPE_UINT64, wrong_counts.data(), wrong_counts.size());
+    malformed("moe.profile.expert_counts", GGUF_TYPE_UINT8, wrong_counts.data(), wrong_counts.size());
+    auto names = std::vector<uint8_t>(long_name.begin(), long_name.end()); names.insert(names.end(), {'s','o','u','r','c','e','-','b'});
+    names[1] = 0; malformed("moe.profile.source_name_bytes", GGUF_TYPE_UINT8, names.data(), names.size());
+    auto omitted = make_source_profile_statistics({sources.front()}); invalid(source_profile_metadata_bytes(omitted.get()), sources);
+    auto ambiguous = sources; ambiguous.push_back(sources.front()); ambiguous.back().banks.front().tensor = b; invalid(bytes, ambiguous);
+    auto unavailable = sources; unavailable.front().banks.front().names.clear(); invalid(bytes, unavailable);
+    auto geometry = sources; auto * c = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, 9, 7, 3); geometry.front().banks.front().tensor = c; invalid(bytes, geometry);
+    auto alias_catalog = sources; alias_catalog.front().banks.front().names = {"alias-a", long_name};
+    auto alias_metadata = make_source_profile_statistics(alias_catalog); auto alias_bytes = source_profile_metadata_bytes(alias_metadata.get());
+    const auto aliases = llama_moe_profile_statistics_parse(alias_bytes.data(), alias_bytes.size(), sources);
+    if (aliases.sources[0].tensor != a || aliases.sources[0].counts != bound.sources[0].counts) { return 1; }
+    auto shared = make_source_profile_statistics(sources);
+    const std::string shared_names = long_name + "alias-asource-b";
+    const std::vector<uint64_t> shared_name_offsets{0, 200, 207, 215}, shared_offsets{0, 3, 6, 11}, shared_observations{6, 6, 15};
+    const std::vector<uint32_t> shared_domains{1, 1, 2}, shared_types{GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F16};
+    std::vector<int64_t> shared_shapes;
+    for (const auto * tensor : {a, a, b}) { shared_shapes.insert(shared_shapes.end(), tensor->ne, tensor->ne + GGML_MAX_DIMS); }
+    std::vector<uint64_t> shared_counts{1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5};
+    gguf_set_arr_data(shared.get(), "moe.profile.source_name_bytes", GGUF_TYPE_UINT8, shared_names.data(), shared_names.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.source_name_offsets", GGUF_TYPE_UINT64, shared_name_offsets.data(), shared_name_offsets.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.source_domains", GGUF_TYPE_UINT32, shared_domains.data(), shared_domains.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.source_types", GGUF_TYPE_UINT32, shared_types.data(), shared_types.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.source_shapes", GGUF_TYPE_INT64, shared_shapes.data(), shared_shapes.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.expert_offsets", GGUF_TYPE_UINT64, shared_offsets.data(), shared_offsets.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.observations", GGUF_TYPE_UINT64, shared_observations.data(), shared_observations.size());
+    gguf_set_arr_data(shared.get(), "moe.profile.expert_counts", GGUF_TYPE_UINT64, shared_counts.data(), shared_counts.size());
+    const auto shared_bytes = source_profile_metadata_bytes(shared.get());
+    const auto shared_bound = llama_moe_profile_statistics_parse(shared_bytes.data(), shared_bytes.size(), sources);
+    if (shared_bound.sources.size() != 2 || shared_bound.sources[0].counts != bound.sources[0].counts) { return 1; }
+    shared_counts[3] = 2; shared_counts[4] = 1;
+    gguf_set_arr_data(shared.get(), "moe.profile.expert_counts", GGUF_TYPE_UINT64, shared_counts.data(), shared_counts.size());
+    invalid(source_profile_metadata_bytes(shared.get()), sources);
+    const std::vector<uint64_t> zero_counts{0, 0, 0, 1, 2, 3, 4, 5}, zero_observations{0, 15};
+    auto unseen = make_source_profile_statistics(sources);
+    gguf_set_arr_data(unseen.get(), "moe.profile.expert_counts", GGUF_TYPE_UINT64, zero_counts.data(), zero_counts.size());
+    gguf_set_arr_data(unseen.get(), "moe.profile.observations", GGUF_TYPE_UINT64, zero_observations.data(), zero_observations.size());
+    const auto unseen_bytes = source_profile_metadata_bytes(unseen.get());
+    const auto unseen_bound = llama_moe_profile_statistics_parse(unseen_bytes.data(), unseen_bytes.size(), sources);
+    if (unseen_bound.sources[0].counts.size() != 3 || unseen_bound.sources[0].observations != 0) { return 1; }
+    routed_profile_collector collector;
+    auto collected_catalog = sources;
+    collected_catalog.push_back(sources.front());
+    if (!collector.initialize(collected_catalog) || collector.statistics.sources.size() != 2) { return 1; }
+    const uint32_t route_indices[] = {0, 1, 0};
+    const int32_t expert_ids[] = {2, 0}, ownership[] = {0, 2};
+    ggml_backend_moe_source_access_v1 probe = {};
+    ggml_tensor copied_weight = *a;
+    probe.source = &copied_weight; probe.source_witness = a; probe.source_domain = sources.front().domain;
+    probe.route_indices = route_indices; probe.expert_ids = expert_ids; probe.classes = ownership;
+    probe.n_routes = 3; probe.n_distinct = 2;
+    if (!collector.observe(2, &probe) || collector.statistics.sources[0].counts != std::vector<uint64_t>{1, 0, 2} ||
+            collector.statistics.sources[0].observations != 3 || collector.ownership_counts != std::array<uint64_t, 3>{2, 0, 1}) { return 1; }
+    const auto counts_before = collector.statistics.sources[0].counts;
+    const uint32_t invalid_routes[] = {0, 2, 0}; probe.route_indices = invalid_routes;
+    if (collector.observe(3, &probe) || collector.statistics.sources[0].counts != counts_before) { return 1; }
+    probe.route_indices = route_indices;
+    const int32_t invalid_ids[] = {3, 0}; probe.expert_ids = invalid_ids;
+    if (collector.observe(3, &probe) || collector.statistics.sources[0].counts != counts_before) { return 1; }
+    probe.expert_ids = expert_ids; probe.source = nullptr;
+    if (collector.observe(3, &probe)) { return 1; }
+    probe.source = &copied_weight; collector.statistics.sources[0].observations = UINT64_MAX;
+    if (collector.observe(3, &probe) || collector.statistics.sources[0].counts != counts_before) { return 1; }
+    collector.statistics.sources[0].observations = 3;
+    collector.statistics.provenance = "Synthetic routing observer fixture; complete source vectors, not calibrated model observations";
+    auto collected_metadata = make_source_profile_statistics(collected_catalog, false, &collector.statistics);
+    const auto collected_bytes = source_profile_metadata_bytes(collected_metadata.get());
+    const auto collected = llama_moe_profile_statistics_parse(collected_bytes.data(), collected_bytes.size(), collected_catalog);
+    if (collected.sources.size() != 2 || collected.sources[0].counts != counts_before || collected.sources[1].counts != std::vector<uint64_t>(5, 0) ||
+            collected.sources[1].observations != 0) { return 1; }
+    auto ambiguous_domains = sources; ambiguous_domains.back().banks.front().tensor = a;
+    if (!collector.initialize(ambiguous_domains) || collector.statistics.sources.size() != 2) { return 1; }
+    probe.source_domain = ambiguous_domains.back().domain;
+    if (!collector.observe(3, &probe) || collector.statistics.sources[0].observations || collector.statistics.sources[1].observations != 3) { return 1; }
+    fprintf(stderr, "test-source-profile-collector: original tensor/domain identities,aliases,ownership,zero coverage,invalid route/ID/source/overflow rejection and codec roundtrip OK\n");
+    fprintf(stderr, "test-source-profile-statistics: heterogeneous sources/domains,full200-byte names,aliases,complete occurrences and%u malformed/coverage cases OK\n", rejected);
+    return 0;
+}
+
+static int test_model_source_profile(const char * path, const char * statistics_file) {
+    auto model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 99;
+    model_params.moe_expert_cache_slots = 4;
+    model_params.moe_expert_cache_host_pinned_size = 0;
+    model_params.progress_callback = silent_model_load_progress;
+    llama_model_ptr model(llama_model_load_from_file(path, model_params));
+    if (!model) { return 1; }
+    auto layers = std::move(model->layers);
+    model->layers.clear();
+    model->build_moe_sources();
+    model->layers = std::move(layers);
+    auto params = llama_context_default_params();
+    params.n_ctx = 512;
+    params.n_batch = params.n_ubatch = 128;
+    params.n_threads = params.n_threads_batch = 4;
+    params.phase_aware_workspace = true;
+    const auto & sources = model->moe_sources();
+    auto metadata = make_source_profile_statistics(sources);
+    const auto bytes = source_profile_metadata_bytes(metadata.get());
+    if (statistics_file) {
+        const auto * configured = getenv("GGML_MOE_EXPERT_PROFILE");
+        if (!configured || strcmp(configured, statistics_file)) { return 1; }
+        std::ofstream output(statistics_file, std::ios::binary | std::ios::trunc);
+        if (!output.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) { return 1; }
+    }
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    if (!ctx || !ctx->initialize_moe_profile()) { return 1; }
+    const auto statistics = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), sources);
+    std::vector<ggml_backend_moe_source_statistics_v1> views;
+    for (const auto & source : statistics.sources) {
+        views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+    }
+    if (!ctx->initialize_moe_statistics(views)) { return 1; }
+    std::vector<std::vector<int32_t>> source_ranks(statistics.sources.size());
+    std::vector<ggml_backend_moe_static_profile_v1> profiles;
+    for (size_t i = 0; i < statistics.sources.size(); ++i) {
+        const auto & source = statistics.sources[i];
+        const auto * tensor = source.tensor;
+        if (tensor->ne[2] < 4 || tensor->ne[2] > 65536) { return 1; }
+        auto & ranks = source_ranks[i];
+        for (int64_t expert = 0; expert < tensor->ne[2]; ++expert) { ranks.push_back(int32_t(expert)); }
+        std::sort(ranks.begin(), ranks.end(), [&](int32_t a, int32_t b) { return source.counts[a] > source.counts[b] || (source.counts[a] == source.counts[b] && a < b); });
+        profiles.push_back({tensor, ranks.data(), uint32_t(ranks.size())});
+    }
+    if (sources.empty() || !ctx->initialize_moe_profile(profiles)) { return 1; }
+    const auto * vocab = llama_model_get_vocab(model.get());
+    auto tokens = common_tokenize(vocab, "Explain the sky.", true, true);
+    if (tokens.empty() || tokens.size() > params.n_batch) { return 1; }
+    auto batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
+    if (llama_decode(ctx.get(), batch) != 0) { return 1; }
+    const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+    if (!logits) { return 1; }
+    for (int32_t i = 0; i < llama_vocab_n_tokens(vocab); ++i) {
+        if (!std::isfinite(logits[i])) { return 1; }
+    }
+    for (uint32_t step = 0; step < 8; ++step) {
+        auto token = tokens.back();
+        auto decode = llama_batch_get_one(&token, 1);
+        if (llama_decode(ctx.get(), decode) != 0) { return 1; }
+        const auto * current = llama_get_logits_ith(ctx.get(), -1);
+        if (!current) { return 1; }
+        for (int32_t i = 0; i < llama_vocab_n_tokens(vocab); ++i) { if (!std::isfinite(current[i])) { return 1; } }
+    }
+    for (auto & ranks : source_ranks) { std::reverse(ranks.begin(), ranks.end()); }
+    if (!ctx->initialize_moe_profile(profiles)) { return 1; }
+    fprintf(stderr, "test-model-source-profile: groups=%zu original routed banks initialized before and after decode without layer/down-bank lookup OK\n", sources.size());
+    fprintf(stderr, "test-model-source-profile: full source-indexed statistics bytes=%zu sources=%zu decoded and ranked independently of cache capacity OK\n", bytes.size(), statistics.sources.size());
+    return 0;
+}
+
+struct routed_cpu_oracle {
+    routed_profile_collector profile_collector;
+    std::string profile_export_path;
+    std::string profile_trace_path;
+    llama_context * profile_context = nullptr;
+    std::ofstream profile_trace;
+    size_t profile_trace_bytes = 0;
+    uint64_t profile_frame = 0;
+    uint64_t profile_frames = 0;
+    common_json records = common_json::array();
+    uint64_t mismatched_routes = 0;
+    ggml_backend_ptr backend;
+    bool cpu_enabled = false;
+    bool gpu_enabled = false;
+    ggml_backend_ptr gpu_backend;
+    common_json gpu_records = common_json::array();
+    common_json projection_records = common_json::array();
+    std::string projection_capture_path;
+    bool projection_captured = false;
+    std::string trace_path;
+    size_t trace_bytes = 0;
+    common_json trace_records = common_json::array();
+    common_json trace_states = common_json::array();
+
+    bool profile_trace_record(const common_json & record) {
+        constexpr size_t limit = 256 * 1024 * 1024;
+        const std::string line = record.dump();
+        if (profile_trace_bytes >= limit || line.size() >= limit - profile_trace_bytes) { return false; }
+        if (!(profile_trace << line << '\n')) { return false; }
+        profile_trace_bytes += line.size() + 1;
+        return true;
+    }
+
+    bool trace_profile_projection(uint64_t epoch, const ggml_backend_moe_source_access_v1 * probe) {
+        const auto * frame = profile_context ? profile_context->get_moe_test_frame() : nullptr;
+        if (!frame || !frame->ubatch || !frame->certificate || !probe || !probe->ids) { return false; }
+        if (getenv("GGML_TEST_MOE_PROFILE_FAIL_FRAME")) { return false; }
+        const auto & batch = *frame->ubatch;
+        const auto & certificate = *frame->certificate;
+        if (certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC || certificate.struct_size != sizeof(certificate) ||
+                certificate.n_rows != batch.n_tokens || !batch.n_tokens || !batch.n_pos || !batch.pos || !batch.n_seq_id || !batch.seq_id ||
+                uint64_t(batch.n_tokens) * batch.n_pos > (1u << 22)) { return false; }
+        if (profile_frame != frame->submission) {
+            if (profile_frames >= 65536 || frame->submission <= profile_frame) { return false; }
+            common_json rows = common_json::array();
+            uint64_t cells = uint64_t(batch.n_tokens) * batch.n_pos;
+            for (uint32_t row = 0; row < batch.n_tokens; ++row) {
+                if (batch.n_seq_id[row] <= 0 || !batch.seq_id[row] || uint64_t(batch.n_seq_id[row]) > (1u << 22) - cells) { return false; }
+                cells += batch.n_seq_id[row];
+                std::vector<llama_pos> positions(batch.n_pos);
+                for (uint32_t axis = 0; axis < batch.n_pos; ++axis) { positions[axis] = batch.pos[size_t(axis) * batch.n_tokens + row]; }
+                common_json item = {{"row", row}, {"positions", positions},
+                    {"sequences", std::vector<llama_seq_id>(batch.seq_id[row], batch.seq_id[row] + batch.n_seq_id[row])}};
+                item["token"] = batch.token ? common_json(batch.token[row]) : common_json(nullptr);
+                item["output"] = batch.output ? common_json(bool(batch.output[row])) : common_json(nullptr);
+                item["original_batch_index"] = batch.data && batch.data->batch_idxs.size() == batch.n_tokens ?
+                    common_json(batch.data->batch_idxs[row]) : common_json(nullptr);
+                rows.push_back(std::move(item));
+            }
+            if (!profile_trace_record({{"kind", "frame"}, {"schema", 1}, {"submission", frame->submission},
+                    {"batched", frame->batched}, {"owner_namespace", certificate.owner_namespace},
+                    {"owner_generation", certificate.owner_generation}, {"execution_domain", certificate.domain},
+                    {"row_semantics", certificate.row_semantics}, {"execution_flags", certificate.flags},
+                    {"n_rows", certificate.n_rows}, {"n_sequences", certificate.n_sequences}, {"rows", rows},
+                    {"acceptance", "unknown at source publication"}, {"request_id", nullptr}})) { return false; }
+            profile_frame = frame->submission; ++profile_frames;
+        }
+        const auto source = profile_collector.source_indices.find(std::make_pair(probe->source_domain, probe->source_witness));
+        if (source == profile_collector.source_indices.end()) { return false; }
+        const auto * ids = probe->ids;
+        const bool mapped = ids->ne[0] > 0 && ids->ne[1] == batch.n_tokens && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+            uint64_t(ids->ne[0]) * batch.n_tokens == probe->n_routes;
+        std::vector<int32_t> experts(probe->n_routes), ownership(probe->n_routes);
+        for (uint32_t route = 0; route < probe->n_routes; ++route) {
+            experts[route] = probe->expert_ids[probe->route_indices[route]];
+            ownership[route] = probe->classes[probe->route_indices[route]];
+        }
+        return profile_trace_record({{"kind", "projection"}, {"submission", frame->submission}, {"backend_epoch", epoch},
+            {"source_index", source->second}, {"source_domain", probe->source_domain}, {"projection_index", probe->layer},
+            {"projection_count", probe->n_layers}, {"ids_shape", std::vector<int64_t>(ids->ne, ids->ne + 4)},
+            {"ids_strides", std::vector<size_t>(ids->nb, ids->nb + 4)}, {"row_mapping", mapped ? "flat route / ids_shape[0]" : "unbound geometry"},
+            {"experts", experts}, {"ownership", ownership}});
+    }
+
+    bool trace_blob(const std::string & name, const void * data, size_t bytes) {
+        constexpr size_t limit = 256 * 1024 * 1024;
+        if (!data || !bytes || bytes > limit - trace_bytes) { return false; }
+        std::ofstream file(std::filesystem::path(trace_path) / name, std::ios::binary);
+        if (!file.write(static_cast<const char *>(data), bytes)) { return false; }
+        file.close();
+        if (!file) { return false; }
+        trace_bytes += bytes;
+        return true;
+    }
+
+    static common_json trace_geometry(const ggml_tensor * tensor) {
+        return {{"type", uint32_t(tensor->type)}, {"shape", std::vector<int64_t>(tensor->ne, tensor->ne + GGML_MAX_DIMS)},
+            {"strides", std::vector<size_t>(tensor->nb, tensor->nb + GGML_MAX_DIMS)}};
+    }
+
+    bool trace_projection(uint64_t epoch, const ggml_cuda_moe_source_gpu_probe * probe) {
+        if (trace_path.empty() || epoch < 2 || epoch > 7) { return true; }
+        if (!probe || !probe->operation || !probe->activation || !probe->weight || !probe->input_data ||
+                !probe->route_indices || !probe->expert_ids || !probe->classes ||
+                !probe->n_layers || probe->n_layers > 1024 || probe->layer >= probe->n_layers ||
+                !probe->n_routes || probe->n_routes > 64 || !probe->n_distinct || probe->n_distinct > probe->n_routes ||
+                probe->operation->op != GGML_OP_MUL_MAT_ID || probe->operation->type != GGML_TYPE_F32 ||
+                !probe->operation->buffer || !probe->operation->data || probe->operation->ne[0] <= 0 ||
+                probe->operation->ne[0] > 65536 || !ggml_is_contiguous(probe->operation) || trace_records.size() >= 6144) {
+            return false;
+        }
+        const size_t input_bytes = ggml_nbytes(probe->activation), output_bytes = ggml_nbytes(probe->operation);
+        if (!input_bytes || input_bytes > 8 * 1024 * 1024 || probe->input_bytes < input_bytes ||
+                output_bytes != size_t(probe->operation->ne[0]) * probe->n_routes * sizeof(float)) { return false; }
+        std::vector<int32_t> ids(probe->n_routes), classes(probe->n_routes);
+        for (uint32_t route = 0; route < probe->n_routes; ++route) {
+            const uint32_t index = probe->route_indices[route];
+            if (index >= probe->n_distinct) { return false; }
+            ids[route] = probe->expert_ids[index]; classes[route] = probe->classes[index];
+            if (ids[route] < 0 || ids[route] >= probe->weight->ne[2] || classes[route] < 0 || classes[route] > 2) { return false; }
+        }
+        const std::string prefix = std::to_string(epoch) + "-" + std::to_string(probe->layer) + "-" + std::to_string(trace_records.size());
+        std::vector<float> output(output_bytes / sizeof(float));
+        ggml_backend_tensor_get(probe->operation, output.data(), 0, output_bytes);
+        for (float value : output) { if (!std::isfinite(value)) { return false; } }
+        if (!trace_blob(prefix + "-input.bin", probe->input_data, input_bytes) ||
+                !trace_blob(prefix + "-output.bin", output.data(), output_bytes)) { return false; }
+        trace_records.push_back({{"epoch", epoch}, {"layer", probe->layer}, {"n_layers", probe->n_layers},
+            {"name", probe->operation->name}, {"weight", trace_geometry(probe->weight)},
+            {"activation", trace_geometry(probe->activation)}, {"output", trace_geometry(probe->operation)},
+            {"input_file", prefix + "-input.bin"}, {"output_file", prefix + "-output.bin"}, {"ids", ids}, {"classes", classes}});
+        return true;
+    }
+
+    bool trace_state(llama_context * ctx, uint32_t step) {
+        if (trace_path.empty() || step > 6) { return true; }
+        const size_t bytes = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!bytes || bytes > 64 * 1024 * 1024 || bytes > 256 * 1024 * 1024 - trace_bytes) { return false; }
+        std::vector<uint8_t> state(bytes);
+        if (llama_state_seq_get_data_ext(ctx, state.data(), bytes, 0, LLAMA_STATE_SEQ_FLAGS_NONE) != bytes) { return false; }
+        const std::string name = "state-" + std::to_string(step) + ".bin";
+        if (!trace_blob(name, state.data(), bytes)) { return false; }
+        trace_states.push_back({{"step", step}, {"file", name}, {"bytes", bytes}, {"sha256", hash_sha256_hex(state.data(), bytes)}});
+        return true;
+    }
+
+    static bool cpu_reference(ggml_backend_t backend_cpu, const ggml_tensor * operation,
+            const ggml_tensor * source_weight, const ggml_tensor * source_activation,
+            const void * weight_data, const void * input_data, const int32_t * logical_ids, std::vector<float> & values) {
+        const auto * source_ids = operation->src[2];
+        ggml_context_ptr context(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true}));
+        if (!context || !backend_cpu || !source_ids) { return false; }
+        auto * weight = ggml_dup_tensor(context.get(), source_weight);
+        auto * activation = ggml_dup_tensor(context.get(), source_activation);
+        auto * ids = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, source_ids->ne[0], source_ids->ne[1]);
+        memcpy(weight->nb, source_weight->nb, sizeof(weight->nb));
+        memcpy(activation->nb, source_activation->nb, sizeof(activation->nb));
+        weight->data = const_cast<void *>(weight_data);
+        activation->data = const_cast<void *>(input_data);
+        ids->data = const_cast<int32_t *>(logical_ids);
+        auto * output = ggml_mul_mat_id(context.get(), weight, activation, ids);
+        memcpy(output->op_params, operation->op_params, sizeof(output->op_params));
+        if (memcmp(output->ne, operation->ne, sizeof(output->ne)) ||
+                memcmp(output->nb, operation->nb, sizeof(output->nb)) || !ggml_backend_supports_op(backend_cpu, output)) { return false; }
+        values.resize(ggml_nelements(output));
+        output->data = values.data();
+        auto * graph = ggml_new_graph_custom(context.get(), 16, false);
+        ggml_build_forward_expand(graph, output);
+        ggml_backend_cpu_set_n_threads(backend_cpu, 4);
+        return ggml_backend_graph_compute(backend_cpu, graph) == GGML_STATUS_SUCCESS;
+    }
+
+    static bool observe_gpu(routed_cpu_oracle & oracle, uint64_t epoch, void * view) {
+        if (!oracle.gpu_enabled) { return true; }
+        const auto * probe = static_cast<const ggml_cuda_moe_source_gpu_probe *>(view);
+        if (!probe || !probe->operation || !probe->activation || !probe->weight || !probe->weight_data || !probe->input_data ||
+                !probe->route_indices || !probe->expert_ids || !probe->classes || !probe->n_layers || probe->n_layers > 65536 || probe->layer >= probe->n_layers ||
+                !epoch || !probe->n_routes || probe->n_routes > 65536 || !probe->n_distinct || probe->n_distinct > probe->n_routes ||
+                probe->operation->op != GGML_OP_MUL_MAT_ID || probe->operation->type != GGML_TYPE_F32 ||
+                !probe->operation->buffer || oracle.gpu_records.size() >= 65536) { return false; }
+        const uint32_t start = uint32_t(((epoch - 1) % probe->n_layers) * 3 % probe->n_layers);
+        const uint32_t distance = (probe->layer + probe->n_layers - start) % probe->n_layers;
+        if (distance >= std::min(3u, probe->n_layers)) { return true; }
+        const auto * source_ids = probe->operation->src[2];
+        if (!source_ids || source_ids->type != GGML_TYPE_I32 || source_ids->ne[0] <= 0 || source_ids->ne[1] <= 0 ||
+                source_ids->ne[2] != 1 || source_ids->ne[3] != 1 || uint64_t(source_ids->ne[0]) > probe->n_routes ||
+                uint64_t(source_ids->ne[1]) > probe->n_routes || uint64_t(source_ids->ne[0]) * uint64_t(source_ids->ne[1]) != probe->n_routes ||
+                probe->weight->ne[2] <= 0 || probe->weight->ne[3] != 1 || probe->input_bytes < ggml_nbytes(probe->activation) ||
+                ggml_nbytes(probe->weight) > 1024 * 1024 * 1024 || ggml_nbytes(probe->activation) > 64 * 1024 * 1024 ||
+                ggml_nbytes(probe->operation) > 64 * 1024 * 1024) { return false; }
+        std::vector<int32_t> logical_ids(probe->n_routes);
+        std::vector<int32_t> route_classes(probe->n_routes);
+        for (uint32_t route = 0; route < probe->n_routes; ++route) {
+            const uint32_t index = probe->route_indices[route];
+            if (index >= probe->n_distinct) { return false; }
+            const int32_t id = probe->expert_ids[index], kind = probe->classes[index];
+            if (id < 0 || id >= probe->weight->ne[2] || kind < 0 || kind > 2) { return false; }
+            logical_ids[route] = id;
+            route_classes[route] = kind;
+        }
+        const auto device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(probe->operation->buffer));
+        if (!device) { return false; }
+        if (!oracle.gpu_backend || ggml_backend_get_device(oracle.gpu_backend.get()) != device) {
+            oracle.gpu_backend.reset(ggml_backend_dev_init(device, nullptr));
+        }
+        if (!oracle.gpu_backend) { return false; }
+        ggml_context_ptr weight_context(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+        ggml_context_ptr context(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true}));
+        if (!weight_context || !context) { return false; }
+        auto * weight = ggml_dup_tensor(weight_context.get(), probe->weight);
+        auto * activation = ggml_dup_tensor(context.get(), probe->activation);
+        auto * ids = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, source_ids->ne[0], source_ids->ne[1]);
+        memcpy(weight->nb, probe->weight->nb, sizeof(weight->nb));
+        memcpy(activation->nb, probe->activation->nb, sizeof(activation->nb));
+        auto * output = ggml_mul_mat_id(context.get(), weight, activation, ids);
+        memcpy(output->op_params, probe->operation->op_params, sizeof(output->op_params));
+        if (memcmp(output->ne, probe->operation->ne, sizeof(output->ne)) ||
+                memcmp(output->nb, probe->operation->nb, sizeof(output->nb)) ||
+                !ggml_backend_supports_op(oracle.gpu_backend.get(), output)) { return false; }
+        ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors(weight_context.get(), oracle.gpu_backend.get()));
+        if (!weights) { return false; }
+        ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(context.get(), oracle.gpu_backend.get()));
+        if (!buffer) { return false; }
+        ggml_backend_tensor_set(weight, probe->weight_data, 0, ggml_nbytes(weight));
+        ggml_backend_tensor_set(activation, probe->input_data, 0, ggml_nbytes(activation));
+        ggml_backend_tensor_set(ids, logical_ids.data(), 0, logical_ids.size() * sizeof(int32_t));
+        auto * graph = ggml_new_graph_custom(context.get(), 16, false);
+        ggml_build_forward_expand(graph, output);
+        if (ggml_backend_graph_compute(oracle.gpu_backend.get(), graph) != GGML_STATUS_SUCCESS) { return false; }
+        std::vector<float> expected(ggml_nelements(output)), actual(expected.size());
+        ggml_backend_tensor_get(output, expected.data(), 0, expected.size() * sizeof(float));
+        ggml_backend_tensor_get(probe->operation, actual.data(), 0, actual.size() * sizeof(float));
+        if (output->ne[0] <= 0 || uint64_t(output->ne[0]) * probe->n_routes != expected.size()) { return false; }
+        std::vector<float> expected_cpu;
+        if (!cpu_reference(oracle.backend.get(), probe->operation, probe->weight, probe->activation,
+                probe->weight_data, probe->input_data, logical_ids.data(), expected_cpu) || expected_cpu.size() != expected.size()) { return false; }
+        double cpu_gpu_error = 0, hybrid_gpu_error = 0, mixed_error = 0, gpu_energy = 0;
+        double cpu_gpu_maximum = 0, hybrid_gpu_maximum = 0;
+        uint64_t mixed_mismatches = 0;
+        for (size_t column = 0; column < expected.size(); ++column) {
+            const float gpu = expected[column], cpu = expected_cpu[column], observed = actual[column];
+            if (!std::isfinite(gpu) || !std::isfinite(cpu) || !std::isfinite(observed)) { return false; }
+            const float mixed = route_classes[column / size_t(output->ne[0])] == 2 ? cpu : gpu;
+            const double cpu_delta = double(cpu) - gpu, hybrid_delta = double(observed) - gpu, mixed_delta = double(observed) - mixed;
+            cpu_gpu_error += cpu_delta * cpu_delta;
+            hybrid_gpu_error += hybrid_delta * hybrid_delta;
+            mixed_error += mixed_delta * mixed_delta;
+            gpu_energy += double(gpu) * gpu;
+            cpu_gpu_maximum = std::max(cpu_gpu_maximum, std::fabs(cpu_delta));
+            hybrid_gpu_maximum = std::max(hybrid_gpu_maximum, std::fabs(hybrid_delta));
+            mixed_mismatches += memcmp(&mixed, &observed, sizeof(float)) != 0;
+        }
+        oracle.projection_records.push_back({ {"epoch", epoch}, {"layer", probe->layer}, {"name", probe->operation->name},
+            {"type", ggml_type_name(weight->type)}, {"routes", probe->n_routes}, {"gpu_energy", gpu_energy},
+            {"cpu_gpu_squared_error", cpu_gpu_error}, {"cpu_gpu_nmse", cpu_gpu_error / std::max(gpu_energy, 1e-30)},
+            {"cpu_gpu_max_abs_error", cpu_gpu_maximum}, {"hybrid_gpu_squared_error", hybrid_gpu_error},
+            {"hybrid_gpu_nmse", hybrid_gpu_error / std::max(gpu_energy, 1e-30)}, {"hybrid_gpu_max_abs_error", hybrid_gpu_maximum},
+            {"mixed_squared_error", mixed_error}, {"mixed_bit_mismatches", mixed_mismatches} });
+        if (mixed_mismatches) { return false; }
+        if (!oracle.projection_capture_path.empty() && !oracle.projection_captured && cpu_gpu_error > 5e-4 * gpu_energy) {
+            const std::filesystem::path directory(oracle.projection_capture_path);
+            if (!std::filesystem::create_directory(directory)) { return false; }
+            struct blob { const char * name; const void * data; size_t bytes; };
+            const blob blobs[] = {
+                {"weight.bin", probe->weight_data, ggml_nbytes(probe->weight)},
+                {"activation.bin", probe->input_data, ggml_nbytes(probe->activation)},
+                {"ids.bin", logical_ids.data(), logical_ids.size() * sizeof(int32_t)},
+                {"classes.bin", route_classes.data(), route_classes.size() * sizeof(int32_t)},
+                {"cpu.bin", expected_cpu.data(), expected_cpu.size() * sizeof(float)},
+                {"gpu.bin", expected.data(), expected.size() * sizeof(float)},
+                {"observed.bin", actual.data(), actual.size() * sizeof(float)},
+            };
+            common_json capture = oracle.projection_records.back();
+            capture["blobs"] = common_json::object();
+            for (const auto & blob : blobs) {
+                std::ofstream file(directory / blob.name, std::ios::binary);
+                if (!file.write(static_cast<const char *>(blob.data), blob.bytes)) { return false; }
+                file.close();
+                if (!file) { return false; }
+                capture["blobs"][blob.name] = blob.bytes;
+            }
+            const auto geometry = [](const ggml_tensor * tensor) {
+                return common_json{{"type", uint32_t(tensor->type)}, {"type_name", ggml_type_name(tensor->type)},
+                    {"shape", std::vector<int64_t>(tensor->ne, tensor->ne + GGML_MAX_DIMS)},
+                    {"strides", std::vector<size_t>(tensor->nb, tensor->nb + GGML_MAX_DIMS)}};
+            };
+            capture["weight"] = geometry(probe->weight);
+            capture["activation"] = geometry(probe->activation);
+            capture["ids"] = geometry(ids);
+            capture["source_ids"] = geometry(source_ids);
+            capture["output"] = geometry(probe->operation);
+            capture["op_params"] = std::vector<int32_t>(std::begin(probe->operation->op_params), std::end(probe->operation->op_params));
+            capture["criterion"] = "first sampled ordinary CPU/GPU MUL_MAT_ID above existing 5e-4 limit; no tolerance waiver";
+            std::ofstream metadata(directory / "CAPTURE.json");
+            if (!(metadata << capture.dump(2) << '\n')) { return false; }
+            metadata.close();
+            if (!metadata) { return false; }
+            oracle.projection_captured = true;
+            fprintf(stderr, "test-moe-replay: captured original projection epoch=%llu layer=%u bytes=%zu\n",
+                (unsigned long long) epoch, probe->layer, ggml_nbytes(probe->weight));
+        }
+        for (int32_t kind = 0; kind < 3; ++kind) {
+            uint32_t owned = 0, mismatched = 0;
+            double squared_error = 0, squared_reference = 0, maximum = 0;
+            for (uint32_t route = 0; route < probe->n_routes; ++route) {
+                if (route_classes[route] != kind) { continue; }
+                ++owned;
+                bool exact = true;
+                const size_t offset = size_t(route) * size_t(output->ne[0]);
+                for (int64_t column = 0; column < output->ne[0]; ++column) {
+                    const float reference = expected[offset + size_t(column)], observed = actual[offset + size_t(column)];
+                    if (!std::isfinite(reference) || !std::isfinite(observed)) { return false; }
+                    exact &= memcmp(&reference, &observed, sizeof(float)) == 0;
+                    const double delta = double(observed) - reference;
+                    squared_error += delta * delta;
+                    squared_reference += double(reference) * reference;
+                    maximum = std::max(maximum, std::fabs(delta));
+                }
+                mismatched += !exact;
+            }
+            if (!owned) { continue; }
+            oracle.gpu_records.push_back({ {"epoch", epoch}, {"layer", probe->layer}, {"layers", probe->n_layers},
+                {"name", probe->operation->name}, {"type", ggml_type_name(weight->type)}, {"class", kind},
+                {"logical_ids", logical_ids}, {"route_classes", route_classes}, {"device", ggml_backend_dev_name(device)},
+                {"owned_routes", owned}, {"mismatched_routes", mismatched},
+                {"squared_error", squared_error}, {"reference_energy", squared_reference},
+                {"nmse", squared_error / std::max(squared_reference, 1e-30)}, {"max_abs_error", maximum} });
+        }
+        return true;
+    }
+
+    static bool observe(void * opaque, uint32_t phase, uint64_t epoch, void * view) {
+        auto & oracle = *static_cast<routed_cpu_oracle *>(opaque);
+        if (phase == GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ACCESS) {
+            if (oracle.profile_export_path.empty()) { return true; }
+            const auto * access = static_cast<const ggml_backend_moe_source_access_v1 *>(view);
+            return oracle.profile_collector.observe(epoch, access) && oracle.trace_profile_projection(epoch, access);
+        }
+        if (phase == GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ROUTED_GPU_PUBLICATION_PROBE) {
+            return oracle.trace_projection(epoch, static_cast<const ggml_cuda_moe_source_gpu_probe *>(view)) && observe_gpu(oracle, epoch, view);
+        }
+        if (!oracle.cpu_enabled) { return true; }
+        const bool publication = phase == GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ROUTED_PUBLICATION_PROBE;
+        if (!publication && phase != GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ROUTED_CPU_PROBE) { return true; }
+        const auto * probe = static_cast<const ggml_cuda_moe_source_cpu_probe *>(view);
+        if (!probe || !probe->operation || !probe->activation || !probe->weight || !probe->weight_data ||
+                !probe->input_data || !probe->ids || !probe->ownership || !probe->output ||
+                probe->operation->op != GGML_OP_MUL_MAT_ID || probe->operation->type != GGML_TYPE_F32 ||
+                probe->input_bytes < ggml_nbytes(probe->activation) || probe->output_bytes < ggml_nbytes(probe->operation) ||
+                !probe->n_routes || probe->n_routes > 65536 || oracle.records.size() >= 65536 || !oracle.backend) { return false; }
+        const auto * source_ids = probe->operation->src[2];
+        if (!source_ids || source_ids->ne[0] <= 0 || source_ids->ne[1] <= 0 || source_ids->ne[2] != 1 || source_ids->ne[3] != 1 ||
+                uint64_t(source_ids->ne[0]) > probe->n_routes || uint64_t(source_ids->ne[1]) > probe->n_routes ||
+                uint64_t(source_ids->ne[0]) * uint64_t(source_ids->ne[1]) != probe->n_routes) { return false; }
+        std::vector<float> values;
+        if (publication) {
+            if (!ggml_is_contiguous(probe->operation)) { return false; }
+            values.resize(ggml_nelements(probe->operation));
+            ggml_backend_tensor_get(probe->operation, values.data(), 0, values.size() * sizeof(float));
+        } else if (!cpu_reference(oracle.backend.get(), probe->operation, probe->weight, probe->activation,
+                probe->weight_data, probe->input_data, probe->ids, values)) { return false; }
+        const auto * output = probe->operation;
+        const auto * weight = probe->weight;
+        uint32_t owned = 0, mismatched = 0;
+        double squared_error = 0, squared_reference = 0, maximum = 0;
+        for (uint32_t route = 0; route < probe->n_routes; ++route) {
+            if (!probe->ownership[route]) { continue; }
+            ++owned;
+            const size_t offset = size_t(route) * size_t(output->ne[0]);
+            bool exact = true;
+            for (int64_t column = 0; column < output->ne[0]; ++column) {
+                const float expected = values[offset + size_t(column)], actual = probe->output[offset + size_t(column)];
+                if (!std::isfinite(expected) || !std::isfinite(actual)) { return false; }
+                exact &= memcmp(&expected, &actual, sizeof(float)) == 0;
+                const double delta = double(actual) - expected;
+                squared_error += delta * delta;
+                squared_reference += double(expected) * expected;
+                maximum = std::max(maximum, std::fabs(delta));
+            }
+            mismatched += !exact;
+        }
+        oracle.mismatched_routes += mismatched;
+        oracle.records.push_back({ {"epoch", epoch}, {"layer", probe->layer}, {"phase", publication ? "publication" : "cpu"}, {"name", probe->operation->name},
+            {"type", ggml_type_name(weight->type)}, {"owned_routes", owned}, {"mismatched_routes", mismatched},
+            {"nmse", squared_error / std::max(squared_reference, 1e-30)}, {"max_abs_error", maximum} });
+        return true;
+    }
+};
+
+static int test_model_moe_concurrent_replay(llama_model * model, llama_context_params params,
+        const std::vector<llama_token> & prompt, std::ifstream & input, const char * mode, const char * output_path) {
+    const bool staggered = !strcmp(mode, "staggered") || !strcmp(mode, "rollback");
+    const bool rollback = !strcmp(mode, "rollback");
+    if ((!staggered && strcmp(mode, "parallel")) || !output_path || !output_path[0] ||
+            prompt.size() >= 128 || std::filesystem::exists(output_path)) { return 1; }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(32);
+    std::vector<std::vector<float>> expected(32, std::vector<float>(n_vocab));
+    for (uint32_t step = 0; step < 32; ++step) {
+        input.read(reinterpret_cast<char *>(&tokens[step]), sizeof(llama_token));
+        input.read(reinterpret_cast<char *>(expected[step].data()), size_t(n_vocab) * sizeof(float));
+        if (!input || tokens[step] < 0 || tokens[step] >= n_vocab) { return 1; }
+        for (const auto value : expected[step]) { if (!std::isfinite(value)) { return 1; } }
+    }
+    if (input.peek() != std::char_traits<char>::eof()) { return 1; }
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    const uint32_t header[] = {0x43525031, uint32_t(n_vocab), 32, 2};
+    output.write(reinterpret_cast<const char *>(header), sizeof(header));
+    if (!output) { return 1; }
+    params.n_ctx = 1024;
+    params.n_seq_max = 2;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    if (!ctx) { return 1; }
+    llama_batch batch = llama_batch_init(128, 0, 1);
+    common_json rows = common_json::array();
+    uint32_t completed[2] = {};
+    std::vector<uint8_t> checkpoint;
+    common_json state = common_json::object();
+    bool restored = false;
+    int status = 0;
+    struct route_trace {
+        uint32_t frame = 0, requested_first_step = 0;
+        bool repeated = false;
+        common_json records = common_json::array();
+        static bool observe(void * opaque, uint32_t phase, uint64_t epoch, void * data) {
+            if (phase != GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ROUTED_GPU_PUBLICATION_PROBE) { return true; }
+            auto & self = *static_cast<route_trace *>(opaque);
+            const auto & probe = *static_cast<const ggml_cuda_moe_source_gpu_probe *>(data);
+            const auto * ids = probe.operation->src[2];
+            if (!ids || ids->ne[0] <= 0 || ids->ne[1] <= 0 || uint64_t(ids->ne[0]) * ids->ne[1] != probe.n_routes) { return false; }
+            std::vector<int32_t> logical(probe.n_routes), classes(probe.n_routes);
+            bool has_cpu = false;
+            for (uint32_t route = 0; route < probe.n_routes; ++route) {
+                const auto w = probe.route_indices[route];
+                if (w >= probe.n_distinct) { return false; }
+                logical[route] = probe.expert_ids[w];
+                classes[route] = probe.classes[w];
+                has_cpu = has_cpu || classes[route] == 2;
+            }
+            const size_t row_bytes = std::min(probe.input_bytes, probe.activation->nb[2]);
+            self.records.push_back({{"frame", self.frame}, {"requested_first_step", self.requested_first_step},
+                {"repeated", self.repeated}, {"epoch", epoch}, {"projection", probe.layer},
+                {"name", probe.operation->name}, {"local_rows", ids->ne[1]}, {"routes_per_row", ids->ne[0]},
+                {"ids", logical}, {"classes", classes}, {"cpu_input_available", has_cpu},
+                {"first_row_input_hash", has_cpu ? hash_sha256_hex(probe.input_data, row_bytes) : std::string{}}});
+            return true;
+        }
+    } trace;
+    const auto hook = [&]() {
+        if (getenv("GGML_TEST_MOE_REPLAY_ROUTING")) {
+            ggml_backend_sched_moe_hybrid_set_test_hook_v1(ctx->get_sched(), route_trace::observe, &trace);
+        }
+    };
+    const auto snapshot = [&](llama_seq_id seq) {
+        const size_t size = llama_state_seq_get_size_ext(ctx.get(), seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!size || size > size_t(1024) * 1024 * 1024) { return std::vector<uint8_t>{}; }
+        std::vector<uint8_t> bytes(size);
+        if (llama_state_seq_get_data_ext(ctx.get(), bytes.data(), size, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != size) { bytes.clear(); }
+        return bytes;
+    };
+    const auto record = [&](llama_seq_id seq, uint32_t step, int32_t index, bool repeated) {
+        const float * actual = llama_get_logits_ith(ctx.get(), index);
+        if (!actual) { return false; }
+        double error = 0.0, norm = 0.0, maximum = 0.0;
+        llama_token top = 0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (!std::isfinite(actual[i])) { return false; }
+            const double delta = double(actual[i]) - expected[step][i];
+            error += delta * delta;
+            norm += double(expected[step][i]) * expected[step][i];
+            maximum = std::max(maximum, std::fabs(delta));
+            if (actual[i] > actual[top]) { top = i; }
+        }
+        const uint32_t identity[] = {uint32_t(seq), step, uint32_t(repeated)};
+        output.write(reinterpret_cast<const char *>(identity), sizeof(identity));
+        output.write(reinterpret_cast<const char *>(actual), size_t(n_vocab) * sizeof(float));
+        rows.push_back({{"sequence", seq}, {"step", step}, {"repeated", repeated},
+            {"top", top}, {"reference_top", tokens[step]}, {"nmse", error / std::max(norm, 1e-30)},
+            {"max_abs_error", maximum}, {"logit_hash", hash_sha256_hex(actual, size_t(n_vocab) * sizeof(float))}});
+        return bool(output);
+    };
+    const auto prefill = [&](llama_seq_id seq) {
+        batch.n_tokens = 0;
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            batch_add_compat(batch, prompt[i], i, {seq}, i + 1 == prompt.size());
+        }
+        if (llama_decode(ctx.get(), batch) || !record(seq, 0, -1, false)) { return false; }
+        completed[seq] = 1;
+        return true;
+    };
+    if (!prefill(0) || (!staggered && !prefill(1))) { status = 1; }
+    while (!status && (completed[0] < 32 || completed[1] < 32)) {
+        batch.n_tokens = 0;
+        const bool starts_second = staggered && completed[0] == 8 && completed[1] == 0;
+        std::vector<std::pair<llama_seq_id, uint32_t>> outputs;
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            if (!completed[seq] || completed[seq] == 32) { continue; }
+            const uint32_t step = completed[seq];
+            batch_add_compat(batch, tokens[step - 1], prompt.size() + step - 1, {seq}, true);
+            outputs.push_back({seq, step});
+        }
+        if (starts_second) {
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                batch_add_compat(batch, prompt[i], i, {1}, i + 1 == prompt.size());
+            }
+            outputs.push_back({1, 0});
+        }
+        ++trace.frame;
+        trace.requested_first_step = completed[0];
+        trace.repeated = restored;
+        hook();
+        if (batch.n_tokens == 0 || llama_decode(ctx.get(), batch)) { status = 1; break; }
+        hook();
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            const auto seq = outputs[i].first;
+            const auto step = outputs[i].second;
+            if (!record(seq, step, int32_t(i) - int32_t(outputs.size()), restored && seq == 0 && step >= 17 && step <= 20)) { status = 1; break; }
+            completed[seq] = step + 1;
+        }
+        if (rollback && !restored && completed[0] == 17 && checkpoint.empty()) {
+            checkpoint = snapshot(0);
+            if (checkpoint.empty()) { status = 1; }
+            state["checkpoint_size"] = checkpoint.size();
+            state["checkpoint_hash"] = hash_sha256_hex(checkpoint.data(), checkpoint.size());
+        }
+        if (!status && rollback && !restored && completed[0] == 21) {
+            const auto before = snapshot(1);
+            if (before.empty() || !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1) ||
+                    llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
+                        LLAMA_STATE_SEQ_FLAGS_NONE) != checkpoint.size()) { status = 1; break; }
+            const auto after = snapshot(1);
+            const auto restored_state = snapshot(0);
+            state["restored_state_exact"] = restored_state == checkpoint;
+            state["restored_state_hash"] = hash_sha256_hex(restored_state.data(), restored_state.size());
+            if (restored_state != checkpoint) { status = 1; break; }
+            state["survivor_state_unchanged"] = before == after;
+            state["survivor_step"] = completed[1];
+            if (before != after) { status = 1; break; }
+            completed[0] = 17;
+            restored = true;
+        }
+    }
+    llama_batch_free(batch);
+    output.flush();
+    if (!output || (rollback && !restored)) { status = 1; }
+    ctx.reset();
+    common_log_flush(common_log_main());
+    printf("test-moe-concurrent-replay: %s\n", common_json({{"mode", mode}, {"status", status},
+        {"completed", common_json::array({completed[0], completed[1]})}, {"n_vocab", n_vocab}, {"rows", rows}, {"state", state}, {"routing", trace.records}}).dump().c_str());
+    fflush(stdout);
+    return status;
+}
+
+static int test_model_moe_replay(const char * path, const char * reference_path, bool replay, bool independent_sources, int32_t cache_slots, bool cpu_oracle, bool gpu_oracle, llama_load_mode load_mode, const char * prompt_path, uint32_t replay_rows, const std::string & corpus_split) {
+    if (!reference_path || !replay_rows || replay_rows > 4096 ||
+            (getenv("GGML_TEST_MOE_PROFILE_EXPORT") && replay_rows < 2) ||
+            (getenv("GGML_TEST_MOE_PROFILE_LIFECYCLE") && replay_rows < 32) ||
+            (getenv("GGML_TEST_MOE_REPLAY_TRACE") && replay_rows < 8) ||
+            (getenv("GGML_TEST_MOE_REPLAY_CONCURRENCY") && replay_rows != 32)) { return 1; }
+    std::string prompt_text = "Write a short explanation of why the sky is blue.";
+    if (prompt_path) {
+        std::ifstream file(prompt_path, std::ios::binary);
+        if (!file) { return 1; }
+        prompt_text.resize(64 * 1024 + 1);
+        file.read(prompt_text.data(), prompt_text.size());
+        const auto bytes = file.gcount();
+        if (!file.eof() || file.bad() || bytes <= 0 || bytes > 64 * 1024) { return 1; }
+        prompt_text.resize(size_t(bytes));
+        if (prompt_text.find('\0') != std::string::npos) { return 1; }
+    }
+    const std::string prompt_hash = hash_sha256_hex(prompt_text.data(), prompt_text.size());
+    auto model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 99;
+    model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    model_params.load_mode = load_mode;
+    model_params.moe_expert_cache_slots = cache_slots;
+    model_params.moe_expert_cache_host_pinned_size = 0;
+    model_params.progress_callback = silent_model_load_progress;
+    llama_model_ptr model(llama_model_load_from_file(path, model_params));
+    if (!model) { return 1; }
+    if (independent_sources) {
+        auto layers = std::move(model->layers);
+        model->layers.clear();
+        model->build_moe_sources();
+        model->layers = std::move(layers);
+        std::unordered_set<const ggml_tensor *> routed;
+        for (const auto & use : model->tensor_uses()) {
+            if (use.op == GGML_OP_MUL_MAT_ID) { routed.insert(use.tensor); }
+        }
+        std::unordered_set<const ggml_tensor *> described;
+        for (const auto & group : model->moe_sources()) {
+            if (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX || group.banks.size() != 1 ||
+                    group.banks[0].role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT ||
+                    !described.insert(group.banks[0].tensor).second) { return 1; }
+        }
+        if (routed.empty() || described != routed) { return 1; }
+        fprintf(stderr, "test-moe-replay: independent source catalog covers%zu original operands\n", described.size());
+    }
+    const auto * vocab = llama_model_get_vocab(model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0 || n_vocab > 1024 * 1024) { return 1; }
+    const auto prompt = common_tokenize(vocab, prompt_text, true, true);
+    if (prompt.empty() || prompt.size() > 4096 ||
+            (getenv("GGML_TEST_MOE_REPLAY_CONCURRENCY") && prompt.size() > 128)) { return 1; }
+    const uint32_t header[] = { 0x4d525031, uint32_t(n_vocab), replay_rows, uint32_t(prompt.size()) };
+    const uint64_t reference_bytes = sizeof(header) + uint64_t(prompt.size()) * sizeof(llama_token) +
+        uint64_t(replay_rows) * (sizeof(llama_token) + uint64_t(n_vocab) * sizeof(float));
+    if (reference_bytes > 512 * 1024 * 1024) { return 1; }
+    std::ifstream input;
+    std::ofstream output;
+    if (replay) {
+        std::error_code error;
+        if (std::filesystem::file_size(reference_path, error) != reference_bytes || error) { return 1; }
+        input.open(reference_path, std::ios::binary);
+        uint32_t saved_header[4] = {};
+        input.read(reinterpret_cast<char *>(saved_header), sizeof(saved_header));
+        std::vector<llama_token> saved_prompt(prompt.size());
+        input.read(reinterpret_cast<char *>(saved_prompt.data()), saved_prompt.size() * sizeof(llama_token));
+        if (!input || std::memcmp(header, saved_header, sizeof(header)) != 0 || saved_prompt != prompt) { return 1; }
+    } else {
+        output.open(reference_path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char *>(header), sizeof(header));
+        output.write(reinterpret_cast<const char *>(prompt.data()), prompt.size() * sizeof(llama_token));
+        if (!output) { return 1; }
+    }
+    routed_cpu_oracle oracle;
+    oracle.cpu_enabled = cpu_oracle;
+    oracle.gpu_enabled = gpu_oracle;
+    if (const char * path = getenv("GGML_TEST_MOE_PROFILE_EXPORT")) {
+        if (!*path || std::filesystem::exists(path) || !oracle.profile_collector.initialize(model->moe_sources())) { return 1; }
+        oracle.profile_export_path = path;
+        oracle.profile_trace_path = std::string(path) + ".routes.jsonl";
+        if (std::filesystem::exists(oracle.profile_trace_path)) { return 1; }
+        oracle.profile_trace.open(oracle.profile_trace_path, std::ios::binary);
+        if (!oracle.profile_trace) { return 1; }
+    }
+    if (const char * trace = getenv("GGML_TEST_MOE_REPLAY_TRACE")) {
+        if (!replay || !*trace || !std::filesystem::create_directory(trace)) { return 1; }
+        oracle.trace_path = trace;
+    }
+    if (const char * capture = getenv("GGML_TEST_MOE_REPLAY_PROJECTION_CAPTURE")) {
+        if (!gpu_oracle || !*capture || std::filesystem::exists(capture)) { return 1; }
+        oracle.projection_capture_path = capture;
+    }
+    if (cpu_oracle || gpu_oracle) { oracle.backend.reset(ggml_backend_cpu_init()); }
+    bool oracle_hooked = false;
+    auto params = llama_context_default_params();
+    params.n_ctx = std::max<uint32_t>(512, uint32_t(prompt.size()) + replay_rows);
+    params.n_batch = params.n_ubatch = std::max<uint32_t>(128, uint32_t(prompt.size()));
+    params.n_threads = params.n_threads_batch = 4;
+    params.phase_aware_workspace = true;
+    params.no_perf = false;
+    if (const char * mode = getenv("GGML_TEST_MOE_REPLAY_CONCURRENCY")) {
+        if (!replay || cpu_oracle || gpu_oracle || !oracle.profile_export_path.empty()) { return 1; }
+        return test_model_moe_concurrent_replay(model.get(), params, prompt, input, mode,
+            getenv("GGML_TEST_MOE_REPLAY_CONCURRENT_OUTPUT"));
+    }
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    if (!ctx) { return 1; }
+    const bool profile_lifecycle = getenv("GGML_TEST_MOE_PROFILE_LIFECYCLE") != nullptr;
+    uint64_t paused_projections = 0;
+    if (profile_lifecycle && oracle.profile_export_path.empty()) { return 1; }
+    if (!oracle.profile_export_path.empty()) {
+        oracle.profile_context = ctx.get();
+        if (ctx->get_moe_test_frame()) { return 1; }
+        if (!ctx->begin_source_call()) { return 1; }
+        const bool active_set = ctx->set_moe_test_hook(routed_cpu_oracle::observe, &oracle);
+        ctx->end_source_call();
+        if (active_set) { return 1; }
+        oracle_hooked = ctx->set_moe_test_hook(routed_cpu_oracle::observe, &oracle);
+        if (!oracle_hooked) { return 1; }
+    }
+    llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        batch_add_compat(batch, prompt[i], i, { 0 }, i + 1 == prompt.size());
+    }
+    std::vector<float> expected(n_vocab);
+    common_json rows = common_json::array();
+    common_json logit_hashes = common_json::array();
+    std::vector<llama_token> emitted_tokens;
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    uint32_t agreements = 0;
+    int status = 0;
+    for (uint32_t step = 0; step < header[2]; ++step) {
+        if (profile_lifecycle && step == 8) { ctx->sched_reserve(params.n_batch); }
+        if (profile_lifecycle && step == 16) {
+            paused_projections = oracle.profile_collector.projections;
+            if (!ctx->set_moe_test_hook(nullptr, nullptr)) { status = 1; break; }
+        }
+        if (profile_lifecycle && step == 24 && !ctx->set_moe_test_hook(routed_cpu_oracle::observe, &oracle)) { status = 1; break; }
+        if (llama_decode(ctx.get(), batch) != 0) {
+            if (!oracle.profile_export_path.empty()) {
+                fprintf(stderr, "test-moe-profile-frame: failed decode frame_cleared=%d\n", ctx->get_moe_test_frame() == nullptr);
+            }
+            status = 1; break;
+        }
+        if (!oracle.profile_export_path.empty() && ctx->get_moe_test_frame()) { status = 1; break; }
+        if (profile_lifecycle && step >= 16 && step < 24 && oracle.profile_collector.projections != paused_projections) { status = 1; break; }
+        if ((cpu_oracle || gpu_oracle || !oracle.trace_path.empty() || !oracle.profile_export_path.empty()) && !oracle_hooked) {
+            oracle_hooked = ggml_backend_sched_moe_hybrid_set_test_hook_v1(ctx->get_sched(), routed_cpu_oracle::observe, &oracle);
+        }
+        if (!oracle.trace_state(ctx.get(), step)) { status = 1; break; }
+        const float * actual = llama_get_logits_ith(ctx.get(), -1);
+        if (!actual) { status = 1; break; }
+        llama_token actual_top = 0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (!std::isfinite(actual[i])) { status = 1; break; }
+            if (actual[i] > actual[actual_top]) { actual_top = i; }
+        }
+        if (status) { break; }
+        logit_hashes.push_back(hash_sha256_hex(actual, size_t(n_vocab) * sizeof(float)));
+        llama_token token = actual_top;
+        if (replay) {
+            input.read(reinterpret_cast<char *>(&token), sizeof(token));
+            input.read(reinterpret_cast<char *>(expected.data()), expected.size() * sizeof(float));
+            if (!input || token < 0 || token >= n_vocab) { status = 1; break; }
+            double error = 0.0;
+            double norm = 0.0;
+            double max_error = 0.0;
+            float second = -INFINITY;
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                if (!std::isfinite(expected[i]) || expected[i] > expected[token]) { status = 1; break; }
+                const double delta = double(actual[i]) - expected[i];
+                error += delta * delta;
+                norm += double(expected[i]) * expected[i];
+                max_error = std::max(max_error, std::fabs(delta));
+                if (i != token) { second = std::max(second, expected[i]); }
+            }
+            if (status) { break; }
+            squared_error += error;
+            squared_reference += norm;
+            agreements += actual_top == token;
+            rows.push_back({ { "step", step }, { "reference_top", token }, { "actual_top", actual_top },
+                { "reference_margin", expected[token] - second }, { "max_abs_error", max_error },
+                { "nmse", norm > 0.0 ? error / norm : error } });
+        } else {
+            output.write(reinterpret_cast<const char *>(&token), sizeof(token));
+            output.write(reinterpret_cast<const char *>(actual), n_vocab * sizeof(float));
+            if (!output) { status = 1; break; }
+        }
+        emitted_tokens.push_back(token);
+        batch.n_tokens = 0;
+        batch_add_compat(batch, token, prompt.size() + step, { 0 }, true);
+    }
+    llama_batch_free(batch);
+    if (replay && status == 0 && input.peek() != std::char_traits<char>::eof()) { status = 1; }
+    if (!replay) { output.flush(); if (!output) { status = 1; } }
+    if (cpu_oracle && (!oracle_hooked || oracle.records.empty() || oracle.mismatched_routes)) { status = 1; }
+    if (gpu_oracle && (!oracle_hooked || oracle.gpu_records.empty())) { status = 1; }
+    if (!oracle.projection_capture_path.empty() && !oracle.projection_captured) { status = 1; }
+    if (!oracle.trace_path.empty()) {
+        if (!oracle_hooked || oracle.trace_records.empty() || oracle.trace_states.size() != 7) { status = 1; }
+        std::ofstream trace(std::filesystem::path(oracle.trace_path) / "TRACE.json");
+        if (!(trace << common_json{{"records", oracle.trace_records}, {"states", oracle.trace_states},
+                {"bytes", oracle.trace_bytes}, {"status", status}}.dump(2) << '\n')) { status = 1; }
+        trace.close();
+        if (!trace) { status = 1; }
+    }
+    common_json profile_collection;
+    if (!oracle.profile_export_path.empty()) {
+        auto & collector = oracle.profile_collector;
+        oracle.profile_trace.close();
+        if (!oracle_hooked || !collector.projections || !oracle.profile_frames || !oracle.profile_trace) { status = 1; }
+        if (!status) {
+            std::ifstream trace_file(oracle.profile_trace_path, std::ios::binary);
+            std::vector<char> trace_bytes(std::istreambuf_iterator<char>{trace_file}, std::istreambuf_iterator<char>{});
+            if (!trace_file || trace_bytes.size() != oracle.profile_trace_bytes) { status = 1; }
+            const std::string trace_hash = hash_sha256_hex(trace_bytes.data(), trace_bytes.size());
+            collector.statistics.provenance = common_json({{"producer", "test-llama-archs generic routed publication observer"},
+                {"sampling", "all original source projection occurrences in decode epochs after prefill; all ownership classes"},
+                {"backend_epoch_scope", "session-local; not a token or request position"}, {"lifecycle_test", profile_lifecycle},
+                {"routing_sidecar", {{"format", "moe-routing-jsonl-v1"}, {"sha256", trace_hash}, {"bytes", oracle.profile_trace_bytes},
+                    {"frames", oracle.profile_frames}, {"projection_records", collector.projections}}},
+                {"prompt_token_count", prompt.size()}, {"prompt_sha256", prompt_hash},
+                {"prompt_token_ids_sha256", hash_sha256_hex(prompt.data(), prompt.size() * sizeof(llama_token))}, {"corpus_split", corpus_split},
+                {"teacher_rows", replay_rows}, {"teacher_replay", replay}, {"generation", replay ? "reference tokens" : "greedy original logits"},
+                {"stop_policy", "fixed rows; EOG does not stop the diagnostic"}, {"first_epoch", collector.first_epoch},
+                {"last_epoch", collector.last_epoch}, {"projections", collector.projections}, {"ownership_counts", std::vector<uint64_t>(collector.ownership_counts.begin(), collector.ownership_counts.end())},
+                {"omissions", common_json::array({"prefill", "draft", "MTP acceptance", "representative corpus and held-out quality"})}}).dump();
+            auto metadata = make_source_profile_statistics(model->moe_sources(), false, &collector.statistics);
+            const auto bytes = source_profile_metadata_bytes(metadata.get());
+            const auto decoded = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), model->moe_sources());
+            if (decoded.sources.size() != collector.statistics.sources.size() || bytes.size() > 64 * 1024 * 1024) { status = 1; }
+            for (size_t i = 0; !status && i < decoded.sources.size(); ++i) {
+                const auto & source = collector.statistics.sources[i]; const auto & result = decoded.sources[i];
+                if (result.tensor != source.tensor || result.domain != source.domain || result.observations != source.observations || result.counts != source.counts) { status = 1; }
+            }
+            if (!status) {
+                std::ofstream profile(oracle.profile_export_path, std::ios::binary);
+                if (!profile.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) { status = 1; }
+                profile.close(); if (!profile) { status = 1; }
+            }
+            profile_collection = {{"file", oracle.profile_export_path}, {"sources", decoded.sources.size()}, {"bytes", bytes.size()},
+                {"routing_sidecar", oracle.profile_trace_path}, {"routing_sha256", trace_hash}, {"routing_bytes", oracle.profile_trace_bytes}, {"frames", oracle.profile_frames},
+                {"projections", collector.projections}, {"ownership_counts", std::vector<uint64_t>(collector.ownership_counts.begin(), collector.ownership_counts.end())}, {"first_epoch", collector.first_epoch}, {"last_epoch", collector.last_epoch}};
+        }
+    }
+    if (!oracle.profile_export_path.empty() && !ctx->set_moe_test_hook(nullptr, nullptr)) { status = 1; }
+    const auto perf = llama_perf_context(ctx.get());
+    common_json report = { { "replay", replay }, { "independent_sources", independent_sources },
+        { "source_groups", model->moe_sources().size() }, { "cache_slots", cache_slots }, { "status", status }, { "n_vocab", n_vocab },
+        { "prompt_tokens", prompt }, { "prompt_sha256", prompt_hash }, { "corpus_split", corpus_split },
+        { "requested_rows", replay_rows }, { "emitted_tokens", emitted_tokens }, { "top_agreements", agreements }, { "rows", rows },
+        { "nmse", squared_reference > 0.0 ? squared_error / squared_reference : squared_error },
+        { "decode_ms", perf.t_eval_ms }, { "decode_tokens", perf.n_eval }, { "logit_hashes", logit_hashes }, { "cpu_oracle", oracle.records }, { "cpu_oracle_mismatched_routes", oracle.mismatched_routes },
+        { "gpu_oracle", oracle.gpu_records }, { "projection_references", oracle.projection_records },
+        { "load_mode", llama_load_mode_name(load_mode) }, { "profile_collection", profile_collection } };
+    ctx.reset();
+    model.reset();
+    common_log_flush(common_log_main());
+    printf("test-moe-replay: %s\n", report.dump().c_str());
+    fflush(stdout);
+    return status;
+}
+
 static bool phase_workspace_fail_alloc = false;
 static bool phase_workspace_fail_once = false;
 static int phase_workspace_alloc_failures = 0;
@@ -631,7 +1902,7 @@ static bool observe_mtp_finish(ggml_tensor * tensor, bool ask, void * user_data)
 
 static llama_context_ptr make_phase_workspace_context(
         llama_model * model, llama_context_type type, llama_context * other = nullptr, uint32_t n_seq_max = 1,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr);
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr, uint32_t n_outputs_max = 4);
 
 static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed, float stdev, bool moe = false) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
@@ -1009,13 +2280,13 @@ static llama_batch make_mtp_batch(
 
 static llama_context_ptr make_phase_workspace_context(
         llama_model * model, llama_context_type type, llama_context * other, uint32_t n_seq_max,
-        ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+        ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data, uint32_t n_outputs_max) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 32;
     params.n_batch = 32;
     params.n_ubatch = 32;
     params.n_seq_max = n_seq_max;
-    params.n_outputs_max = type == LLAMA_CONTEXT_TYPE_MTP ? n_seq_max : 4;
+    params.n_outputs_max = type == LLAMA_CONTEXT_TYPE_MTP ? n_seq_max : n_outputs_max;
     params.n_threads = 4;
     params.n_threads_batch = 4;
     params.ctx_type = type;
@@ -1026,7 +2297,670 @@ static llama_context_ptr make_phase_workspace_context(
     return llama_context_ptr(llama_init_from_model(model, params));
 }
 
+
+static int test_source_graph_variants(size_t seed, float stdev, const char * reference_path, bool read_reference) {
+    if (!reference_path || !*reference_path) { throw std::runtime_error("source variants require --replay-reference"); }
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) { throw std::runtime_error("source variants require a GPU"); }
+    ggml_backend_dev_t devices[] = { device, nullptr };
+    auto metadata = get_gguf_ctx(LLM_ARCH_LLAMA, true, false, 8, 2);
+    auto model_params = llama_model_default_params();
+    model_params.devices = devices;
+    model_params.n_gpu_layers = 99;
+    model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    model_params.moe_expert_cache_slots = 4;
+    model_params.moe_expert_cache_host_pinned_size = 0;
+    model_params.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) { throw std::runtime_error("source variant model initialization failed"); }
+    const llama_adapter_loras adapters;
+    const llama_moe_candidate_snapshot candidates(*model, adapters);
+    const auto snapshot = candidates.get();
+    fprintf(stderr, "test-source-descriptor: flags=%u slots=%u groups=%u tensors=%u\n",
+        snapshot.flags, snapshot.n_slots, snapshot.n_groups, snapshot.n_tensors);
+    for (uint32_t i = 0; i < snapshot.n_groups; ++i) {
+        const auto & group = snapshot.groups[i];
+        fprintf(stderr, "test-source-descriptor: group=%u layout=%u domain=%u flags=%u\n", i, group.layout, group.domain, group.flags);
+    }
+    for (uint32_t i = 0; i < snapshot.n_tensors; ++i) {
+        const auto & record = snapshot.tensors[i];
+        if (record.group_index == UINT32_MAX) { continue; }
+        const auto * tensor = record.tensor;
+        fprintf(stderr, "test-source-descriptor: tensor=%s group=%u role=%u status=%u flags=%u type=%s ne=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " nb=%zu,%zu,%zu,%zu\n",
+            tensor->name, record.group_index, record.role, record.status, record.flags, ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+    }
+
+    const bool sampling = std::getenv("GGML_TEST_SOURCE_SAMPLER_VARIANTS") != nullptr;
+    std::array<llama_sampler_ptr, 4> samplers;
+    std::array<llama_sampler_seq_config, 4> sampler_configs;
+    std::array<std::mt19937, 4> randoms;
+    if (sampling) {
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            samplers[seq].reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            llama_sampler_chain_add(samplers[seq].get(), llama_sampler_init_temp(10.0f));
+            llama_sampler_chain_add(samplers[seq].get(), llama_sampler_init_dist(4242 + seq));
+            sampler_configs[seq] = { seq, samplers[seq].get() };
+            randoms[seq].seed(4242 + seq);
+        }
+    }
+    auto params = llama_context_default_params();
+    params.n_ctx = 256;
+    params.n_batch = 32;
+    params.n_ubatch = 4;
+    params.n_seq_max = 4;
+    params.n_outputs_max = 4;
+    params.n_threads = params.n_threads_batch = 4;
+    params.phase_aware_workspace = true;
+    params.moe_source_graph_capacity = true;
+    if (sampling) {
+        params.samplers = sampler_configs.data();
+        params.n_samplers = sampler_configs.size();
+        params.n_outputs_max_per_seq = 4;
+    }
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    if (!ctx) { throw std::runtime_error("source variant context initialization failed"); }
+
+    struct contract { int32_t rows, sequences, span; };
+    const contract cases[] = {
+        {4, 4, 0}, {4, 1, 4}, {4, 2, 2}, {4, 1, 4},
+        {1, 1, 0}, {2, 1, 2}, {3, 1, 3}, {3, 3, 0},
+        {2, 2, 0}, {4, 4, 0}, {4, 2, 2}, {4, 1, 4},
+        {1, 1, 0}, {2, 2, 0}, {3, 3, 0}, {3, 1, 3},
+        {2, 1, 2}, {4, 1, 4}, {4, 2, 2}, {4, 1, 4},
+        {4, 1, -4}, {4, 1, -4}, {4, 2, 2},
+    };
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    std::vector<uint8_t> output;
+    auto append = [&](const void * data, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        output.insert(output.end(), bytes, bytes + size);
+    };
+    llama_pos positions[4] = {};
+    int32_t total_rows = 0;
+    for (size_t frame = 0; frame < sizeof(cases)/sizeof(cases[0]); ++frame) {
+        const auto & c = cases[frame];
+        const int32_t span = c.span ? std::abs(c.span) : 1;
+        auto tokens = get_tokens(c.rows, n_vocab, seed + 1 + frame);
+        llama_batch batch = llama_batch_init(c.rows, 0, 1);
+        for (int32_t seq = 0; seq < c.sequences; ++seq) {
+            for (int32_t i = 0; i < span; ++i) {
+                batch_add_compat(batch, tokens[seq*span + i], positions[seq] + i, { seq }, true);
+            }
+        }
+        llama_decode_execution_intent intent = {};
+        intent.magic = LLAMA_DECODE_EXECUTION_INTENT_MAGIC;
+        intent.abi_version = LLAMA_DECODE_EXECUTION_INTENT_VERSION;
+        intent.struct_size = sizeof(intent);
+        intent.type = LLAMA_DECODE_EXECUTION_INTENT_TARGET_VERIFICATION;
+        intent.verification_span = c.span > 0 ? c.span : 0;
+        const int status = c.span > 0 ? llama_decode_ext(ctx.get(), batch, &intent) : llama_decode(ctx.get(), batch);
+        llama_batch_free(batch);
+        if (status) { throw std::runtime_error("source variant decode failed at frame " + std::to_string(frame)); }
+        llama_synchronize(ctx.get());
+        auto expected_randoms = randoms;
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        for (int32_t row = 0; row < c.rows; ++row) {
+            const float * logits = sampling ? llama_get_sampled_logits_ith(ctx.get(), row) : llama_get_logits_ith(ctx.get(), row);
+            if (!logits || !std::all_of(logits, logits + n_vocab, [](float x) { return std::isfinite(x); })) {
+                throw std::runtime_error("invalid source variant logits");
+            }
+            append(logits, n_vocab*sizeof(float));
+            if (sampling) {
+                const llama_seq_id seq = row / span;
+                const auto token = llama_get_sampled_token_ith(ctx.get(), row);
+                const auto * probs = llama_get_sampled_probs_ith(ctx.get(), row);
+                if (!probs || token < 0 || token >= n_vocab || llama_get_sampled_probs_count_ith(ctx.get(), row) != uint32_t(n_vocab)) {
+                    throw std::runtime_error("invalid source variant sampled output");
+                }
+                float before = 0.0f;
+                for (int32_t id = 0; id < token; ++id) { before += probs[id]; }
+                const float rnd = dist(expected_randoms[seq]);
+                if (rnd < before - 1e-4f || rnd > before + probs[token] + 1e-4f) {
+                    throw std::runtime_error("source variant used the wrong sampler random input");
+                }
+                append(&token, sizeof(token));
+                append(probs, n_vocab*sizeof(float));
+                if (row % span < (span + 1) / 2) {
+                    llama_sampler_accept(samplers[seq].get(), token);
+                    dist(randoms[seq]);
+                }
+            }
+        }
+        for (int32_t seq = 0; seq < c.sequences; ++seq) { positions[seq] += span; }
+        for (int32_t seq = 0; seq < 4; ++seq) {
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx.get()), seq) != positions[seq] - 1) {
+                throw std::runtime_error("source variant sequence state changed");
+            }
+        }
+        ggml_backend_moe_hybrid_state_v1 state = {};
+        state.struct_size = sizeof(state);
+        const bool source_selected = ggml_backend_sched_moe_source_selected_v1(ctx->get_sched());
+        const bool have_state = ggml_backend_sched_moe_hybrid_state_v1(ctx->get_sched(), &state);
+        if ((c.span >= 0 ? !source_selected || !have_state || !state.window_launches ||
+                !(state.resident_routes + state.transfer_routes) : false) ||
+            (have_state && (state.cpu_routes || state.cpu_jobs || state.errors || state.capacity_errors ||
+                state.dispatch_active || state.cpu_active_jobs))) {
+            throw std::runtime_error("source variant did not finish a healthy all-GPU source execution");
+        }
+        fprintf(stderr, "test-source-variants: frame=%zu rows=%d sequences=%d span=%d windows=%" PRIu64 " resident=%" PRIu64 " transfer=%" PRIu64 "\n",
+            frame, c.rows, c.sequences, c.span, state.window_launches, state.resident_routes, state.transfer_routes);
+        total_rows += c.rows;
+    }
+    for (int32_t seq = 0; seq < 4; ++seq) {
+        const size_t size = llama_state_seq_get_size_ext(ctx.get(), seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!size || size > 16*1024*1024) { throw std::runtime_error("invalid source variant state size"); }
+        std::vector<uint8_t> state(size);
+        if (llama_state_seq_get_data_ext(ctx.get(), state.data(), size, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != size) {
+            throw std::runtime_error("source variant state serialization failed");
+        }
+        append(state.data(), size);
+    }
+    if (read_reference) {
+        std::ifstream file(reference_path, std::ios::binary);
+        std::vector<uint8_t> expected(output.size());
+        if (!file.read(reinterpret_cast<char *>(expected.data()), expected.size()) || file.peek() != EOF || expected != output) {
+            throw std::runtime_error("source variant full logits/state differ from the frozen control");
+        }
+    } else {
+        if (std::filesystem::exists(reference_path)) { throw std::runtime_error("refusing to replace source variant reference"); }
+        std::ofstream file(reference_path, std::ios::binary);
+        if (!file.write(reinterpret_cast<const char *>(output.data()), output.size())) {
+            throw std::runtime_error("cannot write source variant reference");
+        }
+    }
+    fprintf(stderr, "test-source-variants: PASS frames=%zu rows=%d vocab=%d bytes=%zu reference=%s\n",
+        sizeof(cases)/sizeof(cases[0]), total_rows, n_vocab, output.size(), read_reference ? "exact" : "written");
+    return 0;
+}
+
+static int test_source_auxiliary_frontend(size_t seed, float stdev, const char * reference_path, bool read_reference, bool uncached_reference, bool no_output_first, bool source_statistics, bool source_ranks, bool inherit_statistics, bool different_model, const char * profile_file, bool parent_active, bool explicit_profile, bool sparse_outputs) {
+    if (!reference_path || !*reference_path) { throw std::runtime_error("auxiliary source test requires --replay-reference"); }
+    const auto * mode = getenv("GGML_MOE_HYBRID");
+    if (!uncached_reference && (!mode || strcmp(mode, "required"))) { throw std::runtime_error("auxiliary source test requires GGML_MOE_HYBRID=required"); }
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) { throw std::runtime_error("auxiliary source test requires a GPU"); }
+    std::vector<uint8_t> recorded;
+    const auto append = [&](const void * data, size_t bytes) {
+        const auto * first = static_cast<const uint8_t *>(data);
+        recorded.insert(recorded.end(), first, first + bytes);
+    };
+    const auto state_bytes = [](llama_context * ctx, llama_seq_id seq) {
+        const size_t bytes = llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!bytes || bytes > 16 * 1024 * 1024) { throw std::runtime_error("invalid auxiliary state size"); }
+        std::vector<uint8_t> result(bytes);
+        if (llama_state_seq_get_data_ext(ctx, result.data(), bytes, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != bytes) {
+            throw std::runtime_error("auxiliary state serialization failed");
+        }
+        return result;
+    };
+    const auto record_state = [&](llama_context * ctx) {
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            const auto bytes = state_bytes(ctx, seq);
+            const uint64_t extent = bytes.size();
+            append(&extent, sizeof(extent)); append(bytes.data(), bytes.size());
+        }
+    };
+    struct frame { int32_t rows, sequences; bool outputs; bool last_output = false; };
+    struct caller_probe {
+        llama_context * context = nullptr;
+        const llama_batch * expected = nullptr;
+        uint32_t domain = 0;
+        uint64_t calls = 0;
+        static bool observe(void * opaque, uint32_t phase, uint64_t, void *) {
+            if (phase != GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_COMPUTE_ENTERED) { return true; }
+            auto & probe = *static_cast<caller_probe *>(opaque);
+            const auto * current = probe.context->get_moe_test_frame();
+            if (!current || !current->ubatch || !current->certificate || !probe.expected ||
+                    current->certificate->domain != probe.domain || !current->certificate->owner_namespace) { return false; }
+            const auto & batch = *current->ubatch;
+            if (!batch.data || batch.data->batch_idxs.size() != batch.n_tokens ||
+                    batch.n_tokens != current->certificate->n_rows || !batch.n_pos) { return false; }
+            for (uint32_t row = 0; row < batch.n_tokens; ++row) {
+                const auto original = batch.data->batch_idxs[row];
+                if (original < 0 || original >= probe.expected->n_tokens ||
+                        batch.pos[row] != probe.expected->pos[original] || batch.n_seq_id[row] != probe.expected->n_seq_id[original] ||
+                        bool(batch.output[row]) != bool(probe.expected->logits[original])) { return false; }
+                for (int32_t seq = 0; seq < batch.n_seq_id[row]; ++seq) {
+                    if (batch.seq_id[row][seq] != probe.expected->seq_id[original][seq]) { return false; }
+                }
+            }
+            ++probe.calls;
+            return true;
+        }
+    };
+    const bool observe_caller = getenv("GGML_TEST_MOE_CALLER_FRAME") != nullptr;
+    uint64_t caller_frames = 0;
+    const frame frames[] = {{1, 1, !no_output_first}, {2, 1, true}, {2, 2, true}, {3, 1, false},
+        {4, 2, true, sparse_outputs}, {1, 1, false}, {4, 1, true}, {2, 2, true}};
+    for (const auto type : {LLAMA_CONTEXT_TYPE_DRAFT, LLAMA_CONTEXT_TYPE_MTP}) {
+        for (bool shared : {false, true}) {
+            for (bool owner_first : {false, true}) {
+                const bool mtp = type == LLAMA_CONTEXT_TYPE_MTP;
+                const bool require_auxiliary_source = read_reference && !uncached_reference &&
+                    llama_speculative_grouped_intent_test_access::hybrid_required(mode, type);
+                auto metadata = get_gguf_ctx(mtp ? LLM_ARCH_QWEN35MOE : LLM_ARCH_LLAMA, true, mtp, 8, 2);
+                ggml_backend_dev_t devices[] = {device, nullptr};
+                auto model_params = llama_model_default_params();
+                model_params.devices = devices;
+                model_params.n_gpu_layers = 99;
+                model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+                model_params.load_mtp = mtp;
+                model_params.moe_expert_cache_slots = uncached_reference ? 0 : 4;
+                model_params.moe_expert_cache_host_pinned_size = 0;
+                model_params.progress_callback = silent_model_load_progress;
+                tensor_data_params tensor_params = {seed, stdev};
+                llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, model_params));
+                if (!model) { throw std::runtime_error("auxiliary test model initialization failed"); }
+                const int32_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                const int32_t embd = llama_model_n_embd_out(model.get());
+                auto params = llama_context_default_params();
+                params.n_ctx = 128;
+                params.n_batch = 16;
+                params.n_ubatch = 4;
+                params.n_seq_max = 2;
+                params.n_outputs_max = 4;
+                params.n_threads = params.n_threads_batch = 4;
+                params.phase_aware_workspace = true;
+                params.moe_source_graph_capacity = true;
+                std::string saved_profile, saved_adapt;
+                std::string selected_profile;
+                const char * selected_adaptation = getenv("GGML_TEST_AUXILIARY_ADAPT");
+                if (!selected_adaptation) { selected_adaptation = explicit_profile ? "off" : "occurrence"; }
+                if (profile_file && read_reference && !uncached_reference) {
+                    const auto * old_profile = getenv("GGML_MOE_EXPERT_PROFILE");
+                    const auto * old_adapt = getenv("GGML_MOE_HYBRID_PROFILE_ADAPT");
+                    if (old_profile) { saved_profile = old_profile; }
+                    if (old_adapt) { saved_adapt = old_adapt; }
+                    const auto statistics_metadata = make_source_profile_statistics(model->moe_sources(), explicit_profile);
+                    const auto bytes = source_profile_metadata_bytes(statistics_metadata.get());
+                    const std::string path = std::string(profile_file) + (explicit_profile ? ".parent." : ".") + std::to_string(int(type));
+                    selected_profile = path;
+                    if (std::filesystem::exists(path)) {
+                        std::ifstream file(path, std::ios::binary);
+                        std::vector<uint8_t> retained(bytes.size());
+                        if (!file.read(reinterpret_cast<char *>(retained.data()), retained.size()) || file.peek() != EOF || retained != bytes) {
+                            throw std::runtime_error("existing auxiliary profile fixture differs");
+                        }
+                    } else {
+                        std::ofstream file(path, std::ios::binary);
+                        if (!file.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) {
+                            throw std::runtime_error("cannot write auxiliary profile fixture");
+                        }
+                    }
+                    if (!explicit_profile) {
+                        common_set_env("GGML_MOE_EXPERT_PROFILE", path);
+                        common_set_env("GGML_MOE_HYBRID_PROFILE_ADAPT", selected_adaptation);
+                    }
+                }
+                llama_context_ptr target(explicit_profile ?
+                    llama_init_from_model_with_moe_profile(model.get(), params, selected_profile.c_str(), selected_adaptation) :
+                    llama_init_from_model(model.get(), params));
+                if (explicit_profile) { std::fill(selected_profile.begin(), selected_profile.end(), '!'); }
+                if (profile_file && !explicit_profile && read_reference && !uncached_reference) {
+                    common_set_env("GGML_MOE_EXPERT_PROFILE", saved_profile);
+                    common_set_env("GGML_MOE_HYBRID_PROFILE_ADAPT", saved_adapt);
+                }
+                if (!target) { throw std::runtime_error("actual target context initialization failed"); }
+                if (inherit_statistics && !profile_file && read_reference && !uncached_reference) {
+                    const auto profile_metadata = make_source_profile_statistics(model->moe_sources());
+                    const auto profile_bytes = source_profile_metadata_bytes(profile_metadata.get());
+                    auto statistics = llama_moe_profile_statistics_parse(profile_bytes.data(), profile_bytes.size(), model->moe_sources());
+                    std::vector<ggml_backend_moe_source_statistics_v1> views;
+                    for (const auto & source : statistics.sources) {
+                        views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                    }
+                    if (!target->initialize_moe_statistics(views)) { throw std::runtime_error("parent supplied statistics installation failed"); }
+                    for (auto & source : statistics.sources) { std::fill(source.counts.begin(), source.counts.end(), 0); }
+                }
+                params.ctx_type = type;
+                if (inherit_statistics) { params.ctx_other = target.get(); }
+                llama_model_ptr auxiliary_model;
+                if (different_model) {
+                    auto auxiliary_metadata = get_gguf_ctx(mtp ? LLM_ARCH_QWEN35MOE : LLM_ARCH_LLAMA, true, mtp, 8, 2);
+                    auxiliary_model.reset(llama_model_init_from_user(auxiliary_metadata.get(), set_tensor_data, &tensor_params, model_params));
+                    if (!auxiliary_model) { throw std::runtime_error("distinct auxiliary model initialization failed"); }
+                }
+                if (parent_active && read_reference && !uncached_reference && !different_model) {
+                    if (!target->begin_source_call()) { throw std::runtime_error("cannot enter parent source call guard"); }
+                    llama_context_ptr unavailable(llama_init_from_model(model.get(), params));
+                    target->end_source_call();
+                    if (unavailable) { throw std::runtime_error("active parent source context allowed a profile snapshot"); }
+                    fprintf(stderr, "test-source-auxiliary-parent: active snapshot rejected type=%d shared=%d owner_first=%d\n",
+                        int(type), shared, owner_first);
+                }
+                auto * selected_model = auxiliary_model ? auxiliary_model.get() : model.get();
+                if (explicit_profile && read_reference && !uncached_reference) {
+                    const auto profile_metadata = make_source_profile_statistics(selected_model->moe_sources());
+                    const auto bytes = source_profile_metadata_bytes(profile_metadata.get());
+                    selected_profile = std::string(profile_file) + ".child." + std::to_string(int(type));
+                    if (std::filesystem::exists(selected_profile)) {
+                        std::ifstream file(selected_profile, std::ios::binary);
+                        std::vector<uint8_t> retained(bytes.size());
+                        if (!file.read(reinterpret_cast<char *>(retained.data()), retained.size()) || file.peek() != EOF || retained != bytes) {
+                            throw std::runtime_error("existing explicit auxiliary profile differs");
+                        }
+                    } else {
+                        std::ofstream file(selected_profile, std::ios::binary);
+                        if (!file.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) {
+                            throw std::runtime_error("cannot write explicit auxiliary profile");
+                        }
+                    }
+                }
+                llama_context_ptr auxiliary(explicit_profile ?
+                    llama_init_from_model_with_moe_profile(selected_model, params, selected_profile.c_str(), selected_adaptation) :
+                    llama_init_from_model(selected_model, params));
+                if (explicit_profile) { std::fill(selected_profile.begin(), selected_profile.end(), '!'); }
+
+                if (inherit_statistics && auxiliary && read_reference && !uncached_reference) {
+                    const auto profile_metadata = make_source_profile_statistics(model->moe_sources());
+                    const auto profile_bytes = source_profile_metadata_bytes(profile_metadata.get());
+                    auto statistics = llama_moe_profile_statistics_parse(profile_bytes.data(), profile_bytes.size(), model->moe_sources());
+                    std::vector<ggml_backend_moe_source_statistics_v1> views;
+                    for (auto & source : statistics.sources) {
+                        std::reverse(source.counts.begin(), source.counts.end());
+                        views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                    }
+                    if (!profile_file && !target->initialize_moe_statistics(views)) { throw std::runtime_error("parent opposite statistics installation failed"); }
+                    for (auto & source : statistics.sources) { std::fill(source.counts.begin(), source.counts.end(), 0); }
+                    fprintf(stderr, "test-source-auxiliary-statistics: type=%d shared=%d owner_first=%d inherited_sources=%zu parent_replaced=%d profile_file=%d explicit=%d different_model=%d\n",
+                        int(type), shared, owner_first, views.size(), !profile_file, profile_file != nullptr, explicit_profile, different_model);
+                }
+                if (!target || !auxiliary) { throw std::runtime_error("actual auxiliary context initialization failed"); }
+                if ((source_statistics || source_ranks) && read_reference && !uncached_reference) {
+                    const auto profile_metadata = make_source_profile_statistics(model->moe_sources());
+                    const auto profile_bytes = source_profile_metadata_bytes(profile_metadata.get());
+                    auto statistics = llama_moe_profile_statistics_parse(profile_bytes.data(), profile_bytes.size(), model->moe_sources());
+                    std::vector<ggml_backend_moe_source_statistics_v1> views;
+                    for (const auto & source : statistics.sources) {
+                        views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                    }
+                    if (source_statistics) {
+                        if (!auxiliary->initialize_moe_statistics(views)) {
+                            throw std::runtime_error("auxiliary supplied statistics installation failed");
+                        }
+                        for (uint32_t variant = 0; variant < 5; ++variant) {
+                            auto invalid = views;
+                            if (variant == 0) { invalid.pop_back(); }
+                            if (variant == 1) { invalid.front().domain = UINT32_MAX; }
+                            if (variant == 2) { ++invalid.front().observations; }
+                            if (variant == 3) { invalid.front().counts = nullptr; }
+                            if (variant == 4) { invalid.back() = invalid.front(); }
+                            if (auxiliary->initialize_moe_statistics(invalid)) {
+                                throw std::runtime_error("invalid auxiliary statistics accepted");
+                            }
+                        }
+                    } else {
+                        std::vector<std::vector<int32_t>> ranks;
+                        std::vector<ggml_backend_moe_static_profile_v1> profiles;
+                        ranks.reserve(statistics.sources.size());
+                        for (const auto & source : statistics.sources) {
+                            ranks.emplace_back();
+                            for (int32_t expert = int32_t(source.counts.size()) - 1; expert >= 0; --expert) { ranks.back().push_back(expert); }
+                            profiles.push_back({source.tensor, ranks.back().data(), uint32_t(ranks.back().size())});
+                        }
+                        if (!auxiliary->initialize_moe_profile(profiles)) {
+                            throw std::runtime_error("auxiliary supplied ranks installation failed");
+                        }
+                        for (uint32_t variant = 0; variant < 5; ++variant) {
+                            auto invalid = profiles;
+                            if (variant == 0) { invalid.front().down = nullptr; }
+                            if (variant == 1) { invalid.front().experts = nullptr; }
+                            if (variant == 2) { ++invalid.front().n_experts; }
+                            if (variant == 3) { invalid.back() = invalid.front(); }
+                            const int32_t saved = ranks.front()[1];
+                            if (variant == 4) { ranks.front()[1] = ranks.front()[0]; }
+                            const bool accepted = auxiliary->initialize_moe_profile(invalid);
+                            ranks.front()[1] = saved;
+                            if (accepted) {
+                                throw std::runtime_error("invalid auxiliary ranks accepted");
+                            }
+                        }
+                        for (auto & rank : ranks) { std::fill(rank.begin(), rank.end(), 0); }
+                    }
+                    for (auto & source : statistics.sources) { std::fill(source.counts.begin(), source.counts.end(), 0); }
+                    fprintf(stderr, "test-source-auxiliary-statistics: type=%d shared=%d owner_first=%d supplied_then_mutated_sources=%zu\n",
+                        int(type), shared, owner_first, views.size());
+                }
+                if (explicit_profile) {
+                    for (const char * invalid_path : {static_cast<const char *>(nullptr), "", "missing-profile-fixture"}) {
+                        llama_context_ptr invalid(llama_init_from_model_with_moe_profile(selected_model, params, invalid_path, "off"));
+                        if (invalid) { throw std::runtime_error("invalid explicit profile path accepted"); }
+                    }
+                    selected_profile = std::string(profile_file) + ".child." + std::to_string(int(type));
+                    llama_context_ptr invalid(llama_init_from_model_with_moe_profile(selected_model, params, selected_profile.c_str(), "invalid-adaptation"));
+                    if (invalid) { throw std::runtime_error("invalid explicit adaptation accepted"); }
+                    fprintf(stderr, "test-source-explicit-profile: bad paths and adaptation rejected; caller paths mutated\n");
+                }
+                std::array<llama_pos, 2> target_pos{}, auxiliary_pos{};
+                const auto decode = [&](llama_context * ctx, bool embeddings, const frame & spec,
+                        std::array<llama_pos, 2> & positions, size_t input_seed, bool require_source) {
+                    llama_batch batch = llama_batch_init(spec.rows, embeddings ? embd : 0, 1);
+                    if (embeddings) {
+                        batch.token = static_cast<llama_token *>(malloc(sizeof(llama_token) * spec.rows));
+                        GGML_ASSERT(batch.token);
+                    }
+                    const auto tokens = get_tokens(spec.rows, vocab, input_seed);
+                    const int32_t per_sequence = spec.rows / spec.sequences;
+                    for (int32_t row = 0; row < spec.rows; ++row) {
+                        const llama_seq_id seq = row / per_sequence;
+                        const llama_pos pos = positions[seq] + row % per_sequence;
+                        batch_add_compat(batch, tokens[row], pos, {seq}, spec.outputs && (!spec.last_output || row == spec.rows - 1));
+                        if (embeddings) {
+                            for (int32_t feature = 0; feature < embd; ++feature) {
+                                batch.embd[size_t(row) * embd + feature] = float((pos + feature) % 17) / 17.0f;
+                            }
+                        }
+                    }
+                    if (source_statistics || source_ranks || inherit_statistics) {
+                        fprintf(stderr, "test-source-auxiliary-decode: type=%d auxiliary=%d rows=%d outputs=%d begin\n",
+                            int(type), ctx == auxiliary.get(), spec.rows, spec.outputs);
+                    }
+                    caller_probe probe{ctx, &batch, ctx == target.get() ? GGML_GRAPH_EXECUTION_DOMAIN_MAIN :
+                        (mtp ? GGML_GRAPH_EXECUTION_DOMAIN_MTP : GGML_GRAPH_EXECUTION_DOMAIN_DRAFT), 0};
+                    if (observe_caller && require_source && !ctx->set_moe_test_hook(caller_probe::observe, &probe)) {
+                        throw std::runtime_error("cannot bind actual auxiliary caller observer");
+                    }
+                    const int status = llama_decode(ctx, batch);
+                    if (observe_caller && require_source) {
+                        if (!probe.calls || ctx->get_moe_test_frame() || !ctx->set_moe_test_hook(nullptr, nullptr)) {
+                            throw std::runtime_error("actual caller frame missing or escaped its graph call");
+                        }
+                        caller_frames += probe.calls;
+                        fprintf(stderr, "test-source-caller-frame: domain=%u rows=%d sequences=%d outputs=%d calls=%llu original_rows=exact cleared=1\n",
+                            probe.domain, spec.rows, spec.sequences, spec.outputs, (unsigned long long) probe.calls);
+                    }
+                    llama_batch_free(batch);
+                    if (status) { throw std::runtime_error("actual auxiliary/target decode failed"); }
+                    llama_synchronize(ctx);
+                    for (int32_t seq = 0; seq < spec.sequences; ++seq) { positions[seq] += per_sequence; }
+                    for (int32_t seq = 0; seq < 2; ++seq) {
+                        if (llama_memory_seq_pos_max(llama_get_memory(ctx), seq) != positions[seq] - 1) {
+                            throw std::runtime_error("actual auxiliary sequence positions changed");
+                        }
+                    }
+                    if (spec.outputs) {
+                        for (int32_t row = spec.last_output ? spec.rows - 1 : 0; row < spec.rows; ++row) {
+                            const auto * logits = llama_get_logits_ith(ctx, row);
+                            if (!logits || !std::all_of(logits, logits + vocab, [](float x) { return std::isfinite(x); })) {
+                                throw std::runtime_error("invalid auxiliary full-vocabulary output");
+                            }
+                            append(logits, size_t(vocab) * sizeof(float));
+                        }
+                    }
+                    if (require_source) {
+                        ggml_backend_moe_hybrid_state_v1 state{}; state.struct_size = sizeof(state);
+                        if (!ggml_backend_sched_moe_source_selected_v1(ctx->get_sched()) ||
+                                !ggml_backend_sched_moe_hybrid_state_v1(ctx->get_sched(), &state) || !state.window_launches ||
+                                !(state.resident_routes + state.transfer_routes) || state.cpu_routes || state.cpu_jobs ||
+                                state.errors || state.capacity_errors || state.dispatch_active || state.cpu_active_jobs) {
+                            throw std::runtime_error("actual auxiliary graph did not complete healthy all-GPU hybrid execution");
+                        }
+                    }
+                    record_state(ctx);
+                };
+                decode(target.get(), false, {2, 2, true}, target_pos, seed, read_reference && !uncached_reference);
+                if (shared) {
+                    if (require_auxiliary_source) {
+                        if (!target->begin_source_call()) { throw std::runtime_error("cannot enter workspace owner call guard"); }
+                        const auto busy = llama_attach_shared_workspace(auxiliary.get(), target.get());
+                        target->end_source_call();
+                        if (busy != -1) { throw std::runtime_error("active source owner allowed workspace capacity mutation"); }
+                    }
+                    const auto attached = llama_attach_shared_workspace(auxiliary.get(), target.get());
+                    if (attached < 0 || (require_auxiliary_source && attached != 0)) {
+                        throw std::runtime_error("actual auxiliary shared workspace attachment failed");
+                    }
+                    fprintf(stderr, "test-source-auxiliary: type=%d requested_shared=1 actual_shared=%d control=%d\n",
+                        int(type), attached, !read_reference);
+                }
+                for (size_t index = 0; index < sizeof(frames) / sizeof(frames[0]); ++index) {
+                    const auto prior = index == 3 ? state_bytes(auxiliary.get(), 0) : std::vector<uint8_t>{};
+                    const auto surviving = index == 3 ? state_bytes(auxiliary.get(), 1) : std::vector<uint8_t>{};
+                    const auto prefix_pos = auxiliary_pos;
+                    decode(auxiliary.get(), mtp, frames[index], auxiliary_pos, seed + 100 + index, require_auxiliary_source);
+                    if (index == 3) {
+                        if (llama_state_seq_set_data_ext(auxiliary.get(), prior.data(), prior.size(), 0,
+                                LLAMA_STATE_SEQ_FLAGS_NONE) != prior.size()) {
+                            throw std::runtime_error("auxiliary accepted-prefix restore failed");
+                        }
+                        if (state_bytes(auxiliary.get(), 1) != surviving) {
+                            throw std::runtime_error("auxiliary restore changed surviving sequence state");
+                        }
+                        auxiliary_pos = prefix_pos;
+                        decode(auxiliary.get(), mtp, {1, 1, false}, auxiliary_pos, seed + 100 + index, require_auxiliary_source);
+                    }
+                    decode(target.get(), false, {1, 1, true}, target_pos, seed + 200 + index, read_reference && !uncached_reference);
+                    fprintf(stderr, "test-source-auxiliary: type=%d shared=%d owner_first=%d frame=%zu rows=%d sequences=%d outputs=%d OK last_output=%d\n",
+                        int(type), shared, owner_first, index, frames[index].rows, frames[index].sequences, frames[index].outputs, frames[index].last_output);
+                }
+                if ((source_statistics || source_ranks) && read_reference && !uncached_reference) {
+                    const auto profile_metadata = make_source_profile_statistics(model->moe_sources());
+                    const auto profile_bytes = source_profile_metadata_bytes(profile_metadata.get());
+                    const auto statistics = llama_moe_profile_statistics_parse(profile_bytes.data(), profile_bytes.size(), model->moe_sources());
+                    std::vector<ggml_backend_moe_source_statistics_v1> views;
+                    for (const auto & source : statistics.sources) {
+                        views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                    }
+                    if (auxiliary->initialize_moe_statistics(views)) {
+                        throw std::runtime_error("installed auxiliary source program allowed unchecked profile replacement");
+                    }
+                    fprintf(stderr, "test-source-auxiliary-setter: invalid inputs and installed-program replacement rejected\n");
+                }
+                if (owner_first) {
+                    target.reset();
+                    decode(auxiliary.get(), mtp, {1, 1, true}, auxiliary_pos, seed + 999, require_auxiliary_source);
+                    auxiliary.reset();
+                } else {
+                    auxiliary.reset();
+                    decode(target.get(), false, {1, 1, true}, target_pos, seed + 999, read_reference && !uncached_reference);
+                    target.reset();
+                }
+            }
+        }
+    }
+    if (read_reference) {
+        std::ifstream file(reference_path, std::ios::binary);
+        std::vector<uint8_t> expected(recorded.size());
+        if (!file.read(reinterpret_cast<char *>(expected.data()), expected.size()) || file.peek() != EOF || expected != recorded) {
+            throw std::runtime_error("actual auxiliary full logits/state differ from frozen control");
+        }
+    } else {
+        if (std::filesystem::exists(reference_path)) { throw std::runtime_error("refusing to replace auxiliary control"); }
+        std::ofstream file(reference_path, std::ios::binary);
+        if (!file.write(reinterpret_cast<const char *>(recorded.data()), recorded.size())) {
+            throw std::runtime_error("cannot write auxiliary control");
+        }
+    }
+    fprintf(stderr, "test-source-auxiliary: PASS contexts=DRAFT,MTP shared/private both teardown orders complete logits/state/accepted-prefix bytes=%zu reference=%s\n",
+        recorded.size(), read_reference ? "exact" : "written");
+    if (observe_caller) { fprintf(stderr, "test-source-caller-frame: PASS callbacks=%llu\n", (unsigned long long) caller_frames); }
+    return 0;
+}
+
 static void test_speculative_limits(size_t seed, float stdev) {
+    {
+        common_ngram_history history;
+        int32_t match = 0;
+        history.update({ 1, 2, 3, 4, 5, 6, 99, 1, 2 });
+        GGML_ASSERT(history.propose({3}, 2, 3, match) == llama_tokens({4, 5}) && match == 3);
+        GGML_ASSERT(history.propose({3, 4}, 2, 3, match) == llama_tokens({5, 6}) && match == 4);
+        GGML_ASSERT(history.propose({3, 4}, 1, 3, match) == llama_tokens({5}));
+        GGML_ASSERT(history.propose({3, 4}, 0, 3, match).empty());
+        GGML_ASSERT(history.propose({3, 4}, 2, 5, match).empty());
+        GGML_ASSERT(history.propose({3, 44}, 2, 3, match).empty());
+        // Queries must not insert rejected pending tokens into the history index.
+        GGML_ASSERT(history.propose({3, 4}, 2, 3, match) == llama_tokens({5, 6}));
+        history.update({7, 8, 9, 10, 11, 99, 7, 8});
+        GGML_ASSERT(history.propose({9}, 2, 3, match) == llama_tokens({10, 11}));
+        GGML_ASSERT(history.propose({3, 4}, 2, 3, match).empty());
+        history.update({7, 8});
+        GGML_ASSERT(history.propose({9}, 2, 3, match).empty());
+        history.clear();
+        GGML_ASSERT(history.propose({7, 8, 9}, 2, 3, match).empty());
+        history.update({4, 5, 6, 1, 8, 4, 5, 6, 2, 8, 4, 5});
+        GGML_ASSERT(history.propose({6}, 2, 3, match) == llama_tokens({2, 8}));
+
+        common_ngram_chain_policy policy(9);
+        GGML_ASSERT(policy.choose(3, 6, 3) == 0);
+        GGML_ASSERT(policy.choose(3, 6, 20) == 6);
+        for (int i = 0; i < 20; ++i) {
+            policy.observe(3, 0, 3, 0, 10.0);
+            policy.observe(3, 6, 3, 3, 100.0);
+        }
+        GGML_ASSERT(policy.choose(3, 6, 3) == 0);
+        GGML_ASSERT(policy.choose(3, 0, 3) == 0 && policy.choose(3, 6, 2) == 0);
+        common_ngram_chain_policy beneficial(9);
+        for (int i = 0; i < 20; ++i) {
+            beneficial.observe(3, 0, 3, 0, 10.0);
+            beneficial.observe(3, 6, 9, 20, 12.0);
+        }
+        GGML_ASSERT(beneficial.choose(3, 6, 20) == 6);
+
+        common_ngram_chain_policy confidence(6);
+        for (int i = 0; i < 20; ++i) {
+            confidence.observe(3, 0, 3, 0, 10.0);
+            confidence.observe(3, 3, 6, 20, 12.0);
+        }
+        GGML_ASSERT(confidence.choose(3, 3, 20, {1.0f, 1.0f, 1.0f}) == 3);
+        GGML_ASSERT(confidence.choose(3, 3, 20, {0.1f, 0.1f, 0.1f}) == 0);
+        GGML_ASSERT(confidence.choose_replacement(3, 3, 20, {0.1f, 0.1f, 0.1f}) == 3);
+        GGML_ASSERT(confidence.choose_replacement(3, 2, 20, {0.1f}) == 0);
+        GGML_ASSERT(confidence.choose_replacement(3, 6, 2, {0.1f}) == 0);
+        common_ngram_chain_policy conditioned(6);
+        for (int i = 0; i < 30; ++i) { conditioned.observe(3, 3, 0, 3, 12.0, true); }
+        GGML_ASSERT(conditioned.choose_replacement(3, 6, 3, {1.0f, 1.0f, 1.0f}) == 0);
+        GGML_ASSERT(conditioned.choose_replacement(3, 6, 20, {0.1f, 0.1f, 0.1f}) > 0);
+        GGML_ASSERT(confidence.choose(3, 3, 20, {NAN, NAN, NAN}) == 0);
+
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        params.draft.n_max = 3;
+        params.lookup_chain = 6;
+        GGML_ASSERT(common_speculative_n_max(&params) == 9 && params.need_n_rs_seq() == 9);
+        common_validate_speculative_params(params, 16);
+        params.mtp_rs_planes = 4;
+        GGML_ASSERT(params.is_mtp_rs_capped() && params.need_n_rs_seq() == 3);
+        bool rejected = false;
+        try { common_validate_speculative_params(params, 9); } catch (const std::invalid_argument &) { rejected = true; }
+        GGML_ASSERT(rejected);
+        params.mtp_rs_planes = 0;
+        params.types = {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
+        rejected = false;
+        try { common_validate_speculative_params(params, 16); } catch (const std::invalid_argument &) { rejected = true; }
+        GGML_ASSERT(rejected);
+        params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        rejected = false;
+        try { common_speculative_ptr missing(common_speculative_init(params, 1)); } catch (const std::invalid_argument &) { rejected = true; }
+        GGML_ASSERT(rejected);
+        params.draft.n_max = INT32_MAX;
+        rejected = false;
+        try { common_validate_speculative_params(params, 16); } catch (const std::invalid_argument &) { rejected = true; }
+        GGML_ASSERT(rejected);
+    }
+
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
 
     llama_model_params model_params = llama_model_default_params();
@@ -1040,18 +2974,19 @@ static void test_speculative_limits(size_t seed, float stdev) {
     GGML_ASSERT(model);
 
     const uint32_t n_seq = 2;
-    llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, n_seq);
+    llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, n_seq, nullptr, nullptr, 5);
     llama_context_ptr draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get(), n_seq);
     GGML_ASSERT(target && draft);
 
     const llama_tokens prompt_match = { 99, 1, 2, 3, 4, 1 };
     const llama_tokens prompt_none  = { 99, 1, 2, 3, 4, 5 };
 
-    auto make_spec = [&](int32_t n_max, int32_t n_min, std::vector<common_speculative_type> types) {
+    auto make_spec = [&](int32_t n_max, int32_t n_min, std::vector<common_speculative_type> types, int32_t chain = 0) {
         common_params_speculative params;
         params.types = std::move(types);
         params.draft.n_max = n_max;
         params.draft.n_min = n_min;
+        params.lookup_chain = chain;
         params.draft.p_min = 0.0f;
         params.draft.ctx_tgt = target.get();
         params.draft.ctx_dft = draft.get();
@@ -1119,6 +3054,66 @@ static void test_speculative_limits(size_t seed, float stdev) {
         GGML_ASSERT(!common_speculative_retain_draft_state(spec.get(), 1));
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 1, 0, -1));
+    }
+
+    for (uint16_t accepted : {0, 1, 4}) {
+        auto spec = make_spec(2, 0, { COMMON_SPECULATIVE_TYPE_DRAFT_MTP }, 2);
+        GGML_ASSERT(common_speculative_n_max(spec.get()) == 4);
+        llama_tokens result;
+        common_speculative_get_draft_params(spec.get(), 0) = {true, 2, 0, 2, &prompt_none, &result};
+        common_speculative_draft(spec.get());
+        GGML_ASSERT(result.size() == 2);
+        const llama_token alternate = (result[1] + 1) % llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const llama_tokens prefix = {10, 11, 12, 13, 14, 15, 16, 17, 18};
+        llama_tokens history = prefix;
+        history.insert(history.end(), {2, result[0], alternate, 7, 8, 99});
+        history.insert(history.end(), prefix.begin(), prefix.end());
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+        result.clear();
+        common_speculative_begin(spec.get(), 0, history);
+        common_speculative_get_draft_params(spec.get(), 0) = {true, 4, 0, 2, &history, &result};
+        llama_tokens other_result;
+        common_speculative_get_draft_params(spec.get(), 1) = {true, 2, 0, 6, &prompt_none, &other_result};
+        common_speculative_draft(spec.get());
+        GGML_ASSERT(other_result.size() == 2);
+        GGML_ASSERT(result.size() == 4 && result[1] == alternate && result[2] == 7 && result[3] == 8);
+        GGML_ASSERT(common_speculative_get_draft_params(spec.get(), 0).probabilities->size() == 2);
+        GGML_ASSERT(!common_speculative_retain_draft_state(spec.get(), 0));
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+
+        common_batch verification(target.get());
+        verification.add(2, 0, 0, true);
+        for (size_t i = 0; i < result.size(); ++i) { verification.add(result[i], llama_pos(i + 1), 0, true); }
+        GGML_ASSERT(llama_process(target.get(), LLAMA_PROCESS_TYPE_DECODE, verification.get()) == 0);
+        GGML_ASSERT(common_speculative_process(spec.get(), verification));
+        common_speculative_accept(spec.get(), 0, accepted);
+        std::vector<uint8_t> state;
+        GGML_ASSERT(common_speculative_get_mtp_state(spec.get(), 0, state));
+        GGML_ASSERT(state.size() == 3 * sizeof(uint32_t) + size_t(llama_model_n_embd_out(model.get())) * sizeof(float));
+        GGML_ASSERT(memcmp(state.data() + 3 * sizeof(uint32_t), llama_get_embeddings_nextn_ith(target.get(), accepted),
+                size_t(llama_model_n_embd_out(model.get())) * sizeof(float)) == 0);
+        common_speculative_print_stats(spec.get());
+        llama_memory_clear(llama_get_memory(target.get()), true);
+        llama_memory_clear(llama_get_memory(draft.get()), true);
+    }
+
+    {
+        auto spec = make_spec(2, 0, { COMMON_SPECULATIVE_TYPE_DRAFT_MTP }, 2);
+        llama_tokens result;
+        common_speculative_get_draft_params(spec.get(), 0) = {true, 2, 0, 2, &prompt_none, &result};
+        common_speculative_draft(spec.get());
+        const llama_tokens original = result;
+        const llama_tokens prefix = {10, 11, 12, 13, 14, 15, 16, 17, 18};
+        llama_tokens history = prefix;
+        history.insert(history.end(), {2, (result[0] + 1) % llama_vocab_n_tokens(llama_model_get_vocab(model.get())), 7, 8, 9, 99});
+        history.insert(history.end(), prefix.begin(), prefix.end());
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+        common_speculative_begin(spec.get(), 0, history);
+        result.clear();
+        common_speculative_get_draft_params(spec.get(), 0) = {true, 4, 0, 2, &history, &result};
+        common_speculative_draft(spec.get());
+        GGML_ASSERT(result == original);
+        llama_memory_clear(llama_get_memory(draft.get()), true);
     }
 
     {
@@ -1319,6 +3314,103 @@ static void test_speculative_limits(size_t seed, float stdev) {
     }
 }
 
+static void test_mtp_state_dependencies() {
+    for (int64_t width : { 4, 8 }) {
+        llm_graph_result result(256);
+        auto * ctx = result.get_ctx();
+        auto * graph = result.get_gf();
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 1);
+        auto * required = ggml_add(ctx, input, input);
+        auto * copy = ggml_cpy(ctx, required, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 1));
+        auto * store = ggml_set_rows(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 2), required,
+                ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1));
+        auto * dead = ggml_mul(ctx, input, input);
+        auto * empty_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 0);
+        auto * empty_output = ggml_get_rows(ctx, dead, empty_ids);
+        ggml_set_output(empty_output);
+        auto * unclassified = ggml_arange(ctx, 0, float(width), 1);
+        GGML_ASSERT(!ggml_op_is_pure(unclassified->op));
+        auto * unknown_input = ggml_sqr(ctx, input);
+        auto * unknown = ggml_map_custom1(ctx, ggml_get_rows(ctx, unknown_input, empty_ids),
+                [](ggml_tensor *, const ggml_tensor *, int, int, void *) {}, 1, nullptr);
+        auto * private_input = ggml_scale(ctx, input, 2.0f);
+        auto * private_write = ggml_scale_inplace(ctx, private_input, 3.0f);
+        auto * hidden = ggml_rms_norm(ctx, input, 1e-5f);
+        auto * hidden_output = ggml_view_1d(ctx, hidden, width, 0);
+        ggml_set_output(hidden_output);
+        std::vector<float> backing(width);
+        auto * external = ggml_sub(ctx, input, input);
+        external->data = backing.data();
+        for (auto * root : { copy, store, empty_output, unknown, unclassified, private_write, hidden_output, external }) {
+            ggml_build_forward_expand(graph, root);
+        }
+        std::vector<ggml_tensor *> nodes;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) { nodes.push_back(ggml_graph_node(graph, i)); }
+        result.retain_state_computation();
+        GGML_ASSERT(!(dead->flags & GGML_TENSOR_FLAG_COMPUTE));
+        for (auto * retained : { required, copy, store, unknown_input, unknown, unclassified, private_input, private_write, hidden, hidden_output, external }) {
+            GGML_ASSERT(retained->flags & GGML_TENSOR_FLAG_COMPUTE);
+        }
+        GGML_ASSERT(empty_output->flags & GGML_TENSOR_FLAG_OUTPUT);
+        GGML_ASSERT(hidden_output->flags & GGML_TENSOR_FLAG_OUTPUT);
+        result.retain_state_computation();
+        GGML_ASSERT(!(dead->flags & GGML_TENSOR_FLAG_COMPUTE));
+        GGML_ASSERT(nodes.size() == size_t(ggml_graph_n_nodes(graph)));
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) { GGML_ASSERT(nodes[i] == ggml_graph_node(graph, i)); }
+    }
+}
+
+static void test_mtp_graph_reactivation(size_t seed, float stdev) {
+    for (bool gpu : { false, true }) {
+        auto * device = gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+        if (gpu && !device) { continue; }
+        for (bool moe : { false, true }) {
+            const auto arch = moe ? LLM_ARCH_QWEN35MOE : LLM_ARCH_QWEN35;
+            gguf_context_ptr metadata = get_gguf_ctx(arch, moe, true);
+            llama_model_params model_params = llama_model_default_params();
+            model_params.progress_callback = silent_model_load_progress;
+            model_params.load_mtp = true;
+            ggml_backend_dev_t devices[] = { device, nullptr };
+            model_params.n_gpu_layers = gpu ? 99 : 0;
+            model_params.devices = devices;
+            tensor_data_params tensor_params = { seed, stdev };
+            llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, model_params));
+            GGML_ASSERT(model);
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = 32;
+            params.n_batch = params.n_ubatch = 4;
+            params.n_threads = params.n_threads_batch = 4;
+            params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.phase_aware_workspace = true;
+            params.decode_boundary_overlap = true;
+            params.moe_source_graph_capacity = false;
+            llama_context_ptr control(llama_init_from_model(model.get(), params));
+            params.moe_source_graph_capacity = true;
+            llama_context_ptr retained(llama_init_from_model(model.get(), params));
+            GGML_ASSERT(control && retained);
+            const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            for (int pos = 0; pos < 12; ++pos) {
+                llama_batch batch = make_mtp_batch(1, llama_model_n_embd_out(model.get()), pos, n_vocab, seed + pos);
+                batch.logits[0] = pos % 2 == 0;
+                GGML_ASSERT(llama_decode(control.get(), batch) == 0);
+                GGML_ASSERT(llama_decode(retained.get(), batch) == 0);
+                llama_synchronize(control.get());
+                llama_synchronize(retained.get());
+                if (batch.logits[0]) {
+                    const float * expected = llama_get_logits_ith(control.get(), -1);
+                    const float * actual = llama_get_logits_ith(retained.get(), -1);
+                    GGML_ASSERT(expected && actual);
+                    for (uint32_t i = 0; i < n_vocab; ++i) {
+                        GGML_ASSERT(std::isfinite(actual[i]) && std::fabs(expected[i] - actual[i]) < 1e-5f);
+                    }
+                }
+                llama_batch_free(batch);
+            }
+            GGML_ASSERT(llama_perf_context(retained.get()).n_reused > llama_perf_context(control.get()).n_reused);
+        }
+    }
+}
+
 static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
 
@@ -1470,6 +3562,120 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     draft.reset();
 }
 
+static void test_mtp_draft_vocab(size_t seed, float stdev) {
+    gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", 2);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    model_params.use_extra_bufts = false;
+    model_params.no_host = true;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, model_params));
+    GGML_ASSERT(model);
+    const auto * vocab = llama_model_get_vocab(model.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> ids;
+    std::vector<bool> included(n_vocab);
+    for (int32_t id = n_vocab - 1; id >= 0; --id) {
+        if (id % 3 == 0 || llama_vocab_is_eog(vocab, id)) {
+            ids.push_back(id);
+            included[id] = true;
+        }
+    }
+    const auto path = std::filesystem::temp_directory_path() / ("mtp-draft-vocab-" + std::to_string(std::random_device{}()) + ".gguf");
+    const auto bad_path = path.string() + ".bad";
+    const auto filename = path.string();
+    GGML_ASSERT(llama_write_mtp_draft_vocab(model.get(), ids.data(), ids.size(), filename.c_str()));
+    auto draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP);
+    auto full = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP);
+    auto normal = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+    GGML_ASSERT(draft && full && normal);
+    GGML_ASSERT(!llama_set_mtp_draft_vocab(normal.get(), filename.c_str()));
+    const int32_t duplicate[] = { ids[0], ids[0] };
+    const int32_t invalid[] = { int32_t(n_vocab) };
+    GGML_ASSERT(!llama_write_mtp_draft_vocab(model.get(), duplicate, 2, bad_path.c_str()));
+    GGML_ASSERT(!llama_write_mtp_draft_vocab(model.get(), invalid, 1, bad_path.c_str()));
+    GGML_ASSERT(!llama_write_mtp_draft_vocab(model.get(), nullptr, 0, bad_path.c_str()));
+    std::vector<int32_t> no_eog;
+    for (auto id : ids) {
+        if (!llama_vocab_is_eog(vocab, id)) {
+            no_eog.push_back(id);
+        }
+    }
+    GGML_ASSERT(!no_eog.empty() && !llama_write_mtp_draft_vocab(model.get(), no_eog.data(), no_eog.size(), bad_path.c_str()));
+    for (const char * field : { "version", "selected_tokens", "token_attributes", "token_offsets", "special_tokens" }) {
+        gguf_context_ptr bad(gguf_init_from_file(filename.c_str(), {true, nullptr}));
+        GGML_ASSERT(bad);
+        const auto name = std::string("mtp_draft_vocab.") + field;
+        gguf_set_val_str(bad.get(), name.c_str(), "wrong type");
+        GGML_ASSERT(gguf_write_to_file(bad.get(), bad_path.c_str(), true));
+        GGML_ASSERT(!llama_set_mtp_draft_vocab(draft.get(), bad_path.c_str()));
+    }
+    GGML_ASSERT(llama_set_mtp_draft_vocab(draft.get(), filename.c_str()));
+    GGML_ASSERT(!llama_set_mtp_draft_vocab(draft.get(), filename.c_str()));
+    // The generated optional output scales must retain full projection.
+    auto fallback = make_mtp_batch(1, llama_model_n_embd_out(model.get()), 0, n_vocab, seed);
+    GGML_ASSERT(llama_decode(draft.get(), fallback) == 0 && llama_decode(full.get(), fallback) == 0);
+    const auto * fallback_expected = llama_get_logits_ith(full.get(), -1);
+    const auto * fallback_actual = llama_get_logits_ith(draft.get(), -1);
+    for (uint32_t id = 0; id < n_vocab; ++id) {
+        GGML_ASSERT(std::isfinite(fallback_actual[id]) && fallback_actual[id] == fallback_expected[id]);
+    }
+    llama_batch_free(fallback);
+    draft.reset();
+    full.reset();
+    normal.reset();
+    // A separate fixture proves the supported direct projection boundary.
+    model->output_s = nullptr;
+    for (auto & layer : model->layers) {
+        layer.nextn.shared_head_head_s = nullptr;
+    }
+    const auto direct_context = [&]() {
+        auto params = llama_context_default_params();
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx = 32;
+        params.n_batch = params.n_ubatch = 32;
+        params.n_outputs_max = params.n_outputs_max_per_seq = 4;
+        params.n_threads = params.n_threads_batch = 4;
+        params.phase_aware_workspace = true;
+        return llama_context_ptr(llama_init_from_model(model.get(), params));
+    };
+    draft = direct_context();
+    full = direct_context();
+    GGML_ASSERT(draft && full && llama_set_mtp_draft_vocab(draft.get(), filename.c_str()));
+    int32_t pos = 0;
+    for (int32_t rows : {1, 2, 3, 4, 1}) {
+        auto batch = make_mtp_batch(rows, llama_model_n_embd_out(model.get()), pos, n_vocab, seed + pos);
+        std::fill(batch.logits, batch.logits + rows, true);
+        GGML_ASSERT(llama_decode(draft.get(), batch) == 0);
+        GGML_ASSERT(llama_decode(full.get(), batch) == 0);
+        for (int32_t row = 0; row < rows; ++row) {
+            const auto * expected = llama_get_logits_ith(full.get(), row);
+            const auto * actual = llama_get_logits_ith(draft.get(), row);
+            GGML_ASSERT(expected && actual);
+            for (uint32_t id = 0; id < n_vocab; ++id) {
+                const bool equal = included[id] ? std::isfinite(actual[id]) && std::fabs(actual[id] - expected[id]) < 1e-5f : actual[id] == -INFINITY;
+                if (!equal) {
+                    fprintf(stderr, "MTP draft vocabulary: pos=%d row=%d id=%u selected=%u full=%g actual=%g\n", pos, row, id, unsigned(included[id]), expected[id], actual[id]);
+                }
+                GGML_ASSERT(equal);
+            }
+        }
+        llama_batch_free(batch);
+        pos += rows;
+    }
+    llama_perf_context_reset(full.get());
+    GGML_ASSERT(!llama_set_mtp_draft_vocab(full.get(), filename.c_str()));
+    draft.reset();
+    full.reset();
+    normal.reset();
+    std::filesystem::remove(path);
+    std::filesystem::remove(bad_path);
+}
+
 static void test_phase_workspace_qwen4exp_mtp_reserve(size_t seed, float stdev) {
     gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
     llama_model_params model_params = llama_model_default_params();
@@ -1492,6 +3698,34 @@ static void test_phase_workspace_qwen4exp_mtp_reserve(size_t seed, float stdev) 
     llama_synchronize(draft.get());
     GGML_ASSERT(llama_get_logits_ith(draft.get(), 3));
     llama_batch_free(batch);
+
+    llama_context_ptr rebuilt = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP);
+    batch = make_mtp_batch(4, llama_model_n_embd_out(model.get()), 0,
+            llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed + 1);
+    GGML_ASSERT(llama_decode(rebuilt.get(), batch) == 0);
+    llama_batch_free(batch);
+    auto * kept_memory = draft->get_memory();
+    auto * full_memory = rebuilt->get_memory();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto compare = [&](int32_t pos, uint32_t tokens) {
+        // A self-copy changes no KV values and requests a full pool layout rebuild.
+        full_memory->seq_cp(0, 0, 0, -1);
+        llama_batch next = make_mtp_batch(tokens, llama_model_n_embd_out(model.get()), pos, n_vocab, seed + pos + 2);
+        GGML_ASSERT(llama_decode(draft.get(), next) == 0);
+        GGML_ASSERT(llama_decode(rebuilt.get(), next) == 0);
+        const float * expected = llama_get_logits_ith(rebuilt.get(), -1);
+        const float * actual = llama_get_logits_ith(draft.get(), -1);
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            GGML_ASSERT(std::isfinite(actual[i]) && std::fabs(expected[i] - actual[i]) < 1e-5f);
+        }
+        llama_batch_free(next);
+    };
+    for (int32_t pos = 4; pos < 16; pos += 4) { compare(pos, 4); }
+    for (int32_t pos : {13, 9, 0}) {
+        GGML_ASSERT(kept_memory->seq_rm(0, pos, -1));
+        GGML_ASSERT(full_memory->seq_rm(0, pos, -1));
+        compare(pos, 4);
+    }
 }
 
 static void test_phase_workspace_mismatched_placement(size_t seed, float stdev) {
@@ -1926,6 +4160,38 @@ static int test_moe_cache_selector_precedence(const size_t seed, const float std
 
     {
         auto model = expect_load("selected baseline", moe_metadata.get(), make_params(both_layers, 1, nullptr), true);
+        if (model) {
+            ggml_backend_moe_source_owner_v1 owner = {};
+            if (!model->moe_source_owner_v1(&owner)) { return 1; }
+            size_t certified = 0;
+            for (const auto & group : model->moe_sources()) {
+                for (const auto & bank : group.banks) {
+                    if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) { continue; }
+                    ggml_backend_moe_source_span_v1 span = {};
+                    span.struct_size = sizeof(span);
+                    span.abi_version = GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION;
+                    span.witness = bank.tensor;
+                    span.data = bank.tensor->data;
+                    span.bytes = ggml_nbytes(bank.tensor);
+                    span.expert_stride = bank.tensor->nb[2];
+                    span.type = bank.tensor->type;
+                    std::copy(std::begin(bank.tensor->ne), std::end(bank.tensor->ne), std::begin(span.ne));
+                    std::copy(std::begin(bank.tensor->nb), std::end(bank.tensor->nb), std::begin(span.nb));
+                    const int status = owner.validate_span(&owner, owner.generation, &span);
+                    if (status != GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK) {
+                        fprintf(stderr, "test-moe-cache-selector: callback source certificate rejected tensor=%s status=%d\n", bank.tensor->name, status);
+                        return 1;
+                    }
+                    span.data = static_cast<const uint8_t *>(span.data) + 1;
+                    if (owner.validate_span(&owner, owner.generation, &span) == GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK) { return 1; }
+                    span.data = bank.tensor->data;
+                    if (owner.validate_span(&owner, owner.generation + 1, &span) != GGML_BACKEND_MOE_SOURCE_STATUS_V1_GENERATION_MISMATCH) { return 1; }
+                    ++certified;
+                }
+            }
+            if (!certified) { return 1; }
+            fprintf(stderr, "test-moe-cache-selector: callback source certificates=%zu stale/data controls rejected\n", certified);
+        }
         if (model &&
             (!layer_cached(*model, 0) || !layer_cached(*model, 1) || model->moe_expert_cache_memory().empty())) {
             fprintf(stderr, "test-moe-cache-selector: baseline placement mismatch\n");
@@ -4003,10 +6269,38 @@ int main(int argc, char ** argv) {
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
     bool run_speculative_limits = false;
+    bool run_mtp_draft_vocab = false;
+    bool run_source_variants = false;
+    bool run_source_auxiliary = false;
+    bool auxiliary_uncached_reference = false;
+    bool auxiliary_no_output_first = false;
+    bool auxiliary_source_statistics = false;
+    bool auxiliary_source_ranks = false;
+    bool auxiliary_inherit_statistics = false;
+    bool auxiliary_different_model = false;
+    const char * auxiliary_profile_file = nullptr;
+    bool auxiliary_parent_active = false;
+    bool auxiliary_explicit_profile = false;
+    bool auxiliary_sparse_outputs = false;
     bool run_moe_cache_selector = false;
     bool run_moe_placement = false;
     bool        run_moe_joint_measurement   = false;
     std::string fit_tool;
+    const char * source_uses_path = nullptr;
+    const char * source_profile_path = nullptr;
+    const char * source_statistics_file = nullptr;
+    bool source_statistics = false;
+    const char * moe_replay_path = nullptr;
+    const char * replay_reference_path = nullptr;
+    bool replay_read = false;
+    const char * replay_prompt_path = nullptr;
+    uint32_t replay_rows = 32;
+    std::string replay_split = "diagnostic";
+    bool replay_independent_sources = false;
+    int32_t replay_cache_slots = 32;
+    bool replay_cpu_oracle = false;
+    bool replay_gpu_oracle = false;
+    llama_load_mode replay_load_mode = LLAMA_LOAD_MODE_NONE;
     const char * target_backend = nullptr;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -4019,10 +6313,84 @@ int main(int argc, char ** argv) {
             test_phase_workspace = true;
         } else if (strcmp(argv[i], "--test-live-context-workspace") == 0) {
             test_live_context_workspace = true;
+        } else if (strcmp(argv[i], "--test-source-variants") == 0) {
+            run_source_variants = true;
+        } else if (strcmp(argv[i], "--test-source-auxiliary") == 0) {
+            run_source_auxiliary = true;
+        } else if (strcmp(argv[i], "--auxiliary-explicit-profile-file") == 0) {
+            if (++i >= argc) { return 1; }
+            auxiliary_profile_file = argv[i];
+            auxiliary_inherit_statistics = true;
+            auxiliary_explicit_profile = true;
+        } else if (strcmp(argv[i], "--auxiliary-profile-file") == 0) {
+            if (++i >= argc) { return 1; }
+            auxiliary_profile_file = argv[i];
+            auxiliary_inherit_statistics = true;
+        } else if (strcmp(argv[i], "--auxiliary-sparse-outputs") == 0) {
+            auxiliary_sparse_outputs = true;
+        } else if (strcmp(argv[i], "--auxiliary-parent-active") == 0) {
+            auxiliary_parent_active = true;
+        } else if (strcmp(argv[i], "--auxiliary-different-model") == 0) {
+            auxiliary_different_model = true;
+        } else if (strcmp(argv[i], "--auxiliary-inherit-statistics") == 0) {
+            auxiliary_inherit_statistics = true;
+        } else if (strcmp(argv[i], "--auxiliary-source-ranks") == 0) {
+            auxiliary_source_ranks = true;
+        } else if (strcmp(argv[i], "--auxiliary-source-statistics") == 0) {
+            auxiliary_source_statistics = true;
+        } else if (strcmp(argv[i], "--auxiliary-no-output-first") == 0) {
+            auxiliary_no_output_first = true;
+        } else if (strcmp(argv[i], "--auxiliary-uncached-reference") == 0) {
+            auxiliary_uncached_reference = true;
         } else if (strcmp(argv[i], "--test-speculative-limits") == 0) {
             run_speculative_limits = true;
+        } else if (strcmp(argv[i], "--test-mtp-draft-vocab") == 0) {
+            run_mtp_draft_vocab = true;
         } else if (strcmp(argv[i], "--test-moe-cache-selector") == 0) {
             run_moe_cache_selector = true;
+        } else if (strcmp(argv[i], "--test-source-uses") == 0 && i + 1 < argc) {
+            source_uses_path = argv[++i];
+        } else if (strcmp(argv[i], "--test-source-profile") == 0 && i + 1 < argc) {
+            source_profile_path = argv[++i];
+        } else if (strcmp(argv[i], "--source-statistics-file") == 0 && i + 1 < argc) {
+            source_statistics_file = argv[++i];
+        } else if (strcmp(argv[i], "--test-source-statistics") == 0) {
+            source_statistics = true;
+        } else if (strcmp(argv[i], "--test-moe-replay") == 0 && i + 1 < argc) {
+            moe_replay_path = argv[++i];
+        } else if (strcmp(argv[i], "--replay-reference") == 0 && i + 1 < argc) {
+            replay_reference_path = argv[++i];
+        } else if (strcmp(argv[i], "--replay-read") == 0) {
+            replay_read = true;
+        } else if (strcmp(argv[i], "--replay-prompt-file") == 0 && i + 1 < argc) {
+            replay_prompt_path = argv[++i];
+        } else if (strcmp(argv[i], "--replay-rows") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            if (!*value || strlen(value) > 4 || *value < '0' || *value > '9') { return 1; }
+            char * end = nullptr;
+            const long rows = strtol(value, &end, 10);
+            if (*end || rows < 1 || rows > 4096) { return 1; }
+            replay_rows = uint32_t(rows);
+        } else if (strcmp(argv[i], "--replay-split") == 0 && i + 1 < argc) {
+            replay_split = argv[++i];
+            if (replay_split != "diagnostic" && replay_split != "calibration" && replay_split != "development" && replay_split != "held-out") { return 1; }
+        } else if (strcmp(argv[i], "--replay-independent-sources") == 0) {
+            replay_independent_sources = true;
+        } else if (strcmp(argv[i], "--replay-gpu-oracle") == 0) {
+            replay_gpu_oracle = true;
+        } else if (strcmp(argv[i], "--replay-load-mode") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            if (strcmp(value, "none") && strcmp(value, "mmap")) { return 1; }
+            replay_load_mode = llama_load_mode_from_str(value);
+        } else if (strcmp(argv[i], "--replay-cpu-oracle") == 0) {
+            replay_cpu_oracle = true;
+        } else if (strcmp(argv[i], "--replay-cache-slots") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            if (!*value || strlen(value) > 5) { return 1; }
+            char * end = nullptr;
+            const long slots = strtol(value, &end, 10);
+            if (*end || slots < 0 || slots > 65536) { return 1; }
+            replay_cache_slots = int32_t(slots);
         } else if (strcmp(argv[i], "--test-moe-placement") == 0) {
             run_moe_placement = true;
         } else if (strcmp(argv[i], "--test-moe-joint-measurement") == 0) {
@@ -4095,8 +6463,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector ||
-        run_moe_placement || run_moe_joint_measurement) {
+    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_mtp_draft_vocab || run_moe_cache_selector ||
+        run_moe_placement || run_moe_joint_measurement || moe_replay_path || run_source_variants || run_source_auxiliary) {
         common_log_set_verbosity_thold(verbosity);
     }
     if (stdev <= 0.0f) {
@@ -4106,8 +6474,14 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (run_mtp_draft_vocab) {
+            test_mtp_draft_vocab(seed, stdev);
+            return 0;
+        }
         if (test_phase_workspace) {
+            test_mtp_state_dependencies();
             test_phase_workspace_runtime_reserve(seed, stdev);
+            test_mtp_graph_reactivation(seed, stdev);
             test_phase_workspace_mtp_lifecycle(seed, stdev);
             test_phase_workspace_qwen4exp_mtp_reserve(seed, stdev);
             test_phase_workspace_mismatched_placement(seed, stdev);
@@ -4121,6 +6495,8 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_unsupported(seed, stdev);
             return 0;
         }
+        if (run_source_variants) { return test_source_graph_variants(seed, stdev, replay_reference_path, replay_read); }
+        if (run_source_auxiliary) { return test_source_auxiliary_frontend(seed, stdev, replay_reference_path, replay_read, auxiliary_uncached_reference, auxiliary_no_output_first, auxiliary_source_statistics, auxiliary_source_ranks, auxiliary_inherit_statistics, auxiliary_different_model, auxiliary_profile_file, auxiliary_parent_active, auxiliary_explicit_profile, auxiliary_sparse_outputs); }
         if (run_speculative_limits) {
             test_speculative_limits(seed, stdev);
             return 0;
@@ -4128,6 +6504,10 @@ int main(int argc, char ** argv) {
         if (run_moe_cache_selector) {
             return test_moe_cache_selector_precedence(seed, stdev);
         }
+        if (source_uses_path) { return test_model_source_uses(source_uses_path); }
+        if (source_profile_path) { return test_model_source_profile(source_profile_path, source_statistics_file); }
+        if (source_statistics) { return test_source_profile_statistics(); }
+        if (moe_replay_path) { return test_model_moe_replay(moe_replay_path, replay_reference_path, replay_read, replay_independent_sources, replay_cache_slots, replay_cpu_oracle, replay_gpu_oracle, replay_load_mode, replay_prompt_path, replay_rows, replay_split); }
         if (run_moe_placement) {
             return test_moe_placement_report(seed, stdev);
         }

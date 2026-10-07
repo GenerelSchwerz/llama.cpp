@@ -13,13 +13,26 @@
 #include "../ggml/src/ggml-backend-moe.h"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 struct llama_model;
+struct llama_moe_source_group;
 class llama_batch_allocr;
 struct llama_vocab;
+class llama_draft_vocab;
+
+struct llama_moe_test_frame {
+    const llama_ubatch * ubatch;
+    const ggml_graph_execution_certificate * certificate;
+    uint64_t submission;
+    bool batched;
+};
 
 struct llama_speculative_execution_policy {
     uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
@@ -36,6 +49,8 @@ struct llama_speculative_grouped_intent_test_access {
         llama_context_type context_type, const llama_ubatch & ubatch, uint32_t row_semantics);
     static bool matches_target_verification_ubatch(const llama_ubatch & ubatch, uint32_t verification_span);
     static bool backend_supported(ggml_backend_t backend);
+    static bool hybrid_required(const char * mode, llama_context_type context_type);
+    static bool hybrid_execution_supported(bool required, uint32_t domain, uint32_t row_semantics);
     static bool                               graph_supported(ggml_backend_sched_t sched, ggml_cgraph * gf);
     static uint32_t flags(uint32_t cache_slots, bool backend_supported);
     static llama_speculative_execution_policy policy(
@@ -94,6 +109,24 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+std::vector<std::vector<int32_t>> llama_moe_profile_parse(
+        const uint8_t * data, size_t bytes, const std::vector<uint32_t> & expert_counts);
+
+struct llama_moe_profile_source_statistics {
+    const ggml_tensor * tensor = nullptr;
+    uint32_t domain = 0;
+    uint64_t observations = 0;
+    std::vector<uint64_t> counts;
+};
+
+struct llama_moe_profile_statistics {
+    std::string provenance;
+    std::vector<llama_moe_profile_source_statistics> sources;
+};
+
+llama_moe_profile_statistics llama_moe_profile_statistics_parse(
+        const uint8_t * data, size_t bytes, const std::vector<llama_moe_source_group> & sources);
+
 struct llama_context {
     struct sched_reserve_plan {
         uint32_t n_tokens_max    = 0;
@@ -107,7 +140,9 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  const char * profile_path = nullptr,
+                  const char * profile_adaptation = nullptr);
 
     ~llama_context();
 
@@ -125,6 +160,14 @@ struct llama_context {
     uint64_t trim_transient_memory();
 
     void synchronize();
+    int32_t reset_source_core_checked(bool all_variants = true);
+    bool select_source_graph_variant(const ggml_graph_execution_certificate & certificate);
+    int32_t close_source_core_checked();
+    bool set_mtp_draft_vocab(const char * path);
+    bool source_core_enabled() const;
+    void prepare_required_grouped_execution(llm_graph_result * res);
+    bool begin_source_call();
+    void end_source_call();
 
     int32_t decode_sampled(llama_seq_id seq_id, llama_pos pos, llama_token * previous = nullptr);
     int32_t decode_sampled(const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
@@ -135,6 +178,10 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    // Set between source calls. Keep callback data alive through quiescent unbind or context destruction.
+    bool set_moe_test_hook(ggml_backend_moe_hybrid_test_hook_v1_t hook, void * data);
+    // The frame is borrowed only during the observer callback.
+    const llama_moe_test_frame * get_moe_test_frame() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -323,6 +370,11 @@ private:
     //
 
 public:
+    bool initialize_moe_profile();
+    bool initialize_moe_profile(const std::vector<ggml_backend_moe_static_profile_v1> & profiles);
+    bool initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics);
+    bool initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics);
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -345,7 +397,12 @@ private:
     void place_sampled_inputs(llm_graph_result * res);
     void            refresh_moe_layer_owners();
     void            place_moe_regions(llm_graph_result * res);
+    bool            finalize_moe_regions(llm_graph_result * res, bool hybrid_decode,
+                                         const ggml_graph_execution_certificate * certificate = nullptr);
     bool            moe_graph_supports_required_grouped(ggml_cgraph * gf) const;
+    bool make_graph_execution_certificate(
+        const llama_ubatch * ubatch, const llama_graph_execution_intent * execution_intent,
+        bool required_grouped_supported, ggml_graph_execution_certificate & certificate) const;
     void finish_compute(int64_t n_tokens, int64_t elapsed_us);
     void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch);
     void reset_sched_workspace();
@@ -444,9 +501,9 @@ private:
 
     std::vector<swap_info> output_swaps;
 
-    ggml_backend_sched_ptr sched;
     uint64_t sched_buffer_generation = 0;
     uint64_t sched_shrink_generation = 0;
+    uint64_t sched_source_retirement_epoch = 0;
     // Paired contexts must be serialized; do not execute or destroy them concurrently.
     llama_context * sched_buffer_owner = nullptr;
     llama_context * sched_buffer_borrower = nullptr;
@@ -460,9 +517,13 @@ private:
 
     bool recurrent_sparse_snapshot_ops_supported = false;
 
+    std::unique_ptr<llama_draft_vocab> mtp_draft_vocab;
+    bool mtp_draft_vocab_locked = false;
     ggml_backend_t backend_cpu = nullptr;
     bool ple_prefetch = false;
     std::vector<ggml_backend_ptr> backends;
+    // Scheduler services borrow backend contexts.
+    ggml_backend_sched_ptr sched;
 
     ggml_context_ptr sampled_input_ctx;
     ggml_backend_buffer_ptr sampled_input_buf;
@@ -500,6 +561,33 @@ private:
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
     std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v2_t>> moe_candidate_replace_fns;
     bool moe_required_grouped_execution_supported = false;
+    bool moe_hybrid_metadata = false;
+    std::vector<std::vector<int32_t>> moe_profile_ranks;
+    std::vector<ggml_backend_moe_static_profile_v1> moe_profiles;
+    llama_moe_profile_statistics moe_profile_statistics;
+    std::vector<ggml_backend_moe_source_statistics_v1> moe_statistics;
+    bool moe_profile_failed = false;
+    uint32_t moe_hybrid_profile_adapt = 0;
+    bool moe_hybrid_required = false;
+    bool moe_source_graph_capacity = false;
+    std::atomic<bool> moe_source_poisoned{false};
+    std::atomic<bool> moe_source_closed{false};
+    std::mutex moe_source_mutex;
+    std::timed_mutex moe_source_publication_mutex;
+    std::condition_variable moe_source_condition;
+    uint32_t moe_source_callers = 0;
+    std::thread::id moe_source_caller;
+    bool moe_test_hook_set = false;
+    ggml_backend_moe_hybrid_test_hook_v1_t moe_test_hook = nullptr;
+    void * moe_test_hook_data = nullptr;
+    uint64_t moe_test_submission = 0;
+    const llama_moe_test_frame * moe_test_frame = nullptr;
+    ggml_graph_execution_certificate moe_hybrid_graph_certificate = {};
+    uint32_t moe_hybrid_gpu_misses = 1;
+    uint32_t moe_hybrid_admission_misses = UINT32_MAX;
+    bool moe_hybrid_demand_admission = false;
+    bool moe_hybrid_resident_batch = false;
+    uint32_t moe_hybrid_executor = GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_EAGER;
     std::vector<ggml_backend_t> moe_layer_owners;
     uint64_t graph_execution_owner_namespace = 0;
     uint64_t graph_execution_owner_generation = 1;
@@ -513,6 +601,27 @@ private:
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    struct mtp_graph_sources {
+        ggml_tensor * tensor;
+        std::array<ggml_tensor *, GGML_MAX_SRC> sources;
+    };
+    std::array<std::vector<mtp_graph_sources>, 2> mtp_graph_original_sources;
+    std::array<uint64_t, 2> mtp_graph_buffer_generation = {};
+    std::array<uint64_t, 2> mtp_graph_shrink_generation = {};
+
+    struct moe_source_graph_variant {
+        std::array<llm_graph_result_ptr, 2> graphs;
+        ggml_backend_sched_ptr scheduler;
+        llm_graph_result * active = nullptr;
+        ggml_graph_execution_certificate certificate = {};
+        uint32_t outputs = 0;
+        bool sampled_device = false;
+        uint64_t buffer_generation = 0;
+        uint64_t shrink_generation = 0;
+        uint64_t retirement_epoch = 0;
+    };
+    std::vector<moe_source_graph_variant> moe_source_graph_variants;
+    uint32_t moe_source_active_outputs = 0;
 
     llm_graph_result * gf_res_prev_active = nullptr;
 

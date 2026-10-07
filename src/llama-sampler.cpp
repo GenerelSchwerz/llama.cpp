@@ -965,6 +965,7 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
 void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler * smpl) {
     auto * p = (llama_sampler_chain *) chain->ctx;
+    ++p->generation;
     p->samplers.push_back({
         /* .is_backend = */ false,
         /* .ptr        = */ smpl,
@@ -1002,6 +1003,7 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
 
     auto * result = p->samplers[i].ptr;
     p->samplers.erase(p->samplers.begin() + i);
+    ++p->generation;
 
     return result;
 }
@@ -1335,10 +1337,10 @@ static void llama_sampler_dist_backend_apply(
     data->probs = probs;
 }
 
-static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_dist_backend_set_input_impl(struct llama_sampler * smpl, const std::vector<ggml_tensor *> & uniforms) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    GGML_ASSERT(!sctx->inp_uniforms.empty());
+    GGML_ASSERT(!uniforms.empty());
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_sampler_dist which uses double precision (sampling from
@@ -1349,7 +1351,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 
     auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
 
-    for (auto * inp_uniform : sctx->inp_uniforms) {
+    for (auto * inp_uniform : uniforms) {
         GGML_ASSERT(inp_uniform != nullptr);
 
         const float rnd = dist(rng);
@@ -1359,6 +1361,10 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
             ++sctx->n_backend_draws_generated;
         }
     }
+}
+
+static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+    llama_sampler_dist_backend_set_input_impl(smpl, ((llama_sampler_dist *) smpl->ctx)->inp_uniforms);
 }
 
 static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
@@ -3145,10 +3151,10 @@ static void llama_sampler_penalties_backend_apply(
     }
 }
 
-static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_penalties_backend_set_input_impl(struct llama_sampler * smpl, ggml_tensor * token_ids, ggml_tensor * counts) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (!sctx->inp_token_ids || !sctx->inp_counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
+    if (!token_ids || !counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
         return;
     }
 
@@ -3200,8 +3206,13 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
         sctx->host_counts   [i] = 0;
     }
 
-    ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
-    ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+    ggml_backend_tensor_set(token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
+    ggml_backend_tensor_set(counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+}
+
+static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+    llama_sampler_penalties_backend_set_input_impl(smpl, sctx->inp_token_ids, sctx->inp_counts);
 }
 
 static void llama_sampler_penalties_backend_reset(struct llama_sampler * smpl) {
@@ -4003,14 +4014,14 @@ static void llama_sampler_logit_bias_backend_apply(
     data->logits = ggml_add(ctx, data->logits, cur);
 }
 
-static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_logit_bias_backend_set_input_impl(struct llama_sampler * smpl, ggml_tensor * bias, ggml_tensor * indices) {
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
     if (sctx->logit_bias.empty()) {
         return;
     }
 
-    GGML_ASSERT(sctx->inp_logit_bias != nullptr);
-    GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
+    GGML_ASSERT(bias != nullptr);
+    GGML_ASSERT(indices != nullptr);
 
     const size_t n = sctx->backend_bias.size();
 
@@ -4023,8 +4034,13 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
         data_logit_idxs[i] = lb.token;
     }
 
-    ggml_backend_tensor_set(sctx->inp_logit_bias, data_logit_bias.data(), 0, ggml_nbytes(sctx->inp_logit_bias));
-    ggml_backend_tensor_set(sctx->inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
+    ggml_backend_tensor_set(bias,    data_logit_bias.data(), 0, ggml_nbytes(bias));
+    ggml_backend_tensor_set(indices, data_logit_idxs.data(), 0, ggml_nbytes(indices));
+}
+
+static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
+    llama_sampler_logit_bias_backend_set_input_impl(smpl, sctx->inp_logit_bias, sctx->inp_logit_idxs);
 }
 
 static void llama_sampler_logit_bias_backend_reset(struct llama_sampler * smpl) {
@@ -4387,6 +4403,58 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     }
 
     return LLAMA_DEFAULT_SEED;
+}
+
+bool llama_sampler_backend_inputs::can_reuse() const {
+    if (!reusable) {
+        return false;
+    }
+    // Parents precede children so a removed chain is never dereferenced.
+    for (const auto & [sampler, generation] : chains) {
+        if (sampler->iface != &llama_sampler_chain_i || ((const llama_sampler_chain *) sampler->ctx)->generation != generation) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_sampler_backend_inputs llama_sampler_backend_prepare_inputs(llama_sampler * sampler) {
+    llama_sampler_backend_inputs result;
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        result.chains.emplace_back(sampler, chain->generation);
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            auto child = llama_sampler_backend_prepare_inputs(entry.ptr);
+            result.reusable &= child.reusable;
+            result.chains.insert(result.chains.end(), child.chains.begin(), child.chains.end());
+            for (auto & setter : child.setters) {
+                result.setters.push_back(std::move(setter));
+            }
+        }
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        const auto * sctx = (const llama_sampler_dist *) sampler->ctx;
+        result.setters.emplace_back([sampler, uniforms = sctx->inp_uniforms]() {
+            llama_sampler_dist_backend_set_input_impl(sampler, uniforms);
+        });
+    } else if (sampler->iface == &llama_sampler_penalties_i) {
+        const auto * sctx = (const llama_sampler_penalties *) sampler->ctx;
+        result.setters.emplace_back([sampler, ids = sctx->inp_token_ids, counts = sctx->inp_counts]() {
+            llama_sampler_penalties_backend_set_input_impl(sampler, ids, counts);
+        });
+    } else if (sampler->iface == &llama_sampler_logit_bias_i) {
+        const auto * sctx = (const llama_sampler_logit_bias *) sampler->ctx;
+        result.setters.emplace_back([sampler, bias = sctx->inp_logit_bias, indices = sctx->inp_logit_idxs]() {
+            llama_sampler_logit_bias_backend_set_input_impl(sampler, bias, indices);
+        });
+    } else if (sampler->iface->backend_set_input && sampler->iface != &llama_sampler_empty_i) {
+        // Custom input setters cannot restore bindings for a retained graph.
+        result.reusable = false;
+        result.setters.emplace_back([sampler]() { sampler->iface->backend_set_input(sampler); });
+    }
+    return result;
 }
 
 // perf

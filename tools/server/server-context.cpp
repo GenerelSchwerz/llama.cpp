@@ -1262,9 +1262,9 @@ private:
             SRV_ERR("%s", "capped MTP recurrent planes require a model graph and recurrent-state backend with selected sparse-snapshot support\n");
             return false;
         }
-        if (capped_mtp && params_base.speculative.draft.n_max + 1 > (int32_t) llama_n_ubatch(ctx_tgt)) {
+        if (capped_mtp && common_speculative_n_max(&params_base.speculative) + 1 > (int32_t) llama_n_ubatch(ctx_tgt)) {
             SRV_ERR("capped MTP replay requires an ubatch of at least %d tokens, but the target context has %u\n",
-                    params_base.speculative.draft.n_max + 1, llama_n_ubatch(ctx_tgt));
+                    common_speculative_n_max(&params_base.speculative) + 1, llama_n_ubatch(ctx_tgt));
             return false;
         }
         vocab = llama_model_get_vocab(model_tgt);
@@ -4430,6 +4430,13 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
+                if (!llama_moe_profile_initialize(slot.ctx_tgt)) {
+                    send_error(slot, "MoE profile initialization failed", ERROR_TYPE_SERVER);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
@@ -4455,7 +4462,8 @@ private:
                 }
                 if (id == LLAMA_TOKEN_NULL) {
                     slot.decode_overlap_enabled = false;
-                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx, false,
+                            !params_base.moe_source_graph_capacity || slot.task->params.sampling.n_probs > 0);
                 }
             }
 
@@ -4527,7 +4535,13 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const uint32_t rs_planes = llama_n_rs_seq(ctx_tgt);
+                const uint32_t direct_horizon = rs_planes > 0 ? rs_planes - 1 : 0;
+                const bool may_restore_sampler = !gpu_snapshot_replay &&
+                        ((slot.spec_replay.mtp_gpu_snapshots_armed() && n_draft > direct_horizon) ||
+                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > rs_planes));
+                common_sampler_ptr smpl_save(may_restore_sampler ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 llama_tokens accepted;
                 if (!gpu_snapshot_replay) {
@@ -4539,7 +4553,8 @@ private:
                     }
                     const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                     accepted = synth_probs.empty()
-                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false,
+                                !params_base.moe_source_graph_capacity || slot.task->params.sampling.n_probs > 0)
                         : server_sample_and_accept_synth(
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 synth_probs, slot.spec_synth_rng,
@@ -4568,10 +4583,10 @@ private:
                     GGML_ASSERT(accepted.size() >= 1);
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-                    const uint32_t direct_horizon = llama_n_rs_seq(ctx_tgt) > 0 ? llama_n_rs_seq(ctx_tgt) - 1 : 0;
                     const bool use_gpu_replay = slot.spec_replay.mtp_gpu_snapshots_armed() && n_rollback > direct_horizon;
 
                     if (use_gpu_replay) {
+                        GGML_ASSERT(smpl_save);
                         const uint32_t n_accepted = accepted.size() - 1;
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4594,6 +4609,7 @@ private:
                     // check for partial draft acceptance
                     if (n_rollback > 0) {
                         if (use_ckpt_tgt) {
+                            GGML_ASSERT(smpl_save);
                             if (trace > 0) {
                                 SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                             }

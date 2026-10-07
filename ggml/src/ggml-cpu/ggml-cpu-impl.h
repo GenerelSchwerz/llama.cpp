@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
@@ -31,7 +32,26 @@ struct ggml_compute_params {
 
     ggml_backend_get_rows_callback get_rows_callback;
     void * get_rows_callback_data;
+
+    ggml_cpu_mmid_route_filter mmid_route_filter;
+    void * mmid_route_filter_data;
 };
+
+
+struct ggml_cpu_mul_mat_kernel {
+    ggml_vec_dot_t vec_dot;
+    ggml_from_float_t from_float;
+    enum ggml_type input_type;
+    int64_t nrows;
+    int64_t block_size;
+    size_t block_bytes;
+    size_t row_bytes;
+    bool prepared;
+    bool convert_input;
+};
+
+GGML_BACKEND_API bool ggml_cpu_get_mul_mat_kernel(const struct ggml_tensor * op, struct ggml_cpu_mul_mat_kernel * kernel);
+bool ggml_cpu_mul_mat_input_work_size(const struct ggml_tensor * input, const struct ggml_cpu_mul_mat_kernel * kernel, size_t * size);
 
 
 #if defined(_MSC_VER)
@@ -534,6 +554,13 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
+
+struct ggml_threadpool * ggml_threadpool_new_persistent(struct ggml_threadpool_params * params);
+size_t ggml_threadpool_host_size(int n_threads);
+
+typedef void (*ggml_threadpool_task_t)(void * data, int ith, int nth, struct ggml_threadpool * pool);
+// The caller serializes jobs and keeps data alive until every worker returns.
+enum ggml_status ggml_threadpool_run_task(struct ggml_threadpool * pool, int n_threads, ggml_threadpool_task_t task, void * data);
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);

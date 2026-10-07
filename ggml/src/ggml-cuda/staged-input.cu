@@ -1,3 +1,4 @@
+#include "common.cuh"
 #include "staged-input.cuh"
 #include "ggml-backend-impl.h"
 
@@ -15,6 +16,7 @@ struct staged_input {
     std::atomic<uint32_t> * flag = nullptr;
     CUdeviceptr device_flag = 0;
     size_t bytes = 0;
+    int device = -1;
     PFN_cuStreamWaitValue32_v11070 wait = nullptr;
     PFN_cuStreamWriteValue32_v11070 write = nullptr;
 
@@ -55,6 +57,7 @@ static void * create(ggml_backend_t backend, size_t bytes) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx->device);
     input->bytes = bytes;
+    input->device = ctx->device;
     if (cudaHostAlloc(&input->host, bytes, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&input->flag), sizeof(*input->flag), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostGetDevicePointer(reinterpret_cast<void **>(&input->device_flag), input->flag, 0) != cudaSuccess) {
@@ -129,8 +132,64 @@ const ggml_staged_input_api * ggml_cuda_staged_input_api() {
     };
     return &api;
 }
+
+bool ggml_cuda_staged_input_pending_for_test(void * input) {
+    return static_cast<staged_input *>(input)->flag->load(std::memory_order_acquire) != 0;
+}
+bool ggml_cuda_staged_input_prepare_source_view(int device, const ggml_tensor * node, ggml_cuda_source_staged_input_view & view) {
+    view = {};
+    int selected = -1;
+    if (device < 0 || device >= ggml_cuda_info().device_count || cudaGetDevice(&selected) != cudaSuccess || selected != device ||
+            !node || node->op != GGML_OP_CUSTOM || node->type != GGML_TYPE_F32 || node->ne[0] <= 0 ||
+            uint64_t(node->ne[0]) > SIZE_MAX / sizeof(float) || uint64_t(node->ne[0]) > uint64_t(INT64_MAX) / sizeof(float) ||
+            node->view_src || node->view_offs) { return false; }
+    const size_t bytes = size_t(node->ne[0]) * sizeof(float);
+    if (node->nb[0] != sizeof(float)) { return false; }
+    for (int i = 1; i < 4; ++i) { if (node->ne[i] != 1 || node->nb[i] != bytes) { return false; } }
+    ggml_custom_op_params params;
+    memcpy(&params, node->op_params, sizeof(params));
+    if (params.fun != marker || params.n_tasks != 1 || !params.userdata ||
+            reinterpret_cast<uintptr_t>(params.userdata) % alignof(staged_input)) { return false; }
+    const auto & input = *static_cast<const staged_input *>(params.userdata);
+    if (input.device != device || input.bytes != bytes || !input.host || !input.flag || !input.device_flag ||
+            sizeof(std::atomic<uint32_t>) != sizeof(uint32_t) || !std::atomic<uint32_t>::is_always_lock_free ||
+            reinterpret_cast<uintptr_t>(input.host) % alignof(float) ||
+            reinterpret_cast<uintptr_t>(input.flag) % alignof(std::atomic<uint32_t>)) { return false; }
+    void * payload_alias = nullptr;
+    void * flag_alias = nullptr;
+    cudaPointerAttributes payload_attributes = {}, flag_attributes = {};
+    if (cudaHostGetDevicePointer(&payload_alias, input.host, 0) != cudaSuccess || !payload_alias ||
+            cudaHostGetDevicePointer(&flag_alias, input.flag, 0) != cudaSuccess || !flag_alias ||
+            reinterpret_cast<CUdeviceptr>(flag_alias) != input.device_flag ||
+            cudaPointerGetAttributes(&payload_attributes, input.host) != cudaSuccess ||
+            cudaPointerGetAttributes(&flag_attributes, input.flag) != cudaSuccess ||
+            payload_attributes.type != cudaMemoryTypeHost || payload_attributes.device != device ||
+            payload_attributes.hostPointer != input.host || payload_attributes.devicePointer != payload_alias ||
+            flag_attributes.type != cudaMemoryTypeHost || flag_attributes.device != device ||
+            flag_attributes.hostPointer != input.flag || flag_attributes.devicePointer != flag_alias ||
+            reinterpret_cast<uintptr_t>(payload_alias) % alignof(float) || reinterpret_cast<uintptr_t>(flag_alias) % alignof(uint32_t)) { return false; }
+    const auto host = reinterpret_cast<uintptr_t>(input.host), flag = reinterpret_cast<uintptr_t>(input.flag);
+    const auto payload = reinterpret_cast<uintptr_t>(payload_alias), device_flag = reinterpret_cast<uintptr_t>(flag_alias);
+    if (bytes > UINTPTR_MAX - host || bytes > UINTPTR_MAX - payload || sizeof(uint32_t) > UINTPTR_MAX - flag ||
+            sizeof(uint32_t) > UINTPTR_MAX - device_flag ||
+            (host < flag + sizeof(uint32_t) && flag < host + bytes) ||
+            (payload < device_flag + sizeof(uint32_t) && device_flag < payload + bytes)) { return false; }
+    uint64_t identity = 14695981039346656037ULL;
+    const auto mix = [&identity](uint64_t value) { identity = (identity ^ value) * 1099511628211ULL; };
+    for (uint64_t value : {uint64_t(host), uint64_t(payload), uint64_t(flag), uint64_t(device_flag), uint64_t(bytes),
+            uint64_t(device), uint64_t(node->op), uint64_t(node->type), uint64_t(node->flags), uint64_t(node->view_offs)}) { mix(value); }
+    for (int i = 0; i < 4; ++i) { mix(uint64_t(node->ne[i])); mix(node->nb[i]); }
+    for (const auto * source : node->src) { mix(reinterpret_cast<uintptr_t>(source)); }
+    const auto * raw_params = reinterpret_cast<const unsigned char *>(node->op_params);
+    for (size_t i = 0; i < sizeof(node->op_params); ++i) { mix(raw_params[i]); }
+    view.host = input.host; view.device_alias = payload_alias; view.host_flag = input.flag; view.device_flag = flag_alias;
+    view.bytes = bytes; view.device = device; view.identity = identity;
+    return true;
+}
 #else
 bool ggml_cuda_staged_input_supports(const ggml_tensor *) { return false; }
 bool ggml_cuda_staged_input_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 const ggml_staged_input_api * ggml_cuda_staged_input_api() { return nullptr; }
+bool ggml_cuda_staged_input_pending_for_test(void *) { return false; }
+bool ggml_cuda_staged_input_prepare_source_view(int, const ggml_tensor *, ggml_cuda_source_staged_input_view & view) { view = {}; return false; }
 #endif

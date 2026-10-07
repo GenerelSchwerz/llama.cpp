@@ -83,6 +83,61 @@ struct ggml_cuda_mmid_direct_source_view {
     size_t expert_stride = 0;
 };
 
+// Images stay borrowed and immutable until the launch completes. Source pointers use logical expert IDs.
+struct ggml_cuda_mmid_execution {
+    const uint8_t * route_owners = nullptr;
+    const void * const * expert_sources = nullptr;
+    const uint32_t * active_rows = nullptr;
+    uint32_t * status = nullptr;
+    uint32_t row_capacity = 0;
+    uint32_t routes_per_row = 0;
+    uint32_t expert_count = 0;
+    uint8_t owner = 0;
+};
+
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__MUSACC__)
+static __device__ __forceinline__ bool ggml_cuda_mmid_route_owned(const ggml_cuda_mmid_execution & execution,
+        uint32_t row, uint32_t column) {
+    const uint32_t rows = execution.active_rows ? *execution.active_rows : execution.row_capacity;
+    if (rows > execution.row_capacity || column >= execution.routes_per_row) {
+        atomicOr(execution.status, 1u);
+        return false;
+    }
+    return row < rows && (!execution.route_owners ||
+        execution.route_owners[size_t(row) * execution.routes_per_row + column] == execution.owner);
+}
+
+static __device__ __forceinline__ const void * ggml_cuda_mmid_expert_source(const ggml_cuda_mmid_execution & execution,
+        uint32_t expert, const void * direct) {
+    if (expert >= execution.expert_count) {
+        atomicOr(execution.status, 2u);
+        return nullptr;
+    }
+    if (!execution.expert_sources) { return direct; }
+    const void * source = execution.expert_sources[expert];
+    if (!source) { atomicOr(execution.status, 4u); }
+    return source;
+}
+#endif
+
+struct ggml_backend_cuda_context;
+
+struct ggml_cuda_mmid_resources {
+    ggml_cuda_mmid_consumer consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED;
+    size_t pool_bytes = 0;
+};
+
+bool ggml_cuda_mmid_pool_reserve(size_t & bytes, size_t count, size_t element_bytes);
+bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources);
+bool ggml_cuda_mmid_execution_compute(ggml_backend_cuda_context & context, ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
+
+bool ggml_cuda_mmid_execution_valid(const ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
+bool ggml_cuda_mmid_execution_compute(ggml_backend_t backend, ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
+bool ggml_cuda_mmid_pool_compute_for_test(ggml_backend_t backend, ggml_tensor * dst,
+    const ggml_cuda_mmid_execution & execution, void * workspace, size_t bytes, size_t * peak);
+bool ggml_cuda_mmid_vector_compute_for_test(ggml_backend_t backend, ggml_tensor * dst);
+cudaStream_t ggml_cuda_mmid_execution_stream_for_test(ggml_backend_t backend);
+
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type);
 ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query);
 bool ggml_cuda_mmid_can_use_compact_mmvq(const ggml_cuda_mmid_capability_query & query, int64_t n_compact_experts);
@@ -96,7 +151,10 @@ bool ggml_cuda_mmid_direct_source_view_compute_for_test(
         ggml_tensor * dst,
         const ggml_cuda_mmid_direct_source_view * view,
         ggml_cuda_mmid_consumer consumer);
+bool ggml_cuda_mmid_bounded_compute_for_test(
+        ggml_backend_t backend, ggml_tensor * dst, const uint32_t * active_channels, uint32_t * status);
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
-        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
+        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream,
+        const ggml_cuda_mmid_execution * execution = nullptr);

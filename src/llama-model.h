@@ -18,11 +18,13 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_moe_placement_report;
+struct ggml_backend_moe_source_owner_v1;
 
 struct llama_moe_source_bank {
     ggml_tensor * tensor;
     uint32_t role;
     uint32_t status;
+    std::vector<std::string> names = {};
 };
 
 struct llama_moe_source_group {
@@ -820,6 +822,7 @@ struct llama_model {
     void build_moe_sources();
     void finalize_moe_expert_cache();
     const std::vector<llama_moe_source_group> & moe_sources() const;
+    const std::vector<llm_tensor_use> & tensor_uses() const;
     llama_moe_placement_report                   moe_placement() const;
     void record_tensor_override_resolution(
         std::string tensor_name, uint32_t origin, int32_t index, std::string pattern,
@@ -836,6 +839,9 @@ struct llama_model {
     void record_artifact_source(size_t file_size, int64_t modification_time, bool modification_time_available);
     void record_resolved_load_strategy(
         bool uses_mmap, std::string direct_io_state, bool uses_mlock, bool has_lazy_tensors);
+    bool record_moe_readable_source(const ggml_tensor * tensor, const void * data, size_t bytes);
+    bool moe_source_owner_v1(ggml_backend_moe_source_owner_v1 * owner) const;
+    void close_moe_source_owner();
 
     void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
     void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;

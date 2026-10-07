@@ -794,6 +794,14 @@ struct llm_tensor_info {
     ggml_op op;
 };
 
+struct llm_tensor_use {
+    ggml_tensor * tensor;
+    ggml_op op;
+    int32_t layer;
+    // Keep the loader name independent of the tensor display name.
+    std::string name;
+};
+
 std::vector<llm_arch> llm_arch_all();
 
 const char * llm_arch_name(llm_arch arch);

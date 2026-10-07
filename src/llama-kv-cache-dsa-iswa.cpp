@@ -308,13 +308,13 @@ bool llama_kv_cache_dsa_iswa_context::next() {
     return true;
 }
 
-bool llama_kv_cache_dsa_iswa_context::apply() {
+bool llama_kv_cache_dsa_iswa_context::apply(bool graph_reserve) {
     assert(!llama_memory_status_is_fail(status));
 
     bool res = true;
 
-    res = res & ctx_dsa->apply();
-    res = res & ctx_swa->apply();
+    res = res & ctx_dsa->apply(graph_reserve);
+    res = res & ctx_swa->apply(graph_reserve);
 
     return res;
 }

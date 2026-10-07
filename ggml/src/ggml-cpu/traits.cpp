@@ -34,3 +34,16 @@ bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size
     }
     return false;
 }
+
+bool ggml_cpu_extra_supports_mmid_route_filter(const struct ggml_tensor * op) {
+    for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra && extra->context) {
+            auto * buf_extra = (ggml::cpu::extra_buffer_type *) extra->context;
+            auto * traits = buf_extra->get_tensor_traits(op);
+            if (traits && !traits->supports_mmid_route_filter()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}

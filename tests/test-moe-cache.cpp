@@ -3,7 +3,36 @@
 #include "test-moe-cache.h"
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--routed-bank-only") == 0) {
+        test_candidate_routed_matrix();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--cpu-routed-service-only") == 0) {
+        test_cpu_routed_service();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--mmid-binding-only") == 0) {
+        test_mmid_execution_binding(0);
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--mmid-map-only") == 0 || strcmp(argv[1], "--mmid-map-bench") == 0)) {
+        test_mmid_route_maps(strcmp(argv[1], "--mmid-map-bench") == 0);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--gpu-profile-only") == 0) {
+        test_grouped_layer_placement(true);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--profile-only") == 0) {
+        test_moe_static_profile();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--cpu-region-only") == 0) {
+        test_moe_cpu_region_proc_api();
+        return 0;
+    }
     test_moe_tensor_split_rejection();
+    test_moe_source_lifetime();
     if (argc == 2 && strcmp(argv[1], "--tensor-policy-only") == 0) {
         return 0;
     }
@@ -14,8 +43,13 @@ int main(int argc, char ** argv) {
         test_grouped_layer_placement();
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--hybrid-metadata-only") == 0) {
+        test_hybrid_metadata();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--pageable-fallback-only") == 0) {
         test_pageable_cache_fallback();
+        test_moe_cache_proc_api();
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--grouped-staging-bench") == 0) {
@@ -147,6 +181,7 @@ int main(int argc, char ** argv) {
     test_scheduler_execution_certificate();
     test_graph_execution_certificate_policy();
     test_candidate_generic_physical_truth();
+    test_candidate_routed_matrix();
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_legacy_owner_leases();

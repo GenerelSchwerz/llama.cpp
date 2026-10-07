@@ -1301,17 +1301,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return it->second.get();
     };
 
-    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
-        if (!t_meta) {
-            if (flags & TENSOR_NOT_REQUIRED) {
-                return nullptr;
-            }
-            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
-        }
-
-        // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
-        // the tensor is duplicated
-        // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
+    const auto tensor_info = [&]() {
+        // Tied output storage uses the output placement contract.
         llm_tensor tn_tensor = tn.tensor;
         if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
             tn_tensor = LLM_TENSOR_OUTPUT;
@@ -1324,6 +1315,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
+        return info;
+    };
+    const auto tensor_op = [&](const llm_tensor_info & info) {
+        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+            return info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
+        }
+        if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
+                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+            return GGML_OP_MUL_MAT_ID;
+        }
+        return info.op;
+    };
+    const auto record_tensor = [&](ggml_tensor * tensor) {
+        if (tensor) {
+            tensor_uses.push_back({tensor, tensor_op(tensor_info()), tn.bid, tn.str()});
+        }
+        return tensor;
+    };
+
+    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+        if (!t_meta) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+        }
+
+        const auto info = tensor_info();
+
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
@@ -1335,17 +1355,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
 
-        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
-        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
-        ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
-            op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
-        } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
-                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
-            op = GGML_OP_MUL_MAT_ID;
-        } else {
-            op = info.op;
-        }
+        const ggml_op op = tensor_op(info);
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -1509,12 +1519,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
-        return ret;
+        return record_tensor(ret);
     }
 
     // must precede check_tensor_dims, and must win over the arch fallback that ties output to token_embd
     if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
-        return shared;
+        return record_tensor(shared);
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
@@ -1555,7 +1565,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_DUPLICATED) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
-            return t;
+            return record_tensor(t);
         }
     }
 
@@ -1570,7 +1580,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
-    return tensor;
+    return record_tensor(tensor);
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
@@ -1732,9 +1742,21 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
+    const auto record_readable_source = [&](ggml_tensor * tensor) {
+        auto * device = tensor->buffer != nullptr ?
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) : nullptr;
+        auto * reg = device != nullptr ? ggml_backend_dev_backend_reg(device) : nullptr;
+        auto readable = reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_readable_source_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_READABLE_SOURCE_PROC_NAME)) : nullptr;
+        const size_t bytes = ggml_nbytes(tensor);
+        if (readable != nullptr && readable(tensor->buffer, tensor->data, bytes)) {
+            moe_readable_sources.push_back({tensor, tensor->data, bytes});
+        }
+    };
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
+            record_readable_source(t);
         }
         return true;
     }
@@ -1995,6 +2017,8 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+
+        record_readable_source(cur);
 
         size_done += n_size;
     }

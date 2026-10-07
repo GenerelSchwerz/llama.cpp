@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <system_error>
 
 namespace {
 bool readable(const ggml_tensor * table) {
@@ -38,7 +39,7 @@ private:
 };
 }
 
-std::unique_ptr<llama_staged_inputs> llama_staged_inputs::create(const llama_model & model, ggml_backend_t backend, bool prefetch) {
+std::unique_ptr<llama_staged_inputs> llama_staged_inputs::create(const llama_model & model, ggml_backend_t backend, bool prefetch, bool caller_inputs) {
     const auto & hp = model.hparams;
     if (!readable(model.tok_embd) || !readable(model.per_layer_tok_embd) || hp.ple_ngram_size < 2 ||
         hp.ple_ngram_size > LLAMA_MAX_PLE_NGRAM || hp.ple_heads_per_ngram > LLAMA_MAX_PLE_HEADS / (hp.ple_ngram_size - 1) ||
@@ -50,17 +51,32 @@ std::unique_ptr<llama_staged_inputs> llama_staged_inputs::create(const llama_mod
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto get_api = reinterpret_cast<ggml_staged_input_get_api_t>(ggml_backend_reg_get_proc_address(reg, GGML_STAGED_INPUT_PROC));
     if (!get_api) { return nullptr; }
-    auto result = std::unique_ptr<llama_staged_inputs>(new llama_staged_inputs(model, prefetch));
+    auto result = std::unique_ptr<llama_staged_inputs>(new llama_staged_inputs(model, prefetch, caller_inputs));
     result->api = get_api();
     if (!result->api) { return nullptr; }
     result->embedding = result->api->create(backend, model.tok_embd->ne[0]*sizeof(float));
     result->ple = result->api->create(backend, size_t(hp.ple_n_heads)*hp.ple_head_dim*sizeof(float));
     if (!result->embedding || !result->ple) { return nullptr; }
+    if (!caller_inputs) {
+        try {
+            result->worker = std::thread([stage = result.get()] { stage->run(); });
+        } catch (const std::system_error &) {
+            return nullptr;
+        }
+    }
     return result;
 }
 
 llama_staged_inputs::~llama_staged_inputs() {
     if (pending.valid()) { pending.wait(); }
+    if (worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        condition.notify_one();
+        worker.join();
+    }
     if (embedding) { api->destroy(embedding); }
     if (ple) { api->destroy(ple); }
 }
@@ -76,7 +92,7 @@ void llama_staged_inputs::prepare(const llama_ubatch & ubatch, const llama_memor
     GGML_ASSERT(ubatch.n_tokens == 1 && token && ready);
     std::vector<llama_token> previous;
     memory->get_attn()->get_prev_tokens(ubatch, model.hparams.ple_ngram_size - 1, previous);
-    pending = std::async(std::launch::async, [this, previous = std::move(previous)]() {
+    auto collect = [this, previous = std::move(previous)]() {
         bool embedding_published = false;
         try {
             ggml_backend_event_synchronize(ready);
@@ -129,7 +145,31 @@ void llama_staged_inputs::prepare(const llama_ubatch & ubatch, const llama_memor
             api->publish(ple);
             throw;
         }
-    });
+    };
+    if (caller_inputs) {
+        collect();
+        return;
+    }
+    auto next = std::packaged_task<void()>(std::move(collect));
+    pending = next.get_future();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        task = std::move(next);
+    }
+    condition.notify_one();
+}
+
+void llama_staged_inputs::run() {
+    for (;;) {
+        std::packaged_task<void()> next;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait(lock, [this] { return stopping || task.valid(); });
+            if (stopping) { return; }
+            next = std::move(task);
+        }
+        next();
+    }
 }
 
 void llama_staged_inputs::finish() {

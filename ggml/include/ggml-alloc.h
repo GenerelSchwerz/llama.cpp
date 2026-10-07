@@ -53,8 +53,16 @@ GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 // A generation change invalidates graph addresses. A shrink-generation change invalidates cached reserve plans.
 // Shared buffers remain valid until both roles detach.
 GGML_API bool           ggml_gallocr_set_resizable(ggml_gallocr_t galloc, ggml_gallocr_t owner);
+// Join another allocation plan in the same execution role and buffer placement. Plans must not execute concurrently.
+GGML_API bool           ggml_gallocr_share_resizable_plan(ggml_gallocr_t galloc, ggml_gallocr_t peer);
 GGML_API void           ggml_gallocr_get_resizable_state(ggml_gallocr_t galloc, uint64_t * generation, uint64_t * shrink_generation);
 GGML_API void           ggml_gallocr_request_shrink(ggml_gallocr_t galloc);
+
+// Called before existing backing is replaced. False keeps backing and generations unchanged.
+// Do not allocate, reset or free any allocator that shares this backing in the callback.
+// Keep its context and graph owners alive until replacement returns; unregister before context destruction.
+typedef bool (*ggml_gallocr_buffer_replacement_callback)(void * user_data);
+GGML_API void ggml_gallocr_set_buffer_replacement_callback(ggml_gallocr_t galloc, ggml_gallocr_buffer_replacement_callback callback, void * user_data);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
@@ -87,6 +95,10 @@ GGML_API bool ggml_gallocr_reserve_n_if_fits(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+
+// Private planner metadata, including wrappers for planned buffers. Excludes backend and malloc overhead.
+// Call while quiescent. SIZE_MAX means shared storage or size overflow.
+GGML_API size_t ggml_gallocr_get_metadata_size(ggml_gallocr_t galloc);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

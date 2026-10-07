@@ -50,7 +50,10 @@ bool grouped_frequency_enabled();
 void test_speculative_grouped_intent_splits();
 
 int  test_grouped_multigpu();
-void test_grouped_layer_placement();
+void test_grouped_layer_placement(bool profile_only = false);
+void test_hybrid_metadata();
+void test_hybrid_row_sources();
+void test_cpu_routed_service();
 
 void test_speculative_required_grouped_backend_capability(int device);
 
@@ -66,6 +69,9 @@ struct ggml_cuda_moe_grouped_context_test_access {
     }
     static void fail_device_resource_allocation(ggml_cuda_moe_grouped_context & context, uint32_t stage) {
         context.fail_device_resource_allocation_for_test(stage);
+    }
+    static void fail_hybrid_packet(ggml_cuda_moe_grouped_context & context, uint32_t stage) {
+        context.fail_hybrid_packet_for_test(stage);
     }
     static bool early_graph(ggml_cuda_moe_grouped_context & context) {
         return context.early_graph_for_test();
@@ -484,12 +490,15 @@ void test_candidate_graph_coverage_ledger();
 void test_candidate_graph_inventory_reuse();
 
 void test_mmid_capabilities();
+void test_mmid_route_maps(bool benchmark);
+void test_mmid_execution_binding(int device);
 
 void test_scheduler_execution_certificate();
 
 void test_graph_execution_certificate_policy();
 
 void test_candidate_generic_physical_truth();
+void test_candidate_routed_matrix();
 
 void test_candidate_producer();
 
@@ -704,6 +713,7 @@ void test_prefill_resident_biases();
 
 void test_active_grouped_dispatch();
 void test_moe_tensor_split_rejection();
+void test_moe_source_lifetime();
 
 void test_cached_mmid_fusion_decline();
 
@@ -714,7 +724,8 @@ cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         int64_t n_out,
         int64_t n_used,
         int64_t n_tokens,
-        int64_t n_experts = 8);
+        int64_t n_experts = 8,
+        int64_t n_channels = 1);
 
 cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         ggml_backend_t backend,
@@ -759,6 +770,7 @@ void test_grouped_decode_benchmark(int device);
 void test_moe_route_publication_lifetime();
 
 void test_moe_cache_proc_api();
+void test_moe_cpu_region_proc_api();
 
 void test_strided_copy_graph_update(int device, bool enabled);
 
@@ -767,3 +779,4 @@ void test_pageable_cache_fallback();
 void test_grouped_staging_benchmark();
 
 void test_cache_slots_and_staging(int dev);
+void test_moe_static_profile();

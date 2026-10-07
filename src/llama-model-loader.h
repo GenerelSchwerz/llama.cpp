@@ -185,6 +185,14 @@ struct llama_model_loader {
     };
     std::unordered_map<std::string, borrowed_tensor_resolution> borrowed_tensors;
 
+    struct moe_readable_source_resolution {
+        const ggml_tensor * tensor = nullptr;
+        const void *        data   = nullptr;
+        size_t              bytes  = 0;
+    };
+    std::vector<moe_readable_source_resolution> moe_readable_sources;
+    std::vector<llm_tensor_use> tensor_uses;
+
     struct artifact_source {
         size_t  file_size = 0;
         int64_t modification_time = 0;

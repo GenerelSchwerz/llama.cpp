@@ -25,6 +25,10 @@ struct dummy_backend_context {
     int    graph_compute_count    = 0;
     int    synchronize_count      = 0;
     size_t synchronized_bytes     = 0;
+    ggml_backend_buffer_type_t accepted_buft = nullptr;
+    const dummy_backend_context * producer = nullptr;
+    int producer_sync_at_compute = 0;
+    int synchronize_at_compute = 0;
 
     ggml_backend_buffer_i                  buffer_interface;
     std::vector<ggml_backend_buffer_t>     buffers;
@@ -153,6 +157,8 @@ static const char * dummy_backend_get_name(ggml_backend_t) {
 static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *) {
     dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
     ctx->graph_compute_count++;
+    ctx->synchronize_at_compute = ctx->synchronize_count;
+    if (ctx->producer) { ctx->producer_sync_at_compute = ctx->producer->synchronize_count; }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -171,7 +177,8 @@ static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tens
 }
 
 static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
-    return device->context == buft->context;
+    const auto * ctx = static_cast<const dummy_backend_context *>(device->context);
+    return device->context == buft->context || ctx->accepted_buft == buft;
 }
 
 static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false,
@@ -648,6 +655,48 @@ static void test_buffer_size_zero() {
     check_all_allocated(graph);
     GGML_ASSERT(backend_a.context->allocated_total() == 16);
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
+}
+
+static void test_metadata_requirements() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    const auto plan_graph = [](int n_nodes) {
+        auto result = make_context();
+        auto * node = make_input_with_size(result.ctx, 16);
+        for (int i = 0; i < n_nodes; ++i) {
+            node = ggml_scale(result.ctx, node, 1.0f);
+        }
+        ggml_set_output(node);
+        ggml_build_forward_expand(result.graph, node);
+        return result;
+    };
+    auto large = plan_graph(32);
+    auto small = plan_graph(8);
+    auto medium = plan_graph(16);
+    ggml_gallocr_ptr alloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_ptr fresh(ggml_gallocr_new(&backend.buffer_type));
+    const size_t initial = ggml_gallocr_get_metadata_size(alloc.get());
+    GGML_ASSERT(initial > 0 && initial != SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = {&backend.buffer_type, &backend.buffer_type};
+    ggml_gallocr_ptr duplicate(ggml_gallocr_new_n(bufts, 2));
+    GGML_ASSERT(ggml_gallocr_get_metadata_size(duplicate.get()) == initial + sizeof(ggml_backend_buffer_type_t) + 2 * sizeof(void *));
+    size_t bytes = 0;
+    ggml_gallocr_reserve_n_size(alloc.get(), large.graph, nullptr, nullptr, &bytes);
+    const size_t large_metadata = ggml_gallocr_get_metadata_size(alloc.get());
+    GGML_ASSERT(bytes > 0 && large_metadata > initial && large_metadata != SIZE_MAX);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+    ggml_gallocr_reserve_n_size(alloc.get(), small.graph, nullptr, nullptr, &bytes);
+    GGML_ASSERT(ggml_gallocr_get_metadata_size(alloc.get()) == large_metadata);
+    ggml_gallocr_reserve_n_size(fresh.get(), small.graph, nullptr, nullptr, &bytes);
+    GGML_ASSERT(ggml_gallocr_get_metadata_size(fresh.get()) < large_metadata);
+    ggml_gallocr_reserve_n_size(alloc.get(), medium.graph, nullptr, nullptr, &bytes);
+    const size_t medium_metadata = ggml_gallocr_get_metadata_size(alloc.get());
+    GGML_ASSERT(medium_metadata < large_metadata && medium_metadata > ggml_gallocr_get_metadata_size(fresh.get()));
+    GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), medium.graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), medium.graph));
+    GGML_ASSERT(ggml_gallocr_get_metadata_size(alloc.get()) == medium_metadata);
+    check_all_allocated(medium.graph);
+    GGML_ASSERT(ggml_gallocr_set_resizable(fresh.get(), nullptr));
+    GGML_ASSERT(ggml_gallocr_get_metadata_size(fresh.get()) == SIZE_MAX);
 }
 
 // Test re-using gallocr for a different graph. The new graph has the same
@@ -1225,6 +1274,337 @@ static void test_resizable_buffers_owner_borrower_teardown_order() {
     }
 }
 
+static void test_scheduler_direct_dependency_with_copied_input() {
+    for (bool shared : { false, true }) {
+        for (bool copied : { false, true }) {
+            auto first = dummy_backend_init(SIZE_MAX, 4, true, true);
+            auto second = dummy_backend_init(SIZE_MAX, 4, true, true);
+            auto host = dummy_backend_init(SIZE_MAX, 4, true, true);
+            second.context->accepted_buft = &first.buffer_type;
+            second.context->producer = first.context.get();
+            first.device->iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor * tensor) {
+                return tensor->op != GGML_OP_ADD;
+            };
+            auto graph = make_context();
+            auto * input = make_input_1d(graph.ctx, 4);
+            auto * produced = ggml_scale(graph.ctx, input, 2.0f);
+            auto * unrelated = make_input_1d(graph.ctx, 4);
+            ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&host.buffer_type, ggml_nbytes(unrelated)));
+            GGML_ASSERT(buffer && ggml_backend_tensor_alloc(buffer.get(), unrelated,
+                ggml_backend_buffer_get_base(buffer.get())) == GGML_STATUS_SUCCESS);
+            auto * output = copied ? ggml_add(graph.ctx, produced, unrelated) : ggml_add(graph.ctx, produced, produced);
+            ggml_set_output(output);
+            ggml_build_forward_expand(graph.graph, output);
+            ggml_backend_t backends[]{first.handle.get(), second.handle.get(), host.handle.get()};
+            ggml_backend_buffer_type_t bufts[]{&first.buffer_type, shared ? &first.buffer_type : &second.buffer_type, &host.buffer_type};
+            ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 3, 128, false, false));
+            ggml_backend_sched_set_tensor_backend(sched.get(), produced, first.handle.get());
+            ggml_backend_sched_set_tensor_backend(sched.get(), output, second.handle.get());
+            GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.graph));
+            GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+            first.context->synchronize_count = 0;
+            GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph.graph) == GGML_STATUS_SUCCESS);
+            GGML_ASSERT(first.context->graph_compute_count == 1 && second.context->graph_compute_count == 1);
+            GGML_ASSERT(second.context->producer_sync_at_compute > first.context->synchronize_at_compute);
+            ggml_backend_sched_synchronize(sched.get());
+        }
+    }
+}
+
+struct buffer_retirement_probe {
+    ggml_gallocr_t alloc = nullptr;
+    std::vector<const dummy_backend_context *> contexts;
+    std::vector<std::vector<ggml_backend_buffer_t>> buffers;
+    std::vector<std::vector<void *>> bases;
+    uint64_t generation = 0;
+    int calls = 0;
+    bool reject = false;
+
+    void snapshot() {
+        buffers.clear(); bases.clear();
+        for (auto * context : contexts) {
+            buffers.push_back(context->buffers);
+            bases.push_back(context->buffer_bases);
+        }
+        generation = gallocr_generation(alloc);
+    }
+
+    static bool retire(void * user_data) {
+        auto & probe = *static_cast<buffer_retirement_probe *>(user_data);
+        for (size_t i = 0; i < probe.contexts.size(); ++i) {
+            GGML_ASSERT(probe.contexts[i]->buffers == probe.buffers[i]);
+            GGML_ASSERT(probe.contexts[i]->buffer_bases == probe.bases[i]);
+        }
+        GGML_ASSERT(gallocr_generation(probe.alloc) == probe.generation);
+        ++probe.calls;
+        return !probe.reject;
+    }
+};
+
+static void test_checked_shared_buffer_retirement_case(bool reject_owner, bool owner_first) {
+    auto shared = dummy_backend_init(SIZE_MAX, 4, true);
+    auto owner_extra = dummy_backend_init(SIZE_MAX, 4, true);
+    auto borrower_extra = dummy_backend_init(SIZE_MAX, 4, true);
+    ggml_backend_buffer_type_t owner_bufts[]{&shared.buffer_type, &owner_extra.buffer_type};
+    ggml_backend_buffer_type_t borrower_bufts[]{&shared.buffer_type, &borrower_extra.buffer_type};
+    ggml_gallocr_ptr owner(ggml_gallocr_new_n(owner_bufts, 2));
+    ggml_gallocr_ptr borrower(ggml_gallocr_new_n(borrower_bufts, 2));
+    GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
+    GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
+    auto small = make_resizable_add_graph(4);
+    auto large = make_resizable_add_graph(24);
+    const int nodes[]{0}, leafs[]{1, 0};
+    buffer_retirement_probe first, second;
+    first.alloc = owner.get(); second.alloc = borrower.get();
+    first.contexts = second.contexts = {shared.context.get(), owner_extra.context.get(), borrower_extra.context.get()};
+    ggml_gallocr_set_buffer_replacement_callback(owner.get(), buffer_retirement_probe::retire, &first);
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), buffer_retirement_probe::retire, &second);
+    GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 0 && second.calls == 0);
+    first.snapshot(); second.snapshot();
+    first.reject = reject_owner; second.reject = !reject_owner;
+    GGML_ASSERT(!ggml_gallocr_reserve_n(borrower.get(), large.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 1 && second.calls == int(!reject_owner));
+    GGML_ASSERT(gallocr_generation(owner.get()) == first.generation && gallocr_generation(borrower.get()) == second.generation);
+    for (size_t i = 0; i < first.contexts.size(); ++i) {
+        GGML_ASSERT(first.contexts[i]->buffers == first.buffers[i] && first.contexts[i]->buffer_bases == first.bases[i]);
+    }
+    first.reject = false; second.reject = false;
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), large.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 2 && second.calls == 1 + int(!reject_owner));
+    GGML_ASSERT(gallocr_generation(owner.get()) > first.generation && gallocr_generation(borrower.get()) > second.generation);
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), large.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 2 && second.calls == 1 + int(!reject_owner));
+    first.snapshot(); second.snapshot();
+    ggml_gallocr_request_shrink(owner.get());
+    GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 2 && second.calls == 1 + int(!reject_owner));
+    ggml_gallocr_request_shrink(borrower.get());
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 3 && second.calls == 2 + int(!reject_owner));
+    ggml_gallocr_set_buffer_replacement_callback(owner.get(), nullptr, nullptr);
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), nullptr, nullptr);
+    if (owner_first) {
+        owner.reset();
+        GGML_ASSERT(!shared.context->buffers.empty());
+        borrower.reset();
+    } else {
+        borrower.reset();
+        GGML_ASSERT(!shared.context->buffers.empty());
+        owner.reset();
+    }
+    GGML_ASSERT(shared.context->buffers.empty() && owner_extra.context->buffers.empty() && borrower_extra.context->buffers.empty());
+}
+
+static void test_checked_shared_buffer_retirement() {
+    for (bool reject_owner : {false, true}) {
+        for (bool owner_first : {false, true}) {
+            test_checked_shared_buffer_retirement_case(reject_owner, owner_first);
+        }
+    }
+}
+
+static void test_checked_retirement_allocation_failure() {
+    auto backend = dummy_backend_init(SIZE_MAX, 4, true);
+    ggml_gallocr_ptr owner(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_ptr borrower(ggml_gallocr_new(&backend.buffer_type));
+    GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
+    GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
+    auto small = make_resizable_add_graph(4);
+    auto large = make_resizable_add_graph(24);
+    buffer_retirement_probe first, second;
+    first.alloc = owner.get(); second.alloc = borrower.get();
+    first.contexts = second.contexts = {backend.context.get()};
+    ggml_gallocr_set_buffer_replacement_callback(owner.get(), buffer_retirement_probe::retire, &first);
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), buffer_retirement_probe::retire, &second);
+    GGML_ASSERT(ggml_gallocr_reserve(owner.get(), small.graph));
+    GGML_ASSERT(ggml_gallocr_reserve(borrower.get(), small.graph));
+    first.snapshot(); second.snapshot();
+    backend.context->fail_alloc = true;
+    GGML_ASSERT(!ggml_gallocr_reserve(owner.get(), large.graph));
+    GGML_ASSERT(first.calls == 1 && second.calls == 1);
+    const auto failed_generation = gallocr_generation(owner.get());
+    GGML_ASSERT(failed_generation > first.generation && gallocr_generation(borrower.get()) == failed_generation);
+    GGML_ASSERT(backend.context->buffers.empty());
+    backend.context->fail_alloc = false;
+    GGML_ASSERT(ggml_gallocr_reserve(borrower.get(), small.graph));
+    GGML_ASSERT(first.calls == 1 && second.calls == 1);
+    GGML_ASSERT(gallocr_generation(owner.get()) > failed_generation);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(owner.get(), large.graph));
+    check_all_allocated(large.graph);
+    ggml_gallocr_set_buffer_replacement_callback(owner.get(), nullptr, nullptr);
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), nullptr, nullptr);
+}
+
+static void test_shared_plan_existing_backing() {
+    for (bool explicit_owner : { false, true }) {
+        for (bool owner_first : { false, true }) {
+            auto backend = dummy_backend_init(SIZE_MAX, 4, true);
+            ggml_backend_buffer_type_t bufts[]{&backend.buffer_type, &backend.buffer_type};
+            ggml_gallocr_ptr owner(ggml_gallocr_new_n(bufts, 2));
+            ggml_gallocr_ptr sibling(ggml_gallocr_new_n(bufts, 2));
+            auto original = make_resizable_add_graph(24);
+            auto same = make_resizable_add_graph(24);
+            GGML_ASSERT(ggml_gallocr_reserve(owner.get(), original.graph));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(owner.get(), original.graph));
+            check_all_allocated(original.graph);
+            buffer_retirement_probe probe;
+            probe.alloc = owner.get(); probe.contexts = {backend.context.get()}; probe.snapshot();
+            ggml_gallocr_set_buffer_replacement_callback(owner.get(), buffer_retirement_probe::retire, &probe);
+            const auto generation = gallocr_generation(owner.get());
+            auto * output = ggml_graph_node(original.graph, ggml_graph_n_nodes(original.graph) - 1);
+            auto * data = output->data;
+            auto * buffer = output->buffer;
+            const size_t bytes = backend.context->allocated_total();
+            if (explicit_owner) { GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr)); }
+            GGML_ASSERT(ggml_gallocr_share_resizable_plan(sibling.get(), owner.get()));
+            GGML_ASSERT(gallocr_generation(owner.get()) == generation && gallocr_generation(sibling.get()) == generation);
+            GGML_ASSERT(probe.calls == 0 && backend.context->buffers == probe.buffers[0]);
+            GGML_ASSERT(output->data == data && output->buffer == buffer);
+            GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) == bytes);
+            GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 1) == 0);
+            GGML_ASSERT(ggml_gallocr_get_buffer_size(sibling.get(), 0) == bytes);
+            GGML_ASSERT(ggml_gallocr_reserve(sibling.get(), same.graph));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(sibling.get(), same.graph));
+            GGML_ASSERT(probe.calls == 0 && backend.context->allocated_total() == bytes);
+            check_all_allocated(same.graph);
+            ggml_gallocr_set_buffer_replacement_callback(owner.get(), nullptr, nullptr);
+            if (owner_first) { owner.reset(); } else { sibling.reset(); }
+            GGML_ASSERT(backend.context->allocated_total() == bytes);
+            if (owner_first) { sibling.reset(); } else { owner.reset(); }
+            GGML_ASSERT(backend.context->buffers.empty());
+        }
+    }
+}
+
+static void test_shared_buffer_shape_plan_placements() {
+    auto common = dummy_backend_init(SIZE_MAX, 4, true);
+    auto target = dummy_backend_init(SIZE_MAX, 4, true);
+    auto draft = dummy_backend_init(SIZE_MAX, 4, true);
+    ggml_backend_buffer_type_t target_bufts[]{&common.buffer_type, &target.buffer_type, &target.buffer_type};
+    ggml_backend_buffer_type_t draft_bufts[]{&common.buffer_type, &draft.buffer_type, &draft.buffer_type};
+    ggml_gallocr_ptr owner(ggml_gallocr_new_n(target_bufts, 3));
+    ggml_gallocr_ptr borrower(ggml_gallocr_new_n(draft_bufts, 3));
+    ggml_gallocr_ptr shape(ggml_gallocr_new_n(draft_bufts, 3));
+    GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
+    GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
+    GGML_ASSERT(ggml_gallocr_share_resizable_plan(shape.get(), borrower.get()));
+    auto small = make_resizable_add_graph(4);
+    auto medium = make_resizable_add_graph(16);
+    auto large = make_resizable_add_graph(24);
+    const int nodes[]{0}, leafs[]{1, 0};
+    GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), small.graph, nodes, leafs));
+    GGML_ASSERT(ggml_gallocr_reserve_n(shape.get(), large.graph, nodes, leafs));
+    GGML_ASSERT(common.context->buffers.size() == 1 && target.context->buffers.size() == 1 && draft.context->buffers.size() == 1);
+    GGML_ASSERT(ggml_gallocr_get_buffer_size(shape.get(), 1) == ggml_gallocr_get_buffer_size(borrower.get(), 1));
+    GGML_ASSERT(ggml_gallocr_get_buffer_size(shape.get(), 2) == 0);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(shape.get(), large.graph));
+    check_all_allocated(large.graph);
+    const auto draft_size = draft.context->allocated_total();
+    buffer_retirement_probe first, second;
+    first.alloc = borrower.get(); second.alloc = shape.get();
+    first.contexts = second.contexts = {common.context.get(), target.context.get(), draft.context.get()};
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), buffer_retirement_probe::retire, &first);
+    ggml_gallocr_set_buffer_replacement_callback(shape.get(), buffer_retirement_probe::retire, &second);
+    owner.reset();
+    first.snapshot(); second.snapshot();
+    GGML_ASSERT(ggml_gallocr_reserve_n(shape.get(), medium.graph, nodes, leafs));
+    GGML_ASSERT(first.calls == 1 && second.calls == 1);
+    GGML_ASSERT(draft.context->allocated_total() < draft_size && target.context->buffers.empty());
+    GGML_ASSERT(ggml_gallocr_alloc_graph(shape.get(), medium.graph));
+    check_all_allocated(medium.graph);
+    ggml_gallocr_set_buffer_replacement_callback(borrower.get(), nullptr, nullptr);
+    borrower.reset();
+    GGML_ASSERT(!draft.context->buffers.empty());
+    ggml_gallocr_set_buffer_replacement_callback(shape.get(), nullptr, nullptr);
+    shape.reset();
+    GGML_ASSERT(common.context->buffers.empty() && target.context->buffers.empty() && draft.context->buffers.empty());
+}
+
+static void test_shared_buffer_shape_plans() {
+    for (bool owner_first : {false, true}) {
+        auto backend = dummy_backend_init(SIZE_MAX, 4, true);
+        ggml_gallocr_ptr owner(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_ptr borrower(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_ptr sibling(ggml_gallocr_new(&backend.buffer_type));
+        GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
+        GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
+        GGML_ASSERT(ggml_gallocr_share_resizable_plan(sibling.get(), owner_first ? owner.get() : borrower.get()));
+        auto small = make_resizable_add_graph(4);
+        auto large = make_resizable_add_graph(24);
+        GGML_ASSERT(ggml_gallocr_reserve(owner.get(), small.graph));
+        GGML_ASSERT(ggml_gallocr_reserve(borrower.get(), small.graph));
+        buffer_retirement_probe first, second, third;
+        first.alloc = owner.get(); second.alloc = borrower.get(); third.alloc = sibling.get();
+        first.contexts = second.contexts = third.contexts = {backend.context.get()};
+        ggml_gallocr_set_buffer_replacement_callback(owner.get(), buffer_retirement_probe::retire, &first);
+        ggml_gallocr_set_buffer_replacement_callback(borrower.get(), buffer_retirement_probe::retire, &second);
+        ggml_gallocr_set_buffer_replacement_callback(sibling.get(), buffer_retirement_probe::retire, &third);
+        first.snapshot(); second.snapshot(); third.snapshot(); third.reject = true;
+        GGML_ASSERT(!ggml_gallocr_reserve(sibling.get(), large.graph));
+        GGML_ASSERT(third.calls == 1 && backend.context->buffers == first.buffers[0]);
+        GGML_ASSERT(gallocr_generation(owner.get()) == first.generation);
+        third.reject = false;
+        GGML_ASSERT(ggml_gallocr_reserve(sibling.get(), large.graph));
+        GGML_ASSERT(third.calls == 2);
+        const auto large_size = backend.context->allocated_total();
+        const auto large_generation = gallocr_generation(owner.get());
+        const int calls = first.calls + second.calls + third.calls;
+        GGML_ASSERT(ggml_gallocr_reserve(owner.get(), small.graph));
+        GGML_ASSERT(first.calls + second.calls + third.calls == calls);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(sibling.get(), 0) == large_size);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(sibling.get(), large.graph));
+        check_all_allocated(large.graph);
+        first.snapshot(); second.snapshot(); third.snapshot();
+        ggml_gallocr_request_shrink(owner.get());
+        GGML_ASSERT(ggml_gallocr_reserve(owner.get(), small.graph));
+        GGML_ASSERT(ggml_gallocr_reserve(borrower.get(), small.graph));
+        GGML_ASSERT(gallocr_generation(owner.get()) == large_generation);
+        GGML_ASSERT(backend.context->allocated_total() == large_size);
+        ggml_gallocr_set_buffer_replacement_callback(owner.get(), nullptr, nullptr);
+        ggml_gallocr_set_buffer_replacement_callback(borrower.get(), nullptr, nullptr);
+        if (owner_first) { owner.reset(); } else { borrower.reset(); }
+        GGML_ASSERT(backend.context->allocated_total() == large_size);
+        auto & remaining = owner_first ? borrower : owner;
+        second.alloc = remaining.get(); second.contexts = {backend.context.get()};
+        second.snapshot(); third.snapshot();
+        ggml_gallocr_set_buffer_replacement_callback(remaining.get(), buffer_retirement_probe::retire, &second);
+        GGML_ASSERT(ggml_gallocr_reserve(sibling.get(), small.graph));
+        GGML_ASSERT(ggml_gallocr_reserve(remaining.get(), small.graph));
+        GGML_ASSERT(backend.context->allocated_total() < large_size);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(sibling.get(), 0) == backend.context->allocated_total());
+        ggml_gallocr_set_buffer_replacement_callback(remaining.get(), nullptr, nullptr);
+        ggml_gallocr_set_buffer_replacement_callback(sibling.get(), nullptr, nullptr);
+        remaining.reset();
+        GGML_ASSERT(!backend.context->buffers.empty());
+        sibling.reset();
+        GGML_ASSERT(backend.context->buffers.empty());
+    }
+}
+
+static void test_checked_private_buffer_retirement() {
+    auto backend = dummy_backend_init(SIZE_MAX, 4, true);
+    ggml_gallocr_ptr alloc(ggml_gallocr_new(&backend.buffer_type));
+    auto small = make_resizable_add_graph(4);
+    auto large = make_resizable_add_graph(24);
+    buffer_retirement_probe probe;
+    probe.alloc = alloc.get(); probe.contexts = {backend.context.get()};
+    ggml_gallocr_set_buffer_replacement_callback(alloc.get(), buffer_retirement_probe::retire, &probe);
+    GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), small.graph));
+    GGML_ASSERT(probe.calls == 0);
+    probe.snapshot(); probe.reject = true;
+    GGML_ASSERT(!ggml_gallocr_reserve(alloc.get(), large.graph));
+    GGML_ASSERT(probe.calls == 1 && backend.context->buffers == probe.buffers[0]);
+    probe.reject = false;
+    GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), large.graph));
+    GGML_ASSERT(probe.calls == 2);
+    GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), large.graph));
+    GGML_ASSERT(probe.calls == 2);
+    ggml_gallocr_set_buffer_replacement_callback(alloc.get(), nullptr, nullptr);
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1361,6 +1741,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_metadata_requirements", test_metadata_requirements);
     run("test_reallocation", test_reallocation);
     run("test_async_scheduler_replan", test_async_scheduler_replan);
     run("test_resizable_buffers_grow_shrink_grow", test_resizable_buffers_grow_shrink_grow);
@@ -1373,6 +1754,13 @@ int main() {
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
+    run("test_scheduler_direct_dependency_with_copied_input", test_scheduler_direct_dependency_with_copied_input);
+    run("test_checked_shared_buffer_retirement", test_checked_shared_buffer_retirement);
+    run("test_checked_private_buffer_retirement", test_checked_private_buffer_retirement);
+    run("test_checked_retirement_allocation_failure", test_checked_retirement_allocation_failure);
+    run("test_shared_plan_existing_backing", test_shared_plan_existing_backing);
+    run("test_shared_buffer_shape_plans", test_shared_buffer_shape_plans);
+    run("test_shared_buffer_shape_plan_placements", test_shared_buffer_shape_plan_placements);
     run("test_ordered_multi_stream_ranges", test_ordered_multi_stream_ranges);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;

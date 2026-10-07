@@ -449,7 +449,19 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
         size_t n_kept = 0;
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
+        bool repaired_tail = false;
+        if (!sq.shared && mem_idx_stale[s] != POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
+                sq.pos_min == sp.begin()->first && mem_idx_stale[s] > sq.pos_min) {
+            const auto first = std::make_pair(mem_idx_stale[s], 0u);
+            n_kept = std::lower_bound(sq.cells.begin(), sq.cells.end(), first) - sq.cells.begin();
+            sq.cells.resize(n_kept);
+            sq.cells.insert(sq.cells.end(), sp.lower_bound(first), sp.end());
+            auto pool_end = std::lower_bound(sq.pools.begin(), sq.pools.end(), n_kept,
+                    [&](uint32_t j, size_t end) { return size_t(j) + kpool <= end; });
+            sq.pools.erase(pool_end, sq.pools.end());
+            sq.j_next = sq.pools.empty() ? 0 : size_t(sq.pools.back()) + kpool;
+            repaired_tail = sq.cells.size() == sp.size();
+        } else if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
                 sq.pos_min == sp.begin()->first) {
             n_kept = sq.cells.size();
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
@@ -457,9 +469,8 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // Head edits and shared cells require a full rebuild. Tail edits keep only complete prefix pools.
+        if (sq.cells.size() != sp.size() || (mem_idx_stale[s] != POS_CLEAN && !repaired_tail)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -603,11 +614,12 @@ bool llama_memory_hybrid_idx_context::next() {
     return llama_memory_hybrid_context::next();
 }
 
-bool llama_memory_hybrid_idx_context::apply() {
-    bool res = llama_memory_hybrid_context::apply();
+bool llama_memory_hybrid_idx_context::apply(bool graph_reserve) {
+    n_pool_graph = 0;
+    bool res = llama_memory_hybrid_context::apply(graph_reserve);
 
     if (ctx_idx) {
-        res = res & ctx_idx->apply();
+        res = res & ctx_idx->apply(graph_reserve);
     }
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
@@ -618,6 +630,18 @@ bool llama_memory_hybrid_idx_context::apply() {
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;
+        if (graph_reserve) {
+            const auto * idx = mem->get_mem_idx();
+            const uint64_t maximum = uint64_t(idx->get_size()) / mem->get_kpool() * idx->get_n_seq_max();
+            const uint32_t required = kpool_pad(kpool_st->n_pool_real);
+            // Aliased sequences can exceed the configured pool bound; keep their natural shape.
+            if (maximum <= UINT32_MAX - kpool_pad(0)) {
+                const uint32_t capacity = kpool_pad(uint32_t(maximum));
+                if (required <= capacity) {
+                    n_pool_graph = llama_memory_graph_extent(required, capacity, kpool_pad(0));
+                }
+            }
+        }
     }
 
     return res;
@@ -801,7 +825,8 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    const uint32_t required = kpool_pad(kpool_cur().n_pool_real);
+    return n_pool_graph ? n_pool_graph : required;
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -835,7 +860,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == get_n_kpool());
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);

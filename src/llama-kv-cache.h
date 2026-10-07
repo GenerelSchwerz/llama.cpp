@@ -201,7 +201,7 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, bool graph_reserve = false) const;
     uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // get views of the current state of the cache
@@ -422,7 +422,7 @@ public:
     //
 
     bool next()  override;
-    bool apply() override;
+    bool apply(bool graph_reserve = false) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

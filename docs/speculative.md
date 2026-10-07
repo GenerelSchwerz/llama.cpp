@@ -123,6 +123,20 @@ See:
 
 - #5479, #6828, #6848
 
+### History extension after MTP
+
+`--spec-lookup-chain N` enables experimental history replacement or extension of an MTP proposal. It is off by default. For example:
+
+```sh
+llama-server [...] --spec-type draft-mtp --spec-draft-n-max 3 --spec-lookup-chain 2
+```
+
+The lookup matches committed history against the pending sampled token. It can replace the MTP proposal when the first history token agrees with the first MTP draft, or append up to `N` history tokens after the MTP proposal. The initialized MTP limit plus `N` and the request limits bound the complete window. Pending and rejected tokens are never indexed. The target verifies the whole proposal through its existing sampler and rollback path.
+
+`--spec-lookup-chain-min N` sets the minimum matching suffix length (default: 3). Each sequence learns history acceptance by matching suffix length and draft-through-target-acceptance costs, including full-row head catch-up but excluding deferred finish-accept and server delivery. The selector uses probabilities already available from the MTP sampler, without an extra device read. These are the existing sampler candidate probabilities, not independently calibrated full-vocabulary acceptance estimates. Unknown window costs are probed only after strong matches. Repeated text can benefit; ordinary text can become slower, including the cost of larger target state reserves. Enabling this option can change outputs through different verification batch arithmetic.
+
+The implementation uses token history and initialized MTP capabilities, with no model-name gate or extra draft-model steps. Shared-KV and private-KV MTP keep their existing full-row catch-up and accepted hidden-state rules. MTP statistics count the accepted prefix that matches the original MTP proposal; history statistics count the selected history tokens, so these counters can overlap for replacements. Context, batch and output limits still bound verification. The target recurrent reserve includes `--spec-lookup-chain`; explicit capped planes still require the existing sparse-snapshot support. Other standalone n-gram modes are unchanged.
+
 ### n-gram Map (`ngram-simple`, `ngram-map-*`)
 
 These implementations search the token history for patterns and use matching sequences as draft candidates.
@@ -247,8 +261,14 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-lookup-chain                     N
+                                        maximum extra history tokens after MTP drafts (default: 0, off)
+                                        (env: LLAMA_ARG_SPEC_LOOKUP_CHAIN)
+--spec-lookup-chain-min                 N
+                                        minimum matching history suffix (default: 3)
+                                        (env: LLAMA_ARG_SPEC_LOOKUP_CHAIN_MIN)
 --spec-mtp-rs-planes                    N
-                                        total target recurrent-state planes for draft-mtp, including the current state (default: 0, use spec-draft-n-max + 1)
+                                        total target recurrent-state planes for draft-mtp, including the current state (default: 0, use spec-draft-n-max + spec-lookup-chain + 1)
                                         (env: LLAMA_ARG_SPEC_MTP_RS_PLANES)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
@@ -266,9 +286,9 @@ Use exactly one of these options:
 
 #### Capped MTP recurrent planes
 
-`--spec-mtp-rs-planes` applies only to `draft-mtp`. The default value `0` allocates `--spec-draft-n-max + 1` target recurrent-state planes. An explicit value must be in `[2, --spec-draft-n-max + 1]`; a smaller value enables capped replay. Capped replay cannot be combined with Eagle3, DFlash, or DSpark because those modes also control recurrent rollback.
+`--spec-mtp-rs-planes` applies only to `draft-mtp`. The default value `0` allocates `--spec-draft-n-max + --spec-lookup-chain + 1` target recurrent-state planes. An explicit value must be in `[2, --spec-draft-n-max + --spec-lookup-chain + 1]`; a smaller value enables capped replay. Capped replay cannot be combined with Eagle3, DFlash, or DSpark because those modes also control recurrent rollback.
 
-The effective target ubatch is `min(batch-size, ubatch-size)`, or `batch-size` when `ubatch-size` is zero. For capped replay it must be at least `--spec-draft-n-max + 1`. A nonzero draft ubatch override must equal the target ubatch.
+The effective target ubatch is `min(batch-size, ubatch-size)`, or `batch-size` when `ubatch-size` is zero. For capped replay it must be at least `--spec-draft-n-max + --spec-lookup-chain + 1`. A nonzero draft ubatch override must equal the target ubatch.
 
 Every device selected for the recurrent graph operations must support sparse snapshots. The server rejects an unsupported device layout at startup; it does not move the operations to another device or fall back to CPU.
 

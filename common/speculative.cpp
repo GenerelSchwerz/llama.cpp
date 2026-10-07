@@ -1873,6 +1873,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (dp.probabilities) { dp.probabilities->push_back(cur_p->data[0].p); }
 
                 if ((params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
@@ -2518,6 +2519,25 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    struct lookup_sequence {
+        common_ngram_history history;
+        common_ngram_chain_policy policy;
+        std::vector<float> probabilities;
+        int32_t primary = 0;
+        int32_t mtp_prefix = 0;
+        bool replacement = false;
+        size_t replacements = 0;
+        int32_t extra = 0;
+        int32_t match = 0;
+        int64_t started = 0;
+        size_t offered = 0;
+        size_t accepted = 0;
+        size_t windows = 0;
+    };
+    int32_t lookup_chain = 0;
+    int32_t lookup_chain_min = 3;
+    std::vector<lookup_sequence> lookup;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2616,6 +2636,15 @@ void common_validate_speculative_params(
     const bool has_mtp = std::find(
             params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
 
+    if (params.lookup_chain < 0 || params.lookup_chain > 1024 ||
+            params.lookup_chain_min < 3 || params.lookup_chain_min > 1024) {
+        throw std::invalid_argument("invalid history lookup chain limits");
+    }
+    if (params.lookup_chain > 0 && (!has_mtp || params.draft.n_max < 1 ||
+            int64_t(params.draft.n_max) + params.lookup_chain >= UINT16_MAX || params.has_synth())) {
+        throw std::invalid_argument("lookup chaining requires MTP drafts, a uint16 acceptance window, and real target verification");
+    }
+
     if (params.mtp_rs_planes == 0) {
         return;
     }
@@ -2628,7 +2657,7 @@ void common_validate_speculative_params(
         throw std::invalid_argument("spec-mtp-rs-planes requires spec-draft-n-max >= 1");
     }
 
-    const int64_t max_planes = int64_t(params.draft.n_max) + 1;
+    const int64_t max_planes = int64_t(params.draft.n_max) + params.lookup_chain + 1;
     if (params.mtp_rs_planes < 2 || int64_t(params.mtp_rs_planes) > max_planes) {
         throw std::invalid_argument(string_format(
                 "spec-mtp-rs-planes must be 0 or in [2, %" PRId64 "] for spec-draft-n-max=%d",
@@ -2647,10 +2676,10 @@ void common_validate_speculative_params(
     }
 
     if (params.is_mtp_rs_capped() && target_ubatch_effective > 0 &&
-            int64_t(params.draft.n_max) + 1 > target_ubatch_effective) {
+            int64_t(common_speculative_n_max(&params)) + 1 > target_ubatch_effective) {
         throw std::invalid_argument(string_format(
                 "capped spec-mtp-rs-planes requires ubatch-size >= spec-draft-n-max + 1 (%" PRId64 ")",
-                int64_t(params.draft.n_max) + 1));
+                int64_t(common_speculative_n_max(&params)) + 1));
     }
 }
 
@@ -2731,9 +2760,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
 
     for (const auto type : spec->types) {
         switch (type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max) + std::max(0, spec->lookup_chain));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
@@ -2770,7 +2801,8 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     }
 
     for (const auto & impl : spec->impls) {
-        n_max = std::max(n_max, std::max(0, impl->n_max));
+        n_max = std::max(n_max, std::max(0, impl->n_max) +
+                (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ? spec->lookup_chain : 0));
     }
 
     return n_max;
@@ -2862,6 +2894,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+    result.moe_expert_profile = params_spec.moe_expert_profile;
+    result.moe_profile_adaptation = params_spec.moe_profile_adaptation;
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
@@ -2949,6 +2983,11 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    if (!params.speculative.draft.mtp_draft_vocab.empty() && !spec_mtp) {
+        LOG_ERR("%s: --mtp-draft-vocab requires draft-mtp\n", __func__);
+        return;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -2981,7 +3020,8 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
-        llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
+        llama_context * ctx_dft = params.moe_expert_profile.empty() ? llama_init_from_model(model_dft, cparams) :
+            llama_init_from_model_with_moe_profile(model_dft, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -2993,13 +3033,25 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
-        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
+        llama_context * ctx_dft = params.moe_expert_profile.empty() ? llama_init_from_model(model_tgt, cparams) :
+            llama_init_from_model_with_moe_profile(model_tgt, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
         }
 
         pimpl->context.reset(ctx_dft);
+    }
+
+    if (!params.speculative.draft.mtp_draft_vocab.empty() && (!pimpl->context ||
+            !llama_set_mtp_draft_vocab(pimpl->context.get(), params.speculative.draft.mtp_draft_vocab.c_str()))) {
+        LOG_ERR("%s: failed to configure --mtp-draft-vocab\n", __func__);
+        pimpl->context.reset();
+        return;
+    }
+    if (!params.speculative.draft.mtp_draft_vocab.empty()) {
+        LOG_INF("%s: MTP draft vocabulary: opt-in sidecar %s; normal sampler/confidence policy\n",
+                __func__, params.speculative.draft.mtp_draft_vocab.c_str());
     }
 
     if (pimpl->context && spec_mtp && params.phase_aware_workspace) {
@@ -3043,6 +3095,12 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    if (params.lookup_chain > 0) {
+        common_validate_speculative_params(params, 0);
+        if (!params.draft.ctx_tgt || !params.draft.ctx_dft) {
+            throw std::invalid_argument("lookup chaining requires initialized target and MTP contexts");
+        }
+    }
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -3159,6 +3217,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    result->lookup_chain = params.lookup_chain;
+    result->lookup_chain_min = params.lookup_chain_min;
+    if (result->lookup_chain > 0) {
+        result->lookup.resize(n_seq);
+        const int32_t limit = common_speculative_n_max(result.get());
+        for (auto & sequence : result->lookup) {
+            sequence.policy = common_ngram_chain_policy(limit);
+        }
+    }
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -3209,6 +3277,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    if (!spec->lookup.empty()) {
+        spec->lookup.at(seq_id) = {};
+        spec->lookup.at(seq_id).policy = common_ngram_chain_policy(common_speculative_n_max(spec));
+        spec->lookup.at(seq_id).history.update(prompt);
+    }
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->discard_draft_overlap(seq_id);
@@ -3260,6 +3333,20 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    if (!spec->lookup.empty()) {
+        const int64_t started = ggml_time_us();
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            if (dparams[i].drafting) {
+                auto & sequence = spec->lookup[i];
+                sequence.primary = 0;
+                sequence.extra = 0;
+                sequence.replacement = false;
+                sequence.probabilities.clear();
+                dparams[i].probabilities = &sequence.probabilities;
+                spec->lookup[i].started = started;
+            }
+        }
+    }
     for (auto & impl : spec->impls) {
         if (impl->n_max == 0) {
             continue;
@@ -3303,6 +3390,40 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+                    if (!spec->lookup.empty() && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                        auto & sequence = spec->lookup[seq_id];
+                        sequence.primary = int32_t(result.size());
+                        sequence.mtp_prefix = sequence.primary;
+                        sequence.extra = 0;
+                        if (dp.prompt && dp.id_last >= 0) {
+                            sequence.history.update(*dp.prompt);
+                            const int32_t limit = dp.n_max >= 0 ? std::min(dp.n_max, impl->n_max + spec->lookup_chain) : impl->n_max + spec->lookup_chain;
+                            auto replacement = sequence.history.propose({dp.id_last}, limit, spec->lookup_chain_min, sequence.match);
+                            const int32_t replace = !replacement.empty() && replacement[0] == result[0] ?
+                                    sequence.policy.choose_replacement(sequence.primary, int32_t(replacement.size()), sequence.match, sequence.probabilities) : 0;
+                            if (replace > 0) {
+                                sequence.mtp_prefix = int32_t(std::mismatch(result.begin(), result.end(), replacement.begin(), replacement.begin() + replace).first - result.begin());
+                                result.assign(replacement.begin(), replacement.begin() + replace);
+                                sequence.replacement = true;
+                                sequence.extra = replace;
+                                sequence.replacements++;
+                            } else {
+                                llama_tokens pending = { dp.id_last };
+                                pending.insert(pending.end(), result.begin(), result.end());
+                                auto extension = sequence.history.propose(pending, std::min(limit - sequence.primary, spec->lookup_chain),
+                                        spec->lookup_chain_min, sequence.match);
+                                const int32_t count = sequence.policy.choose(sequence.primary, int32_t(extension.size()), sequence.match, sequence.probabilities);
+                                result.insert(result.end(), extension.begin(), extension.begin() + count);
+                                sequence.extra = count;
+                            }
+                            sequence.offered += sequence.extra;
+                            sequence.windows += sequence.extra > 0;
+                            if (sequence.extra > 0) {
+                                SPC_DBG("history chain: seq=%d primary=%d extra=%d match=%d replacement=%d\n",
+                                        int(seq_id), sequence.primary, sequence.extra, sequence.match, int(sequence.replacement));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3350,20 +3471,31 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         return;
     }
 
+    uint16_t primary_accepted = n_accepted;
+    if (!spec->lookup.empty() && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        auto & sequence = spec->lookup[seq_id];
+        if (sequence.primary > 0) {
+            primary_accepted = uint16_t(std::min<int32_t>(n_accepted, sequence.mtp_prefix));
+            sequence.policy.observe(sequence.primary, sequence.extra, n_accepted, sequence.match,
+                    double(ggml_time_us() - sequence.started) / 1000.0, sequence.replacement);
+            sequence.accepted += sequence.replacement ? n_accepted : std::max(0, int32_t(n_accepted) - sequence.primary);
+            sequence.primary = 0;
+        }
+    }
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
-        if (impl->n_acc_tokens_per_pos.size() < n_accepted) {
-            impl->n_acc_tokens_per_pos.resize(n_accepted, 0);
+        if (impl->n_acc_tokens_per_pos.size() < primary_accepted) {
+            impl->n_acc_tokens_per_pos.resize(primary_accepted, 0);
         }
 
-        for (size_t i = 0; i < n_accepted; ++i) {
+        for (size_t i = 0; i < primary_accepted; ++i) {
             impl->n_acc_tokens_per_pos[i]++;
         }
 
-        if (n_accepted > 0) {
+        if (primary_accepted > 0) {
             impl->n_acc_drafts++;
-            impl->n_acc_tokens += n_accepted;
+            impl->n_acc_tokens += primary_accepted;
         }
 
         impl->accept(seq_id, n_accepted, false);
@@ -3453,6 +3585,9 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
         return;
     }
 
+    if (!spec->lookup.empty()) {
+        spec->lookup.at(seq_id).history.clear();
+    }
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
@@ -3495,6 +3630,9 @@ bool common_speculative_set_mtp_state(
 
     for (auto & impl : spec->impls) {
         if (impl->set_mtp_replay_state(seq_id, data)) {
+            if (!spec->lookup.empty()) {
+                spec->lookup.at(seq_id).history.clear();
+            }
             return true;
         }
     }
@@ -3507,6 +3645,11 @@ void common_speculative_print_stats(const common_speculative * spec) {
         return;
     }
 
+    for (size_t seq_id = 0; seq_id < spec->lookup.size(); ++seq_id) {
+        const auto & sequence = spec->lookup[seq_id];
+        SPC_INF("history chain: seq=%zu windows=%zu offered=%zu accepted=%zu replacements=%zu\n",
+                seq_id, sequence.windows, sequence.offered, sequence.accepted, sequence.replacements);
+    }
     for (const auto & impl : spec->impls) {
         std::string str_perf;
         if (impl->gen_perf) {

@@ -62,8 +62,9 @@ struct llama_memory_context_i {
     virtual bool next() = 0;
 
     // apply the memory state for the current ubatch to the memory object
+    // graph_reserve pads graph views within existing backing for reuse; logical state stays unchanged
     // return false on failure
-    virtual bool apply() = 0;
+    virtual bool apply(bool graph_reserve = false) = 0;
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
@@ -160,3 +161,6 @@ struct llama_memory_i {
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+
+// Grow a graph view geometrically without exceeding its existing backing.
+uint32_t llama_memory_graph_extent(uint32_t required, uint32_t capacity, uint32_t padding);

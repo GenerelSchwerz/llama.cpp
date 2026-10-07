@@ -114,9 +114,12 @@ if (CUDAToolkit_FOUND)
     add_compile_definitions(GGML_CUDA_COMPACT_CAUSAL_MASK)
 
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
-    list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+    list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h" "moe-caller-schedule.h")
 
     file(GLOB   GGML_SOURCES_CUDA CONFIGURE_DEPENDS "*.cu")
+    list(APPEND GGML_SOURCES_CUDA "moe-caller-schedule.cpp")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe-reference.cu")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe-source-tail.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -133,6 +136,19 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_GRAPHS AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.3")
+        add_library(ggml-cuda-moe-tail STATIC moe-source-tail.cu)
+        set_target_properties(ggml-cuda-moe-tail PROPERTIES
+            CUDA_STANDARD 17
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+            CUDA_RUNTIME_LIBRARY Shared
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(ggml-cuda-moe-tail PRIVATE GGML_CUDA_MOE_DEVICE_TAIL)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_DEVICE_TAIL)
+        target_link_libraries(ggml-cuda PRIVATE ggml-cuda-moe-tail)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -264,7 +280,19 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
 
+    add_library(ggml-cuda-moe-reference OBJECT moe-reference.cu)
+    set_target_properties(ggml-cuda-moe-reference PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(ggml-cuda-moe-reference PRIVATE cxx_std_17)
+    target_include_directories(ggml-cuda-moe-reference PRIVATE . .. ../../include)
+    target_link_libraries(ggml-cuda-moe-reference PRIVATE ggml-base CUDA::toolkit)
+    target_compile_definitions(ggml-cuda-moe-reference PRIVATE GGML_USE_CUDA)
+    # Reference IQ arithmetic uses no -use_fast_math.
+    target_compile_options(ggml-cuda-moe-reference PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>")
+    target_link_libraries(ggml-cuda PRIVATE ggml-cuda-moe-reference)
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    if (TARGET ggml-cuda-moe-tail)
+        target_compile_options(ggml-cuda-moe-tail PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

@@ -2,6 +2,8 @@
 #include "log.h"
 #include "ngram-map.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -533,4 +535,185 @@ void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted) {
     LOG_DBG("common_ngram_map_send_accepted: n_accepted = %d, prev value_num = %d\n",
             n_accepted, curr_value.n_accepted);
     curr_value.n_accepted = n_accepted;
+}
+
+static uint64_t common_ngram_history_hash(llama_token a, llama_token b, llama_token c) {
+    uint64_t hash = uint32_t(a);
+    hash = (hash ^ uint32_t(b)) * 1099511628211ULL;
+    return (hash ^ uint32_t(c)) * 1099511628211ULL;
+}
+
+void common_ngram_history::clear() {
+    history.clear();
+    positions.clear();
+}
+
+void common_ngram_history::update(const llama_tokens & tokens) {
+    if (tokens.size() < history.size() || !std::equal(history.begin(), history.end(), tokens.begin())) {
+        clear();
+    }
+    const size_t first = history.size();
+    history.insert(history.end(), tokens.begin() + first, tokens.end());
+    for (size_t end = std::max(size_t(2), first); end < history.size(); ++end) {
+        const uint64_t hash = common_ngram_history_hash(history[end - 2], history[end - 1], history[end]);
+        auto & entries = positions[hash];
+        for (size_t i = entries.size() - 1; i > 0; --i) {
+            entries[i] = entries[i - 1];
+        }
+        entries[0] = end;
+    }
+}
+
+llama_tokens common_ngram_history::propose(
+        const llama_tokens & pending, int32_t n_max, int32_t min_match, int32_t & match) const {
+    match = 0;
+    if (n_max <= 0 || min_match < 3 || pending.empty() || pending.size() > SIZE_MAX - history.size()) {
+        return {};
+    }
+    const size_t size = history.size() + pending.size();
+    if (size < size_t(min_match)) {
+        return {};
+    }
+    auto token_at = [&](size_t pos) {
+        return pos < history.size() ? history[pos] : pending[pos - history.size()];
+    };
+    const uint64_t hash = common_ngram_history_hash(token_at(size - 3), token_at(size - 2), token_at(size - 1));
+    const auto found = positions.find(hash);
+    if (found == positions.end()) {
+        return {};
+    }
+    size_t best_end = 0;
+    size_t best_match = 0;
+    for (const size_t end : found->second) {
+        if (end < 2 || end + 1 >= history.size()) {
+            continue;
+        }
+        size_t len = 0;
+        while (len <= end && len < size && history[end - len] == token_at(size - 1 - len)) {
+            ++len;
+        }
+        if (len > best_match) {
+            best_match = len;
+            best_end = end;
+        }
+    }
+    if (best_match < size_t(min_match)) {
+        return {};
+    }
+    match = int32_t(std::min(best_match, size_t(INT32_MAX)));
+    const size_t count = std::min(size_t(n_max), history.size() - best_end - 1);
+    return llama_tokens(history.begin() + best_end + 1, history.begin() + best_end + 1 + count);
+}
+
+common_ngram_chain_policy::common_ngram_chain_policy(int32_t n_max)
+    : costs(size_t(std::max(0, n_max)) + 1, 0.0),
+      primary_tokens(costs.size(), 0.0), observations(costs.size(), 0) {}
+
+double common_ngram_chain_policy::cost(int32_t n) const {
+    if (costs[n] > 0.0) {
+        return costs[n];
+    }
+    size_t lo = size_t(n), hi = size_t(n);
+    while (lo > 0 && costs[lo] <= 0.0) { --lo; }
+    while (hi + 1 < costs.size() && costs[hi] <= 0.0) { ++hi; }
+    if (costs[lo] > 0.0 && costs[hi] > 0.0) {
+        return costs[lo] + (costs[hi] - costs[lo]) * double(size_t(n) - lo) / double(hi - lo);
+    }
+    if (costs[lo] > 0.0) { return costs[lo] * double(n + 1) / double(lo + 1); }
+    if (costs[hi] > 0.0) { return costs[hi] * double(n + 1) / double(hi + 1); }
+    return double(n + 1);
+}
+
+static int32_t history_match_bucket(int32_t match) {
+    int32_t bucket = 0;
+    while (match > 1) { match /= 2; ++bucket; }
+    return bucket;
+}
+
+double common_ngram_chain_policy::probability(int32_t match, bool replacement) const {
+    const auto & outcomes = replacement ? replacement_acceptance : chain_acceptance;
+    const auto found = outcomes.find(history_match_bucket(match));
+    const double prior = 1.0 - 1.0 / (double(match) + 1.0);
+    if (found == outcomes.end()) { return prior; }
+    return (found->second.ok + 2.0 * prior) / (found->second.ok + found->second.bad + 2.0);
+}
+
+double common_ngram_chain_policy::expected_primary(
+        int32_t primary, const std::vector<float> & probabilities, double & prefix) const {
+    prefix = 1.0;
+    double expected = 1.0;
+    for (int32_t i = 0; i < primary; ++i) {
+        const double p = size_t(i) < probabilities.size() ? probabilities[i] : 0.8;
+        prefix *= std::isfinite(p) ? std::max(0.0, std::min(1.0, p)) : 0.0;
+        expected += prefix;
+    }
+    if (probabilities.empty() && primary_tokens[primary] > 0.0) {
+        expected = primary_tokens[primary];
+    }
+    return expected;
+}
+
+int32_t common_ngram_chain_policy::choose(
+        int32_t primary, int32_t available, int32_t match, const std::vector<float> & probabilities) const {
+    if (primary <= 0 || size_t(primary) >= costs.size() || available <= 0 || match < 3) { return 0; }
+    const int32_t limit = std::min(available, int32_t(costs.size() - 1) - primary);
+    const double q = probability(match, false);
+    double prefix;
+    const double expected = expected_primary(primary, probabilities, prefix);
+    double best_rate = expected / cost(primary) * 1.03;
+    double run = q, added = 0.0;
+    int32_t best = 0;
+    for (int32_t k = 1; k <= limit; ++k) {
+        added += run;
+        run *= q;
+        const double rate = (expected + prefix * added) / cost(primary + k);
+        if (rate > best_rate) { best_rate = rate; best = k; }
+    }
+    // Probe strong matches once per unseen shape. Short matches need measured benefit.
+    if (best == 0 && limit > 0 && observations[primary + limit] == 0 && q >= 0.9 && prefix >= 0.5) {
+        return limit;
+    }
+    return best;
+}
+
+int32_t common_ngram_chain_policy::choose_replacement(
+        int32_t primary, int32_t available, int32_t match, const std::vector<float> & probabilities) const {
+    if (primary <= 0 || size_t(primary) >= costs.size() || available < primary || match < 3) { return 0; }
+    const int32_t limit = std::min(available, int32_t(costs.size() - 1));
+    const double q = probability(match, true);
+    double prefix;
+    double best_rate = expected_primary(primary, probabilities, prefix) / cost(primary) * 1.03;
+    double run = q, expected = 1.0;
+    int32_t best = 0;
+    for (int32_t k = 1; k <= limit; ++k) {
+        expected += run;
+        run *= q;
+        if (k >= primary && expected / cost(k) > best_rate) {
+            best_rate = expected / cost(k); best = k;
+        }
+    }
+    if (best < limit && limit > primary && observations[limit] == 0 && q >= 0.9) { return limit; }
+    return best;
+}
+
+void common_ngram_chain_policy::observe(
+        int32_t primary, int32_t extra, int32_t accepted, int32_t match, double round_ms, bool replacement) {
+    const int64_t total = replacement ? extra : int64_t(primary) + extra;
+    if (primary <= 0 || size_t(primary) >= costs.size() || extra < 0 || total < 1 || total >= int64_t(costs.size()) ||
+            accepted < 0 || accepted > total || !std::isfinite(round_ms) || round_ms <= 0.0) { return; }
+    auto & measured = costs[size_t(total)];
+    measured = measured > 0.0 ? 0.9 * measured + 0.1 * round_ms : round_ms;
+    if (observations[size_t(total)] < UINT32_MAX) { ++observations[size_t(total)]; }
+    if (!replacement) {
+        auto & tokens = primary_tokens[primary];
+        const double committed = 1.0 + std::min(primary, accepted);
+        tokens = tokens > 0.0 ? 0.95 * tokens + 0.05 * committed : committed;
+    }
+    const int32_t offset = replacement ? 0 : primary;
+    if (extra > 0 && accepted >= offset && match >= 3) {
+        auto & outcomes = replacement ? replacement_acceptance : chain_acceptance;
+        auto & a = outcomes[history_match_bucket(match)];
+        a.ok = 0.97 * a.ok + accepted - offset;
+        a.bad = 0.97 * a.bad + (accepted < total ? 1.0 : 0.0);
+    }
 }

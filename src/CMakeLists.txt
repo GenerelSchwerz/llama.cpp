@@ -16,6 +16,7 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-context-overlap.cpp
+    llama-draft-vocab.cpp
     llama-staged-input.cpp
     llama-cparams.cpp
     llama-grammar.cpp

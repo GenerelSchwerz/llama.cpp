@@ -1836,18 +1836,18 @@ bool llama_kv_cache_dsv4_raw_context::next() {
     return true;
 }
 
-bool llama_kv_cache_dsv4_raw_context::apply() {
+bool llama_kv_cache_dsv4_raw_context::apply(bool graph_reserve) {
     bool res = true;
 
     if (ctx_base_mem) {
-        res = res & ctx_base_mem->apply();
+        res = res & ctx_base_mem->apply(graph_reserve);
     }
     if (ctx_swa_mem) {
-        res = res & ctx_swa_mem->apply();
+        res = res & ctx_swa_mem->apply(graph_reserve);
     }
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
-        n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+        n_kv = kv_swa->get_n_kv(sinfos_read[i_next], graph_reserve);
     }
 
     return res;
@@ -2104,17 +2104,17 @@ bool llama_kv_cache_dsv4_context::next() {
     return true;
 }
 
-bool llama_kv_cache_dsv4_context::apply() {
+bool llama_kv_cache_dsv4_context::apply(bool graph_reserve) {
     assert(!llama_memory_status_is_fail(status));
 
     bool res = true;
 
-    res = res & ctx_raw->apply();
+    res = res & ctx_raw->apply(graph_reserve);
 
     if (ctx_csa_mem) {
-        res = res & ctx_csa_mem->apply();
-        res = res & ctx_hca_mem->apply();
-        res = res & ctx_lid_mem->apply();
+        res = res & ctx_csa_mem->apply(graph_reserve);
+        res = res & ctx_hca_mem->apply(graph_reserve);
+        res = res & ctx_lid_mem->apply(graph_reserve);
     }
 
     if (ubatches.empty()) {

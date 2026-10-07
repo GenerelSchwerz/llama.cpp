@@ -406,19 +406,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
         if (buffer == nullptr) {
             return nullptr;
         }
-        if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
-            auto * wrapped = moe_host_buffer_wrap(buft, buffer, false, true);
-            if (wrapped != nullptr) {
-                return wrapped;
-            }
-            buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-            if (buffer == nullptr) {
-                return nullptr;
-            }
-        }
-        // Keep CUDA cache dispatch and the CPU backing's deallocator.
-        buffer->buft = buft;
-        return buffer;
+        return moe_host_buffer_wrap(buft, buffer, false, getenv("GGML_CUDA_NO_PINNED") == nullptr);
     }
 
     std::unique_ptr<void, decltype(&cudaFreeHost)> allocation(ptr, cudaFreeHost);
@@ -476,6 +464,19 @@ void * ggml_backend_cuda_moe_cached_writable_load_data(ggml_backend_buffer_t buf
 }
 
 extern "C"
+bool ggml_backend_cuda_moe_cached_readable_source(ggml_backend_buffer_t buffer, const void * data, size_t size) {
+    if (buffer == nullptr || data == nullptr || size == 0 || !ggml_backend_buft_is_cuda_moe_cached(buffer->buft) ||
+            (buffer->iface.free_buffer != moe_host_buffer_free &&
+             buffer->iface.free_buffer != ggml_backend_cuda_moe_cached_buffer_free_buffer)) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+    const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+    return base != 0 && address >= base && address - base <= buffer->size &&
+           size <= buffer->size - (address - base);
+}
+
+extern "C"
 void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail) {
     g_fail_full_pinning_for_test.store(fail, std::memory_order_relaxed);
 }
@@ -505,16 +506,7 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
 
 extern "C"
 ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
-    if (moe_host_budget_for(buft) != nullptr) {
-        return moe_host_buffer_wrap(buft, ggml_backend_cpu_buffer_from_ptr(ptr, size), true);
-    }
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    if (buffer == nullptr) {
-        return nullptr;
-    }
-
-    buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
-    return buffer;
+    return moe_host_buffer_wrap(buft, ggml_backend_cpu_buffer_from_ptr(ptr, size), true);
 }
 
 extern "C"

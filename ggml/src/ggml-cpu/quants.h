@@ -11,6 +11,15 @@
 extern "C" {
 #endif
 
+struct ggml_cpu_q8_1_prepared {
+    float deltas[QK_K / 32];
+    float sums[QK_K / 32];
+    int8_t qs[QK_K];
+};
+
+void quantize_row_q8_1_prepared(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void ggml_vec_dot_q5_K_q8_1_prepared(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx, const void * GGML_RESTRICT y, size_t by, int nrc);
+
 // Quantization
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

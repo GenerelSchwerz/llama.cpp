@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+    // False leaves this MUL_MAT_ID output route untouched. Complete all routes before consuming the output.
+    typedef bool (*ggml_cpu_mmid_route_filter)(const struct ggml_tensor * op,
+        int64_t token_row, int64_t route_column, int32_t expert_id, void * user_data);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {
@@ -25,6 +29,10 @@ extern "C" {
 
         ggml_backend_get_rows_callback get_rows_callback;
         void * get_rows_callback_data;
+
+        // Called by the grouping worker; user data must remain valid until compute returns.
+        ggml_cpu_mmid_route_filter mmid_route_filter;
+        void * mmid_route_filter_data;
     };
 
     // numa strategies
@@ -140,6 +148,10 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+
+    // Set between executions. Graph storage, tensors, buffers, threadpool and callback data remain borrowed.
+    GGML_BACKEND_API bool ggml_backend_cpu_graph_plan_set_mmid_route_filter(ggml_backend_t backend_cpu,
+        ggml_backend_graph_plan_t plan, ggml_cpu_mmid_route_filter filter, void * user_data);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

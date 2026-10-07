@@ -1,4 +1,6 @@
 #include "argsort.cuh"
+#include "top-k.cuh"
+#include "ggml-backend-impl.h"
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -304,4 +306,214 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else
     argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
 #endif
+}
+
+namespace ggml_cuda_source_sort_detail {
+
+bool metadata(int device, const ggml_tensor * dst, ggml_op op, ggml_cuda_source_sort_resources & resources, int & ncols, int & nrows) {
+    resources = {};
+    int selected = -1;
+    if (device < 0 || device >= ggml_cuda_info().device_count || cudaGetDevice(&selected) != cudaSuccess || selected != device ||
+            !dst || dst->op != op || !dst->src[0] || dst->type != GGML_TYPE_I32 || dst->src[0]->type != GGML_TYPE_F32) { return false; }
+    const auto * src = dst->src[0];
+    uint64_t elements[2] = {1, 1};
+    for (int t = 0; t < 2; ++t) {
+        const auto * tensor = t ? dst : src;
+        size_t stride = sizeof(int32_t);
+        for (int i = 0; i < 4; ++i) {
+            if (tensor->ne[i] <= 0 || tensor->ne[i] > INT32_MAX || tensor->nb[i] != stride ||
+                    uint64_t(tensor->ne[i]) > uint64_t(INT32_MAX) / elements[t] ||
+                    size_t(tensor->ne[i]) > SIZE_MAX / stride) { return false; }
+            elements[t] *= uint64_t(tensor->ne[i]); stride *= size_t(tensor->ne[i]);
+        }
+    }
+    if (src->ne[0] > (1 << 30) || dst->ne[0] > src->ne[0]) { return false; }
+    for (int i = 1; i < 4; ++i) {
+        if (src->ne[i] != dst->ne[i]) { return false; }
+    }
+    ncols = int(src->ne[0]); nrows = int(elements[0] / uint64_t(ncols));
+    const auto & info = ggml_cuda_info().devices[device];
+    uint64_t identity = 14695981039346656037ULL;
+    for (uint64_t value : {uint64_t(device), uint64_t(info.cc), uint64_t(info.smpb), uint64_t(info.nsm),
+            uint64_t(op), uint64_t(src->type), uint64_t(dst->type)}) { mix(identity, value); }
+    for (const auto * tensor : {src, dst}) {
+        for (int i = 0; i < 4; ++i) { mix(identity, uint64_t(tensor->ne[i])); mix(identity, tensor->nb[i]); }
+        const auto * params = reinterpret_cast<const unsigned char *>(tensor->op_params);
+        for (size_t i = 0; i < sizeof(tensor->op_params); ++i) { mix(identity, params[i]); }
+    }
+#ifdef GGML_CUDA_USE_CUB
+    mix(identity, 1);
+    mix(identity, CCCL_MAJOR_VERSION); mix(identity, CCCL_MINOR_VERSION);
+#else
+    mix(identity, 0);
+#endif
+#ifdef USE_CUDA_GRAPH
+    mix(identity, 1);
+#else
+    mix(identity, 0);
+#endif
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || nrows > prop.maxGridSize[0]) { return false; }
+    for (uint64_t value : {uint64_t(prop.maxThreadsPerBlock), uint64_t(prop.maxGridSize[0]), uint64_t(prop.maxGridSize[1]),
+            uint64_t(prop.sharedMemPerBlock), uint64_t(prop.warpSize)}) { mix(identity, value); }
+    resources.identity = identity;
+    return true;
+}
+
+} // namespace ggml_cuda_source_sort_detail
+
+bool ggml_cuda_argsort_prepare_resources(int device, const ggml_tensor * dst, ggml_cuda_source_sort_resources & resources) {
+    using namespace ggml_cuda_source_sort_detail;
+    resources = {};
+    ggml_cuda_source_sort_resources measured;
+    int ncols = 0, nrows = 0;
+    if (!metadata(device, dst, GGML_OP_ARGSORT, measured, ncols, nrows) || dst->ne[0] != ncols) { return false; }
+    const auto order = ggml_sort_order(dst->op_params[0]);
+    if (order != GGML_SORT_ORDER_ASC && order != GGML_SORT_ORDER_DESC) { return false; }
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) { return false; }
+    const int padded = next_power_of_2(ncols);
+    const bool bitonic = ncols <= 1024 && size_t(padded) * sizeof(int) <= ggml_cuda_info().devices[device].smpb;
+    mix(measured.identity, bitonic);
+    if (bitonic) {
+        if (padded > prop.maxThreadsPerBlock || size_t(padded) * sizeof(int) > prop.sharedMemPerBlock) { return false; }
+        resources = measured; return true;
+    }
+#ifdef GGML_CUDA_USE_CUB
+    const int chunk = argsort_f32_i32_cuda_cub_chunk_nrows(dst->src[0]->nb[1], nrows);
+    if (chunk <= 0 || ncols > INT32_MAX / chunk || chunk > prop.maxGridSize[1] ||
+            (ncols + 255) / 256 > prop.maxGridSize[0]) { return false; }
+    mix(measured.identity, chunk);
+    const int remainder = nrows % chunk;
+    for (int rows : {chunk, remainder}) {
+        if (!rows) { continue; }
+        const int items = ncols * rows;
+        size_t arrays = 0;
+        for (int i = 0; i < 3; ++i) { if (!add(arrays, size_t(items) * sizeof(int32_t))) { return false; } }
+#ifdef STRIDED_ITERATOR_AVAILABLE
+        auto offsets = cuda::make_strided_iterator(cuda::make_counting_iterator(0), ncols);
+#else
+        if (rows == INT32_MAX || !add(arrays, size_t(rows + 1) * sizeof(int))) { return false; }
+        const int * offsets = reinterpret_cast<const int *>(uintptr_t(256));
+#endif
+        for (bool capture : {false, true}) {
+#ifndef USE_CUDA_GRAPH
+            if (capture) { continue; }
+#endif
+            size_t temp = 0;
+            cudaError_t result;
+            float * keys = nullptr;
+            int * indices = nullptr;
+            if (rows == 1) {
+                result = order == GGML_SORT_ORDER_ASC ?
+                    cub::DeviceRadixSort::SortPairs(nullptr, temp, keys, keys, indices, indices, ncols, 0, sizeof(float)*8) :
+                    cub::DeviceRadixSort::SortPairsDescending(nullptr, temp, keys, keys, indices, indices, ncols, 0, sizeof(float)*8);
+            } else if (capture) {
+                result = order == GGML_SORT_ORDER_ASC ?
+                    cub::DeviceSegmentedRadixSort::SortPairs(nullptr, temp, keys, keys, indices, indices, items, rows, offsets, offsets + 1, 0, sizeof(float)*8) :
+                    cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, temp, keys, keys, indices, indices, items, rows, offsets, offsets + 1, 0, sizeof(float)*8);
+            } else {
+                result = order == GGML_SORT_ORDER_ASC ?
+                    cub::DeviceSegmentedSort::SortPairs(nullptr, temp, keys, keys, indices, indices, items, rows, offsets, offsets + 1) :
+                    cub::DeviceSegmentedSort::SortPairsDescending(nullptr, temp, keys, keys, indices, indices, items, rows, offsets, offsets + 1);
+            }
+            if (result != cudaSuccess) { return false; }
+            size_t peak = arrays;
+            if (!add(peak, temp)) { return false; }
+            measured.pool_bytes = std::max(measured.pool_bytes, peak);
+            mix(measured.identity, rows); mix(measured.identity, capture); mix(measured.identity, temp);
+        }
+    }
+    resources = measured; return true;
+#else
+    return false;
+#endif
+}
+
+namespace {
+struct source_sort_test_pool : ggml_cuda_pool {
+    char * data;
+    size_t capacity, used = 0, peak = 0;
+    source_sort_test_pool(void * data, size_t capacity) : data(static_cast<char *>(data)), capacity(capacity) {}
+    void * alloc(size_t bytes, size_t * actual) override {
+        size_t aligned = 0;
+        if (!ggml_cuda_source_sort_detail::add(aligned, bytes) || aligned > capacity - used) { throw std::bad_alloc(); }
+        *actual = aligned;
+        void * result = data + used;
+        used += aligned; peak = std::max(peak, used);
+        return result;
+    }
+    void free(void * ptr, size_t bytes) override {
+        GGML_ASSERT(bytes <= used && ptr == data + used - bytes);
+        used -= bytes;
+    }
+};
+}
+
+bool ggml_cuda_source_sort_capture_for_test(int device, ggml_tensor * dst,
+        ggml_backend_buffer * scratch, size_t capacity, ggml_cuda_source_sort_test_result & result) {
+    result = {};
+    ggml_cuda_source_sort_resources resources;
+    if (!dst || (dst->op != GGML_OP_ARGSORT && dst->op != GGML_OP_TOP_K) ||
+            !(dst->op == GGML_OP_TOP_K ? ggml_cuda_top_k_prepare_resources(device, dst, resources) :
+                ggml_cuda_argsort_prepare_resources(device, dst, resources)) ||
+            capacity < resources.pool_bytes || !scratch || scratch->buft != ggml_backend_cuda_buffer_type(device) ||
+            capacity > ggml_backend_buffer_get_size(scratch) ||
+            reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch)) % 256) { return false; }
+    for (const auto * tensor : {static_cast<const ggml_tensor *>(dst->src[0]), static_cast<const ggml_tensor *>(dst)}) {
+        if (!tensor->buffer || tensor->buffer->buft != ggml_backend_cuda_buffer_type(device)) { return false; }
+        const auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(tensor->buffer));
+        const auto p = reinterpret_cast<uintptr_t>(tensor->data);
+        const auto bytes = ggml_backend_buffer_get_size(tensor->buffer);
+        if (!p || p < base || p - base > bytes || ggml_nbytes(tensor) > bytes - (p - base)) { return false; }
+    }
+    const auto in = reinterpret_cast<uintptr_t>(dst->src[0]->data), out = reinterpret_cast<uintptr_t>(dst->data);
+    const auto work = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(scratch));
+    const auto in_bytes = ggml_nbytes(dst->src[0]), out_bytes = ggml_nbytes(dst);
+    if (in_bytes > UINTPTR_MAX - in || out_bytes > UINTPTR_MAX - out || capacity > UINTPTR_MAX - work ||
+            (in < out + out_bytes && out < in + in_bytes) ||
+            (work < in + in_bytes && in < work + capacity) ||
+            (work < out + out_bytes && out < work + capacity)) { return false; }
+    ggml_backend_cuda_context context(device);
+    auto pool = std::make_unique<source_sort_test_pool>(reinterpret_cast<void *>(work), capacity);
+    auto * measured = pool.get();
+    context.pools[device][0] = std::move(pool);
+    const auto stream = context.stream();
+    const auto compute = [&] { dst->op == GGML_OP_TOP_K ? ggml_cuda_op_top_k(context, dst) : ggml_cuda_op_argsort(context, dst); };
+    compute();
+    if (cudaStreamSynchronize(stream) != cudaSuccess || measured->used) { return false; }
+    result.eager_peak = measured->peak; measured->peak = 0;
+#ifdef USE_CUDA_GRAPH
+    struct capture_guard {
+        cudaStream_t stream;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        bool capturing = false;
+        ~capture_guard() {
+            if (capturing) { (void) cudaStreamEndCapture(stream, &graph); }
+            if (exec) { (void) cudaGraphExecDestroy(exec); }
+            if (graph) { (void) cudaGraphDestroy(graph); }
+        }
+    } capture{stream};
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { return false; }
+    capture.capturing = true;
+    compute();
+    const auto ended = cudaStreamEndCapture(stream, &capture.graph);
+    capture.capturing = false;
+    if (ended != cudaSuccess || !capture.graph || measured->used ||
+            cudaGraphInstantiate(&capture.exec, capture.graph, nullptr, nullptr, 0) != cudaSuccess) { return false; }
+    result.capture_peak = measured->peak;
+    for (int replay = 0; replay < 2; ++replay) {
+        if (cudaGraphLaunch(capture.exec, stream) != cudaSuccess) { return false; }
+        ++result.replays;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return false; }
+#endif
+    if (capacity <= SIZE_MAX - 256) {
+        size_t actual = 0;
+        bool rejected = false;
+        try { (void) measured->alloc(capacity + 256, &actual); } catch (const std::bad_alloc &) { rejected = true; }
+        if (!rejected || measured->used) { return false; }
+    }
+    return result.eager_peak <= capacity && result.capture_peak <= capacity;
 }

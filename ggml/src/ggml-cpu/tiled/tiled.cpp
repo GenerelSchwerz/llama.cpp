@@ -652,7 +652,9 @@ static size_t ggml_tiled_ws_size(void) {
 }
 
 size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst) {
-    if (! ggml_tiled_supported(dst->src[0], dst->src[1])) {
+    struct ggml_cpu_mul_mat_kernel kernel;
+    if (!ggml_cpu_get_mul_mat_kernel(dst, &kernel) || kernel.prepared ||
+            !ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return 0; // unsupported, don't allocate
     }
     return 64 + n_tasks * ggml_tiled_ws_size();  // 64 for alignment plus one 512KB slot per thread
@@ -1213,7 +1215,9 @@ bool ggml_compute_forward_mul_mat_tiled(
     if (params->use_ref) {
         return false;
     }
-    if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {
+    struct ggml_cpu_mul_mat_kernel kernel;
+    if (!ggml_cpu_get_mul_mat_kernel(dst, &kernel) || kernel.prepared ||
+            !ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return false;
     }
     if (!ggml_tiled_min_batch(dst->src[1]->ne[1])) {
@@ -1234,7 +1238,9 @@ bool ggml_compute_forward_mul_mat_id_tiled(
     if (params->use_ref) {
         return false;
     }
-    if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {
+    struct ggml_cpu_mul_mat_kernel kernel;
+    if (!ggml_cpu_get_mul_mat_kernel(dst, &kernel) || kernel.prepared ||
+            !ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return false;
     }
     // profitability is per expert: the rows routed to this expert

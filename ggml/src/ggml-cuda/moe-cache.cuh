@@ -31,6 +31,13 @@ struct ggml_cuda_moe_cache;
 struct ggml_backend_cuda_context;
 
 bool ggml_cuda_moe_router_compute(ggml_backend_cuda_context & context, ggml_tensor * node);
+struct ggml_backend_graph_optimize_params;
+void ggml_cuda_moe_source_image_alloc_deps(ggml_cgraph * graph, int device,
+    const ggml_backend_graph_optimize_params * params);
+bool ggml_cuda_moe_source_image_resources(ggml_backend_cuda_context & context, ggml_cgraph * graph,
+    int first, int end, size_t & bytes);
+bool ggml_cuda_moe_source_compute_range(ggml_backend_cuda_context & context, ggml_cgraph * graph,
+    int first, int end, uint64_t & fused_nodes, uint64_t & image_groups, uint64_t & emitted_images);
 class ggml_cuda_moe_grouped_context;
 struct ggml_cuda_moe_grouped_context_test_access;
 struct ggml_cuda_moe_graph_capability_witness;
@@ -145,6 +152,7 @@ struct ggml_cuda_moe_candidate_group_info {
     uint32_t semantic_group_index = UINT32_MAX;
     uint32_t flags = 0;
     uint32_t n_banks = 0;
+    uint32_t n_resource_banks = 0;
     uint32_t n_slots = 0;
 };
 
@@ -176,6 +184,23 @@ struct ggml_cuda_moe_grouped_acquisition {
 struct ggml_cuda_moe_grouped_transaction {
     ggml_cuda_moe_grouped_acquisition acquisition;
     uint64_t transaction_token = 0;
+};
+
+struct ggml_cuda_moe_hybrid_reference_view {
+    uint64_t resource_identity = 0;
+    uint32_t n_experts = 0;
+    uint32_t n_slots = 0;
+    const int32_t * slot_for_expert = nullptr;
+    const int32_t * expert_for_slot = nullptr;
+};
+
+struct ggml_cuda_moe_source_transport;
+
+struct ggml_cuda_moe_source_transport_stats {
+    uint64_t direct_calls = 0, direct_bytes = 0;
+    uint64_t catalog_staged_calls = 0, catalog_staged_bytes = 0;
+    uint64_t null_staged_calls = 0, null_staged_bytes = 0;
+    uint64_t tile_wait_wall_ns = 0, materialize_wall_ns = 0;
 };
 
 struct ggml_cuda_moe_legacy_acquisition {
@@ -286,6 +311,7 @@ enum ggml_cuda_moe_execution_strategy : uint32_t {
     GGML_CUDA_MOE_EXECUTION_STRATEGY_INVALID = 0,
     GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT,
     GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED,
+    GGML_CUDA_MOE_EXECUTION_STRATEGY_HYBRID,
 };
 
 enum ggml_cuda_moe_graph_outcome : uint32_t {
@@ -398,6 +424,7 @@ struct ggml_cuda_moe_graph_group_dispatch {
     uint32_t n_slots = 0;
     uint32_t n_auxiliary_shadows = 0;
     bool defer_completion = false;
+    bool hybrid_admission_started = false;
     std::vector<int32_t> prefill_slot_for_expert;
 };
 
@@ -409,6 +436,274 @@ struct ggml_cuda_moe_graph_binding {
     uint32_t bank_index = 0;
     uint32_t slot_index = UINT32_MAX;
 };
+
+struct ggml_cuda_moe_hybrid_selection {
+    uint32_t status;
+    uint32_t admissions;
+    uint32_t replacements;
+    uint32_t resident_count;
+    uint32_t transfer_count;
+    uint32_t cpu_count;
+    uint32_t distinct_count;
+    uint32_t route_count;
+    uint32_t gpu_count;
+    uint64_t epoch;
+};
+
+static constexpr uint32_t GGML_CUDA_MOE_HYBRID_PACKET_ARRAYS = 9;
+
+struct ggml_cuda_moe_hybrid_runtime {
+    uint64_t epoch = 0;
+    uint64_t clock_begin = 0;
+    uint32_t device_clock = 0;
+    uint32_t packet_failure = 0;
+    uint32_t started = 0;
+    uint32_t accepted = 0;
+    uint32_t cpu_status = 0;
+    uint64_t cpu_epoch = 0;
+    uint32_t cpu_routes = 0;
+    uint32_t admissions = 0;
+};
+
+struct ggml_cuda_moe_hybrid_packet_view {
+    ggml_cuda_moe_hybrid_selection * header = nullptr;
+    int32_t * slots = nullptr;
+    int32_t * residents = nullptr;
+    int32_t * transfers = nullptr;
+    int32_t * transfer_ids = nullptr;
+    int32_t * transfer_slots = nullptr;
+    int32_t * cpu_ids = nullptr;
+    int32_t * cpu_ranks = nullptr;
+    int32_t * classes = nullptr;
+    int32_t * rows = nullptr;
+    uint32_t capacity = 0;
+    ggml_cuda_moe_hybrid_runtime * runtime = nullptr;
+    uint32_t * window_failed = nullptr;
+    bool combine_gpu = false;
+    bool direct_gather = false;
+};
+
+static inline bool ggml_cuda_moe_hybrid_can_combine_gpu(bool window, bool admission, uint32_t slots, uint32_t routes) {
+    return window && admission && slots >= routes;
+}
+
+static inline ggml_cuda_moe_hybrid_packet_view ggml_cuda_moe_hybrid_packet(void * data, uint32_t capacity) {
+    auto * header = static_cast<ggml_cuda_moe_hybrid_selection *>(data);
+    auto * values = reinterpret_cast<int32_t *>(header + 1);
+    return {header, values, values + capacity, values + size_t(capacity) * 2, values + size_t(capacity) * 3,
+        values + size_t(capacity) * 4, values + size_t(capacity) * 5, values + size_t(capacity) * 6,
+        values + size_t(capacity) * 7, values + size_t(capacity) * 8, capacity};
+}
+
+enum ggml_cuda_moe_hybrid_weight_class : uint32_t {
+    GGML_CUDA_MOE_HYBRID_RESIDENT = 0,
+    GGML_CUDA_MOE_HYBRID_TRANSFER,
+    GGML_CUDA_MOE_HYBRID_CPU,
+};
+
+struct ggml_cuda_moe_hybrid_rows_query {
+    const ggml_backend_moe_hybrid_region_v1 * region = nullptr;
+    ggml_graph_execution_certificate certificate = {};
+    uint32_t plan_capacity = 0;
+    uint32_t slot_capacity = 0;
+    uint32_t transfer_capacity = 0;
+    uint64_t workspace_generation = 0;
+    uint64_t resource_fingerprint = 0;
+    size_t device_alignment = 0;
+    size_t host_alignment = 0;
+    size_t producer_workspace_bytes = 0;
+    size_t device_capacity_bytes = 0;
+    size_t pinned_capacity_bytes = 0;
+    const uint8_t * source_device_accessible = nullptr;
+    uint32_t n_sources = 0;
+    bool host_control_alias = false;
+    bool external_publish_storage = false;
+    bool external_transfer_storage = false;
+};
+
+struct ggml_cuda_moe_hybrid_rows_layout {
+    ggml_backend_moe_hybrid_geometry_v1 geometry = {};
+    uint64_t identity = 0;
+    uint32_t plan_capacity = 0;
+    uint32_t slot_capacity = 0;
+    uint32_t transfer_capacity = 0;
+    uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+    uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    uint32_t sequence_capacity = 0;
+    uint32_t input_width = 0;
+    uint32_t output_width = 0;
+    uint32_t ids_row_stride = 0;
+    size_t plan_bytes = 0;
+    size_t control_bytes = 0;
+    size_t packed_input_bytes = 0;
+    size_t private_output_bytes = 0;
+    size_t transfer_bytes = 0;
+    size_t host_input_bytes = 0;
+    size_t staging_tile_bytes = 0;
+    size_t device_alignment = 0;
+    size_t host_alignment = 0;
+    size_t plan_offset = SIZE_MAX;
+    size_t control_offset = SIZE_MAX;
+    size_t packed_input_offset = SIZE_MAX;
+    size_t gpu_output_offset = SIZE_MAX;
+    size_t cpu_output_offset = SIZE_MAX;
+    size_t publish_offset = SIZE_MAX;
+    size_t workspace_offset = SIZE_MAX;
+    size_t workspace_bytes = 0;
+    size_t host_control_offset = SIZE_MAX;
+    size_t host_input_offset = SIZE_MAX;
+    size_t host_output_offset = SIZE_MAX;
+    size_t host_staging_offsets[2] = {SIZE_MAX, SIZE_MAX};
+    size_t device_bytes = 0;
+    size_t pinned_bytes = 0;
+    bool host_control_alias = false;
+    bool external_publish_storage = false;
+    bool external_transfer_storage = false;
+};
+
+enum ggml_cuda_moe_hybrid_source_role : uint32_t {
+    GGML_CUDA_MOE_HYBRID_SOURCE_INVALID = 0,
+    GGML_CUDA_MOE_HYBRID_SOURCE_MMID_WEIGHT,
+    GGML_CUDA_MOE_HYBRID_SOURCE_ADD_ID_BIAS,
+};
+
+struct ggml_cuda_moe_hybrid_rows_source {
+    uint32_t role = GGML_CUDA_MOE_HYBRID_SOURCE_INVALID;
+    size_t expert_bytes = 0;
+    size_t device_offset = SIZE_MAX;
+    size_t bytes = 0;
+    bool device_accessible = false;
+};
+
+struct ggml_cuda_moe_hybrid_producer_result {
+    uint64_t epoch = 0;
+    uint32_t completed_routes = 0;
+    int32_t status = GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+    uint32_t complete = 0;
+};
+
+struct ggml_cuda_moe_hybrid_rows_ticket {
+    uint64_t epoch = 0;
+    uint64_t identity = 0;
+    uint32_t status = 0;
+    uint32_t active_rows = 0;
+    uint32_t route_count = 0;
+    uint32_t weight_count = 0;
+    uint32_t transfer_count = 0;
+    uint32_t gpu_lanes = 0;
+    uint32_t resident_lanes = 0;
+    uint32_t transfer_lanes = 0;
+    uint32_t cpu_routes = 0;
+    uint32_t expected_producers = 0;
+    uint32_t completed_producers = 0;
+    uint32_t completed_routes = 0;
+    uint32_t producers_ready = 0;
+    uint32_t commit_decision = 0; // 0: undecided, 1: reject, 2: copy
+    uint32_t published_routes = 0;
+    uint32_t published = 0;
+    uint32_t accepted = 0;
+    ggml_cuda_moe_hybrid_selection selection = {};
+};
+
+struct ggml_cuda_moe_hybrid_rows_runtime {
+    uint64_t epoch;
+    uint64_t identity;
+    uint64_t cancel_epoch;
+    uint32_t active_rows;
+    uint32_t n_sequences;
+    uint32_t gpu_miss_quota;
+    uint32_t corrupt_route;
+};
+
+struct ggml_cuda_moe_hybrid_rows_view {
+    ggml_cuda_moe_hybrid_rows_ticket * ticket;
+    ggml_cuda_moe_hybrid_rows_runtime * runtime;
+    int32_t * weight_experts;
+    uint32_t * weight_classes;
+    uint32_t * weight_storage;
+    ggml_backend_moe_hybrid_route_v1 * routes;
+    uint32_t * gpu_routes;
+    uint32_t * route_lanes;
+    uint32_t * cpu_routes;
+    uint32_t * expected_routes;
+    ggml_cuda_moe_hybrid_producer_result * producers;
+};
+
+ggml_cuda_moe_hybrid_rows_view ggml_cuda_moe_hybrid_rows_packet(void * data, const ggml_backend_moe_hybrid_geometry_v1 & geometry);
+const int32_t * ggml_cuda_moe_hybrid_rows_weights(const void * plan, uint32_t capacity);
+const int32_t * ggml_cuda_moe_hybrid_rows_ids(const void * plan, uint32_t capacity);
+const int32_t * ggml_cuda_moe_hybrid_rows_transfer_experts(const void * plan, uint32_t capacity);
+bool ggml_cuda_moe_hybrid_rows_pack(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, ggml_cuda_moe_hybrid_rows_view packet,
+    const float * input, float * packed, ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_hybrid_rows_gpu_binding(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, ggml_cuda_moe_hybrid_rows_view packet, uint32_t kind,
+    const float * packed, float * branch_input, int32_t * ids, ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_hybrid_rows_gpu_combined_binding(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, ggml_cuda_moe_hybrid_rows_view rows,
+    ggml_cuda_moe_hybrid_packet_view packet, const float * packed, float * branch_input, int32_t * ids,
+    ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_hybrid_rows_gpu_complete(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, ggml_cuda_moe_hybrid_rows_view packet, uint32_t kind,
+    const float * branch_output, float * output, ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_hybrid_rows_gpu_combined_complete(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, ggml_cuda_moe_hybrid_rows_view packet,
+    const float * branch_output, float * output, ggml_cuda_moe_stream_t stream);
+bool ggml_cuda_moe_hybrid_rows_commit(
+    const ggml_cuda_moe_hybrid_rows_layout & layout, const void * plan, ggml_cuda_moe_hybrid_rows_view packet,
+    const float * gpu, const float * cpu, float * output, ggml_cuda_moe_stream_t stream);
+
+bool ggml_cuda_moe_hybrid_rows_measure(
+    const ggml_cuda_moe_hybrid_rows_query & query, ggml_cuda_moe_hybrid_rows_layout & layout,
+    std::vector<ggml_cuda_moe_hybrid_rows_source> & sources);
+
+enum ggml_cuda_moe_hybrid_rows_import_test_fault : uint32_t {
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_NONE = 0,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_STALE_EPOCH,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_WRONG_EXPERT,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_DUPLICATE_EXPERT,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_MISSING_ROUTE,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_WEIGHT_INDEX,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_TRANSFER_INDEX,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_RECIPROCAL_MAP,
+    GGML_CUDA_MOE_HYBRID_IMPORT_TEST_CPU_ROUTE,
+};
+
+struct ggml_cuda_moe_hybrid_rows_test_state {
+    ggml_cuda_moe_hybrid_rows_layout layout;
+    uint64_t epoch = 1;
+    uint64_t cancel_epoch = 0;
+    uint64_t execution_identity = 0;
+    uint32_t active_rows = 0;
+    uint32_t n_sequences = 0;
+    uint32_t gpu_miss_quota = 0;
+    uint32_t replays = 1;
+    bool capture = false;
+    bool corrupt_route = false;
+    bool import_plan = false;
+    ggml_cuda_moe_hybrid_rows_import_test_fault import_fault = GGML_CUDA_MOE_HYBRID_IMPORT_TEST_NONE;
+    uint32_t cancel_phase = 0; // 1: after producers, 2: after commit
+    std::vector<int32_t> ids;
+    std::vector<int32_t> slot_for_expert;
+    std::vector<int32_t> expert_for_slot;
+    std::vector<float> input;
+    std::vector<float> gpu_output;
+    std::vector<float> cpu_output;
+    std::vector<ggml_cuda_moe_hybrid_producer_result> producers;
+    ggml_cuda_moe_hybrid_rows_ticket ticket;
+    uint32_t plan_status = 0;
+    std::vector<int32_t> weight_experts;
+    std::vector<uint32_t> weight_classes;
+    std::vector<uint32_t> weight_storage;
+    std::vector<ggml_backend_moe_hybrid_route_v1> routes;
+    std::vector<uint32_t> gpu_routes;
+    std::vector<uint32_t> cpu_route_indices;
+    std::vector<uint32_t> expected_routes;
+    std::vector<float> packed_input;
+    std::vector<float> output;
+};
+
+bool ggml_cuda_moe_hybrid_rows_for_test(ggml_cuda_moe_hybrid_rows_test_state & state);
 
 enum ggml_cuda_moe_graph_prepare_result : uint32_t {
     GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE = 0,
@@ -454,6 +749,7 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t source_device_bytes = 0;
     uint64_t source_prepack_bytes = 0;
     uint64_t source_device_prefetch_bytes = 0;
+    uint64_t occupancy_unavailable = 0;
     uint64_t populated_slots = 0;
     uint64_t slot_capacity = 0;
     uint64_t populated_payload_bytes = 0;
@@ -739,6 +1035,7 @@ private:
     uint32_t n_nodes_;
     ggml_cuda_moe_graph_coverage_diagnostics coverage_diagnostics_;
     bool initialized_;
+    bool source_residency_;
     bool inventory_complete_;
     bool unknown_reusable_;
 };
@@ -800,11 +1097,20 @@ struct ggml_cuda_moe_grouped_resource_info {
     uint32_t transaction_active = 0;
 };
 
+enum moe_grouped_source_path : uint32_t {
+    MOE_GROUPED_SOURCE_DIRECT_REGISTERED = 0,
+    MOE_GROUPED_SOURCE_PAGEABLE_STAGED,
+    MOE_GROUPED_SOURCE_MAPPED,
+    MOE_GROUPED_SOURCE_DEVICE,
+    MOE_GROUPED_SOURCE_PATH_COUNT,
+};
+
 struct ggml_cuda_moe_grouped_bank_descriptor {
     const ggml_tensor * tensor = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
     const void * source_data = nullptr;
+    const void * source_device_alias = nullptr;
     const void * buffer_base = nullptr;
     uint64_t buffer_size = 0;
     uint64_t data_offset = 0;
@@ -818,9 +1124,22 @@ struct ggml_cuda_moe_grouped_bank_descriptor {
     uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
     uint32_t movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
     uint32_t index_modes = 0;
+    uint32_t source_path = MOE_GROUPED_SOURCE_PATH_COUNT;
 };
 
 struct ggml_cuda_moe_grouped_context_test_access;
+
+struct ggml_cuda_moe_source_profile_update {
+    ggml_cuda_moe_graph_group_dispatch * group = nullptr;
+    const int32_t * seed = nullptr;
+    uint32_t n_seed = 0;
+    int32_t * map = nullptr, * owners = nullptr;
+    const uint32_t * bindings = nullptr;
+    uint32_t n_bindings = 0;
+    const int32_t * routes = nullptr;
+    uint32_t n_routes = 0;
+    uint64_t copied_bytes = 0;
+};
 
 class ggml_cuda_moe_grouped_context {
 public:
@@ -832,6 +1151,10 @@ public:
 
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+    bool initialize_profile(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
+            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
+    bool initialize_statistics(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
+            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
     ggml_cuda_moe_candidate_registry_state state() const;
     bool find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const;
     bool find_down_group_key(const ggml_tensor * tensor, ggml_cuda_moe_candidate_group_key * key) const;
@@ -886,7 +1209,8 @@ public:
             uint64_t coverage_epoch = 0,
             const void * coverage_nodes = nullptr,
             uint32_t coverage_mmid_count = 0,
-            uint64_t coverage_mmid_fingerprint = 0) const;
+            uint64_t coverage_mmid_fingerprint = 0,
+            bool source_residency = false) const;
     bool bind_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
@@ -906,7 +1230,8 @@ public:
             uint64_t coverage_epoch = 0,
             const void * coverage_nodes = nullptr,
             uint32_t coverage_mmid_count = 0,
-            uint64_t coverage_mmid_fingerprint = 0) const;
+            uint64_t coverage_mmid_fingerprint = 0,
+            bool source_residency = false) const;
     bool graph_resource_fingerprint(
             const ggml_cuda_moe_graph_execution & execution,
             ggml_cuda_moe_stream_t stream,
@@ -919,7 +1244,7 @@ public:
             const std::vector<std::weak_ptr<void>> * resource_witnesses = nullptr);
     bool begin_graph_dispatch(
             ggml_cuda_moe_graph_execution * execution,
-            ggml_cuda_moe_graph_dispatch_mode mode);
+            ggml_cuda_moe_graph_dispatch_mode mode, bool source_adaptation = false);
     bool track_staged_stream(ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
     bool copy_staged_source(
             const ggml_tensor * tensor,
@@ -974,6 +1299,74 @@ public:
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream);
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
+    bool finish_source_dispatch(ggml_cuda_moe_graph_execution * execution);
+    bool prepare_hybrid_group(
+            ggml_cuda_moe_graph_group_dispatch * group,
+            ggml_cuda_moe_stream_t stream,
+            ggml_cuda_moe_hybrid_selection * selection, int32_t * slots, int32_t * resident_slots,
+            uint32_t admission_quota = 0, ggml_cuda_moe_hybrid_packet_view packet = {},
+            uint32_t gpu_miss_quota = 0, uint64_t epoch = 0,
+            ggml_cuda_moe_hybrid_runtime * prepare_only = nullptr, uint32_t route_capacity = 0,
+            uint32_t materialization_capacity = 0);
+    bool select_hybrid_group(ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_selection * selection, int32_t * slots, int32_t * resident_slots,
+            uint32_t admission_quota, ggml_cuda_moe_hybrid_packet_view packet, uint32_t gpu_miss_quota,
+            uint64_t epoch, uint64_t clock_begin, bool device_clock,
+            const int32_t * ids_override = nullptr, uint32_t route_capacity = 0);
+    bool get_hybrid_reference_view(const ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_reference_view * view) const;
+    // Immutable leaves borrow canonical storage; other leaves keep their original binding.
+    bool prepare_source_leaf(const ggml_tensor * tensor, ggml_cuda_moe_stream_t stream,
+            const ggml_backend_moe_source_owner_v1 & source_owner, ggml_backend_buffer_t * buffer,
+            void ** data, std::shared_ptr<void> * lease);
+    bool prepare_source_group(ggml_cuda_moe_graph_group_dispatch * group, ggml_cuda_moe_stream_t stream,
+            int32_t * host_slots, uint32_t expert_capacity, int32_t * host_owners, uint32_t slot_capacity,
+            bool allow_create, uint64_t * residency_token = nullptr);
+    // Apply only after map readback and prior producers have drained. Host maps live through dispatch drain.
+    bool update_source_profiles(ggml_cuda_moe_source_profile_update * updates, uint32_t count,
+            ggml_cuda_moe_source_transport * transport, ggml_cuda_moe_stream_t stream,
+            uint64_t deadline_ns, bool maintenance, bool asynchronous = false,
+            const ggml_backend_moe_source_owner_v1 * source_owner = nullptr,
+            ggml_backend_moe_hybrid_test_hook_v1_t hook = nullptr, void * hook_data = nullptr);
+    bool complete_source_adaptation(bool wait, uint64_t deadline_ns);
+    bool apply_source_profile(ggml_cuda_moe_graph_group_dispatch & group, const int32_t * experts,
+            uint32_t count, int32_t * host_slots, int32_t * host_owners,
+            ggml_cuda_moe_source_transport * transport, const uint32_t * bindings, uint32_t n_bindings,
+            ggml_cuda_moe_stream_t stream, uint64_t deadline_ns, uint64_t * copied_bytes);
+    // Prepared bank indices borrow the original grouped source and resource leases.
+    bool prepare_source_transport(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, size_t tile_bytes,
+            ggml_cuda_moe_source_transport ** transport, uint32_t * binding_index, bool mapped_copy = false);
+    bool source_transport_matches(const ggml_cuda_moe_source_transport * transport, uint32_t binding_index,
+            const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index) const;
+    bool copy_source_transport(ggml_cuda_moe_source_transport * transport, uint32_t binding_index, const ggml_tensor * tensor,
+            void * destination, const void * source, size_t bytes, ggml_cuda_moe_stream_t stream, uint64_t deadline_ns);
+    bool validate_source_transport(const ggml_cuda_moe_source_transport * transport, uint32_t binding_index,
+            const ggml_tensor * tensor, const void * source, size_t bytes) const;
+    // A valid but unmapped span returns success with a null alias.
+    bool source_transport_alias(const ggml_cuda_moe_source_transport * transport, uint32_t binding_index,
+            const ggml_tensor * tensor, const void * source, size_t bytes, const void ** alias) const;
+    // Snapshot only from the invoking caller or after actual caller exit.
+    bool source_transport_stats(const ggml_cuda_moe_source_transport * transport,
+            ggml_cuda_moe_source_transport_stats * stats) const;
+    bool release_source_transport(ggml_cuda_moe_source_transport ** transport);
+    bool plan_hybrid_rows(ggml_cuda_moe_graph_group_dispatch & group,
+            const ggml_cuda_moe_hybrid_rows_layout & layout, void * plan, ggml_cuda_moe_hybrid_rows_view packet,
+            const uint32_t * window_failed, const int32_t * ids_override = nullptr);
+    bool import_hybrid_rows_plan(const ggml_cuda_moe_graph_group_dispatch & group,
+            const ggml_cuda_moe_hybrid_rows_layout & layout, void * plan, ggml_cuda_moe_hybrid_rows_view packet,
+            const int32_t * ids_override = nullptr, const uint32_t * window_failed = nullptr);
+    bool begin_hybrid_admission(ggml_cuda_moe_graph_group_dispatch & group, int32_t expert, int32_t slot);
+    bool complete_hybrid_admission(ggml_cuda_moe_graph_group_dispatch & group, int32_t expert, int32_t slot, uint64_t & auxiliary_bytes);
+    bool begin_hybrid_admissions(ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_packet_view packet, uint32_t * status);
+    bool copy_hybrid_admission_bank(ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_packet_view packet, uint32_t bank, const void * scratch, uint32_t * status);
+    bool gather_hybrid_admissions(ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_packet_view packet, uint32_t * status, ggml_cuda_moe_stream_t stream);
+    bool complete_hybrid_admissions(ggml_cuda_moe_graph_group_dispatch & group,
+            ggml_cuda_moe_hybrid_packet_view packet, uint32_t * status, uint64_t & auxiliary_bytes);
+    bool finish_hybrid_admission(ggml_cuda_moe_graph_group_dispatch & group, bool publish, bool wait = true,
+            ggml_cuda_moe_hybrid_runtime * runtime = nullptr);
     void configure_early_router(const ggml_cgraph * graph, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream, bool capture, ggml_backend_cuda_context & parent);
     void launch_early_router(const ggml_tensor * node, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
     bool original_auxiliary_source(
@@ -1000,6 +1393,9 @@ public:
     void shutdown();
 
 private:
+    bool initialize_placement(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
+            const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
+            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags);
     friend struct ggml_cuda_moe_grouped_context_test_access;
     friend class ggml_cuda_moe_group_call_lease;
     friend class ggml_cuda_moe_legacy_operation_lease;
@@ -1016,7 +1412,7 @@ private:
             bool upload_ids,
             ggml_cuda_moe_stream_t compute_stream,
             ggml_cuda_moe_grouped_decode_acquisition * acquisition,
-            const ggml_cuda_moe_group_call_lease * authority);
+            const ggml_cuda_moe_group_call_lease * authority, bool policy_intent = false);
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
     bool admission_closed_for_test() const;
@@ -1055,6 +1451,7 @@ private:
     bool set_original_auxiliary_budget_for_test(size_t byte_budget);
     size_t original_auxiliary_bytes_for_test() const;
     void fail_device_resource_allocation_for_test(uint32_t stage);
+    void fail_hybrid_packet_for_test(uint32_t stage);
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
@@ -1081,6 +1478,37 @@ private:
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
 size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend);
+
+struct ggml_cuda_moe_hybrid_selection_test_state {
+    std::vector<int32_t> ids;
+    std::vector<int32_t> slot_for_expert;
+    std::vector<int32_t> expert_for_slot;
+    std::vector<uint64_t> last_used;
+    std::vector<uint32_t> frequency;
+    std::vector<uint64_t> frequency_epoch;
+    uint64_t step = 0;
+    uint64_t clock = 0;
+    uint32_t quota = 0;
+    bool frequency_aware = true;
+    bool device_clock = true;
+    bool packet_enabled = false;
+    bool combine_gpu = false;
+    bool direct_gather = false;
+    uint32_t gpu_miss_quota = 0;
+    uint64_t packet_epoch = 1;
+    ggml_cuda_moe_hybrid_selection selection = {};
+    std::vector<int32_t> slots;
+    std::vector<int32_t> residents;
+    std::vector<int32_t> admitted_experts;
+    std::vector<int32_t> admitted_slots;
+    std::vector<int32_t> admitted_ranks;
+    std::vector<int32_t> packet_values;
+    std::vector<std::vector<uint8_t>> gather_sources;
+    std::vector<std::vector<uint8_t>> gather_outputs;
+    uint32_t gather_status = 0;
+};
+
+bool ggml_cuda_moe_hybrid_select_for_test(ggml_cuda_moe_hybrid_selection_test_state & state);
 
 struct ggml_cuda_graph_capture_state_for_test {
     uintptr_t graph = 0;
@@ -1143,6 +1571,7 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
 void * ggml_backend_cuda_moe_cached_writable_load_data(ggml_backend_buffer_t buffer, void * data, size_t size);
+bool ggml_backend_cuda_moe_cached_readable_source(ggml_backend_buffer_t buffer, const void * data, size_t size);
 void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail);
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 bool ggml_backend_cuda_moe_get_debug_mm(void);
@@ -1320,3 +1749,8 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
 #ifdef __cplusplus
 }
 #endif
+
+extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v1(ggml_backend_t backend,
+    const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
+extern "C" bool ggml_backend_cuda_moe_profile_initialize_v1(ggml_backend_t backend,
+    const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles, uint32_t flags, uint64_t * copied_bytes);

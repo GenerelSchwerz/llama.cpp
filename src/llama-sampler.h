@@ -2,6 +2,8 @@
 
 #include "llama.h"
 
+#include <functional>
+#include <utility>
 #include <vector>
 
 struct llama_vocab;
@@ -33,10 +35,28 @@ struct llama_sampler_chain {
     mutable int64_t t_sample_us;
 
     mutable int32_t n_sample;
+
+    uint64_t generation = 0;
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+
+struct llama_sampler_backend_inputs {
+    std::vector<std::function<void()>> setters;
+    std::vector<std::pair<const llama_sampler *, uint64_t>> chains;
+    bool reusable = true;
+
+    bool can_reuse() const;
+
+    void set_input() const {
+        for (const auto & setter : setters) {
+            setter();
+        }
+    }
+};
+
+llama_sampler_backend_inputs llama_sampler_backend_prepare_inputs(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

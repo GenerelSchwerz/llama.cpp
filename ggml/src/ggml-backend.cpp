@@ -1,3 +1,4 @@
+#include "moe-fidelity-config.h"
 // Note: porting this file to C++ is a work in progress
 
 #ifdef _WIN32
@@ -9,6 +10,8 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-backend-moe.h"
+#include "ggml-moe-source-program.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -20,14 +23,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <crt_externs.h>
 #endif
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+extern "C" char ** environ;
+#endif
 
 // backend buffer type
 
@@ -774,6 +783,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 
 struct ggml_backend_sched_split {
     int backend_id;
+    bool direct_dependencies[GGML_SCHED_MAX_BACKENDS];
     int i_start;
     int i_end;
     struct ggml_tensor ** inputs;
@@ -781,6 +791,190 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+};
+
+struct ggml_backend_sched_hybrid_region {
+    uint32_t split_index;
+    uint64_t allocator_generation;
+    std::vector<ggml_backend_moe_cpu_prepared_region_v1_t> cpu;
+    void * device;
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor>> witnesses;
+
+    bool matches() const {
+        for (const auto & witness : witnesses) {
+            if (!ggml_moe_source_tensor_matches(*witness.first, witness.second)) { return false; }
+        }
+        return true;
+    }
+};
+
+struct ggml_backend_sched_source_cpu {
+    ggml_backend_moe_cpu_service_v1_t service = nullptr;
+    const ggml_backend_moe_cpu_region_service_api_v1 * api = nullptr;
+};
+
+struct ggml_backend_sched_hybrid {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_reg_t cpu_module = nullptr;
+    ggml_backend_reg_t device_module = nullptr;
+    const ggml_backend_moe_cpu_region_service_api_v1 * cpu_api = nullptr;
+    const ggml_backend_moe_hybrid_api_v1 * device_api = nullptr;
+    const ggml_backend_moe_source_core_api_v1 * source_api = nullptr;
+    std::mutex source_mutex;
+    ggml_backend_moe_cpu_service_v1_t cpu = nullptr;
+    std::shared_ptr<ggml_backend_sched_source_cpu> source_cpu;
+    void * device = nullptr;
+    ggml_backend_moe_hybrid_config_v1 config = {};
+    std::vector<std::vector<int32_t>> profile_ranks;
+    std::vector<ggml_backend_moe_static_profile_v1> profiles;
+    std::vector<std::vector<uint64_t>> statistics_counts;
+    std::vector<ggml_backend_moe_source_statistics_v1> statistics;
+    ggml_backend_moe_source_owner_v1 source_owner = {};
+    uint32_t max_regions = 0;
+    std::vector<ggml_backend_sched_hybrid_region> regions;
+    std::vector<void *> dispatch;
+    std::vector<std::unique_ptr<ggml_backend_sched_hybrid>> split_sessions;
+
+    template <typename F> void each_session(F visit) {
+        visit(this);
+        for (auto & session : split_sessions) { visit(session.get()); }
+    }
+
+    ggml_backend_sched_hybrid * find_split(uint32_t split_index) {
+        ggml_backend_sched_hybrid * found = nullptr;
+        each_session([&](ggml_backend_sched_hybrid * session) {
+            if (!session->regions.empty() && session->regions.front().split_index == split_index) { found = session; }
+        });
+        return found;
+    }
+
+    int32_t ensure_source(const std::shared_ptr<ggml_backend_sched_source_cpu> & shared = {}) {
+        if (!source_api || (cpu && device)) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK; }
+        if (!cpu && shared) {
+            if (!shared->service || shared->api != cpu_api) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+            source_cpu = shared; cpu = shared->service;
+        }
+        if (!cpu) {
+            source_cpu = std::make_shared<ggml_backend_sched_source_cpu>();
+            source_cpu->api = cpu_api;
+            ggml_backend_moe_cpu_service_config_v1 cpu_config = {};
+            cpu_config.struct_size = sizeof(cpu_config); cpu_config.abi_version = 1;
+            cpu_config.source_owner = &source_owner; cpu_config.n_threads = config.n_threads;
+            cpu_config.n_lanes = 1; cpu_config.max_regions = config.max_prepared_regions;
+            cpu_config.flags = config.cpu_flags; cpu_config.prepared_payload_limit = config.cpu_bytes;
+            const auto status = cpu_api->create(&cpu_config, &cpu);
+            source_cpu->service = cpu;
+            if (status) { return status; }
+        }
+        return device ? GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK : source_api->create(&config, &device);
+    }
+
+    int32_t release_source_region(ggml_backend_sched_hybrid_region & region) {
+        if (region.device) {
+            const auto status = source_api->release_region(device, &region.device);
+            if (status) { return status; }
+        }
+        for (auto & bucket : region.cpu) {
+            if (bucket && cpu_api->destroy_region(cpu, &bucket)) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED; }
+        }
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    }
+
+    int32_t clear_source(bool keep_cpu = false) {
+        std::lock_guard<std::mutex> lock(source_mutex);
+        int32_t retired = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+        if (device) {
+            const auto closed = source_api->close(device);
+            const auto drained = source_api->drain(device);
+            retired = closed ? closed : drained;
+        }
+        for (auto & session : split_sessions) {
+            const auto status = session->clear_source(keep_cpu);
+            if (!retired) { retired = status; }
+        }
+        if (retired) { return retired; }
+        split_sessions.clear();
+        for (auto & region : regions) {
+            const auto status = release_source_region(region);
+            if (status) { return status; }
+        }
+        if (device) {
+            const auto status = source_api->release(&device);
+            if (status) { return status; }
+        }
+        if (cpu && !keep_cpu) {
+            if (!source_cpu || source_cpu.use_count() == 1) {
+                if (cpu_api->close(cpu) || cpu_api->drain(cpu) || cpu_api->destroy(&cpu)) {
+                    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED;
+                }
+            }
+            cpu = nullptr;
+            source_cpu.reset();
+        }
+        regions.clear(); dispatch.clear();
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    }
+
+    void release(ggml_backend_sched_hybrid_region & region) {
+        if (source_api) {
+            if (region.device) {
+                GGML_ASSERT(source_api->close(device) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+                GGML_ASSERT(source_api->drain(device) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+            }
+            GGML_ASSERT(release_source_region(region) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+            return;
+        }
+        if (region.device != nullptr) {
+            device_api->destroy_region(device, region.device);
+            region.device = nullptr;
+        }
+        for (auto & bucket : region.cpu) {
+            if (bucket != 0) {
+                GGML_ASSERT(cpu_api->destroy_region(cpu, &bucket) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+            }
+        }
+    }
+
+    void clear() {
+        if (source_api) {
+            GGML_ASSERT(clear_source(true) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+            return;
+        }
+        if (device != nullptr) {
+            device_api->quiesce(device);
+        }
+        if (backend != nullptr) {
+            ggml_backend_synchronize(backend);
+        }
+        for (auto & region : regions) {
+            release(region);
+        }
+        regions.clear();
+        dispatch.clear();
+    }
+
+    ~ggml_backend_sched_hybrid() {
+        if (source_api) {
+            GGML_ASSERT(clear_source() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+        } else {
+            clear();
+        }
+        if (device != nullptr) {
+            GGML_ASSERT(!source_api);
+            device_api->destroy(device);
+        }
+        if (cpu != nullptr) {
+            GGML_ASSERT(cpu_api->close(cpu) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+            GGML_ASSERT(cpu_api->drain(cpu) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+            GGML_ASSERT(cpu_api->destroy(&cpu) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+        }
+        if (device_module != nullptr) {
+            GGML_ASSERT(config.module_release(device_module));
+        }
+        if (cpu_module != nullptr) {
+            GGML_ASSERT(config.module_release(cpu_module));
+        }
+    }
 };
 
 struct ggml_backend_sched {
@@ -808,6 +1002,13 @@ struct ggml_backend_sched {
     struct ggml_cgraph graph;
     struct ggml_cgraph * source_graph;
     uint64_t source_graph_uid;
+    uint64_t source_retirement_epoch;
+    uint64_t source_preparation_epoch;
+    uint64_t source_preparation_graph_uid;
+    bool source_retirement_failed;
+    ggml_backend_sched_hybrid * hybrid;
+    ggml_backend_sched_hybrid * hybrids[GGML_SCHED_MAX_BACKENDS];
+    int n_hybrids;
 
     // graph splits
     struct ggml_backend_sched_split * splits;
@@ -846,6 +1047,799 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static int32_t ggml_backend_sched_moe_hybrid_create(
+        const ggml_backend_moe_hybrid_config_v1 * config,
+        const std::shared_ptr<ggml_backend_sched_source_cpu> & shared,
+        std::unique_ptr<ggml_backend_sched_hybrid> & output) try {
+    auto state = std::make_unique<ggml_backend_sched_hybrid>();
+    state->backend = config->backend;
+    state->config = *config;
+    state->profile_ranks.resize(config->n_profiles);
+    state->profiles.reserve(config->n_profiles);
+    uint64_t profile_count = 0;
+    for (uint32_t i = 0; i < config->n_profiles; ++i) {
+        const auto & profile = config->profiles[i];
+        if (!profile.down || !profile.experts || !profile.n_experts || profile.n_experts > 65536) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        profile_count += profile.n_experts;
+        if (profile_count > (1u << 22)) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+        auto & ranks = state->profile_ranks[i];
+        ranks.assign(profile.experts, profile.experts + profile.n_experts);
+        state->profiles.push_back({profile.down, ranks.data(), profile.n_experts});
+    }
+    state->config.profiles = state->profiles.empty() ? nullptr : state->profiles.data();
+    state->statistics_counts.resize(config->n_statistics);
+    state->statistics.reserve(config->n_statistics);
+    for (uint32_t i = 0; i < config->n_statistics; ++i) {
+        const auto & source = config->statistics[i];
+        auto & counts = state->statistics_counts[i];
+        counts.assign(source.counts, source.counts + source.n_experts);
+        auto copy = source;
+        copy.counts = counts.data();
+        state->statistics.push_back(copy);
+    }
+    state->config.statistics = state->statistics.empty() ? nullptr : state->statistics.data();
+    state->source_owner = *config->source_owner;
+    state->config.source_owner = &state->source_owner;
+    const auto cpu_module = config->cpu_module_acquire();
+    const auto device_module = ggml_backend_dev_backend_reg(ggml_backend_get_device(config->backend));
+    if (cpu_module == nullptr) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    state->cpu_module = cpu_module;
+    if (!config->module_retain(device_module)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    state->device_module = device_module;
+    const char * cpu_proc_name = config->executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ?
+        GGML_BACKEND_MOE_CPU_FIDELITY_SERVICE_V1_PROC_NAME : GGML_BACKEND_MOE_CPU_REGION_SERVICE_V1_PROC_NAME;
+    const char * device_proc_name = config->executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ?
+        GGML_BACKEND_MOE_HYBRID_FIDELITY_V1_PROC_NAME : GGML_BACKEND_MOE_HYBRID_V1_PROC_NAME;
+    const auto cpu_proc = reinterpret_cast<ggml_backend_moe_cpu_region_service_v1_t>(
+        ggml_backend_reg_get_proc_address(cpu_module, cpu_proc_name));
+    const auto device_proc = reinterpret_cast<ggml_backend_moe_hybrid_v1_t>(
+        ggml_backend_reg_get_proc_address(device_module, device_proc_name));
+    const bool source_core = config->executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY &&
+        ggml_moe_fidelity_selection().source_pool;
+    const auto source_proc = source_core ? reinterpret_cast<ggml_backend_moe_source_core_v1_t>(
+        ggml_backend_reg_get_proc_address(device_module, GGML_BACKEND_MOE_SOURCE_CORE_V1_PROC_NAME)) : nullptr;
+    if (cpu_proc == nullptr || (source_core ? source_proc == nullptr : device_proc == nullptr)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    state->cpu_api = cpu_proc();
+    state->device_api = source_core ? nullptr : device_proc();
+    state->source_api = source_core ? source_proc() : nullptr;
+    const auto * source = state->source_api;
+    const auto * device = state->device_api;
+    const bool provider_valid = source_core ?
+        source && source->struct_size == sizeof(*source) && source->abi_version == 1 &&
+            source->create && source->prepare && source->compute && source->close && source->drain &&
+            source->release_region && source->release && source->state && source->preflight :
+        device && device->struct_size == sizeof(*device) && device->abi_version == 1 &&
+            device->create && device->prepare && device->compute && device->destroy_region &&
+            device->destroy && device->state && device->quiesce;
+    if (state->cpu_api == nullptr || state->cpu_api->struct_size != sizeof(*state->cpu_api) ||
+            state->cpu_api->abi_version != 1 || !provider_valid ||
+            state->cpu_api->create == nullptr || state->cpu_api->prepare == nullptr || state->cpu_api->execute == nullptr ||
+            state->cpu_api->destroy_region == nullptr || state->cpu_api->close == nullptr ||
+            state->cpu_api->drain == nullptr || state->cpu_api->destroy == nullptr ||
+            state->cpu_api->cancel == nullptr) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    ggml_backend_moe_cpu_service_config_v1 cpu_config = {};
+    cpu_config.struct_size = sizeof(cpu_config);
+    cpu_config.abi_version = 1;
+    cpu_config.source_owner = config->source_owner;
+    cpu_config.n_threads = config->n_threads;
+    cpu_config.n_lanes = 1;
+    cpu_config.max_regions = config->max_prepared_regions;
+    cpu_config.flags = config->cpu_flags;
+    cpu_config.prepared_payload_limit = config->cpu_bytes;
+    int32_t status = GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+    if (shared) {
+        if (!source_core || !shared->service || shared->api != state->cpu_api) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        state->source_cpu = shared;
+        state->cpu = shared->service;
+    } else {
+        if (source_core) {
+            state->source_cpu = std::make_shared<ggml_backend_sched_source_cpu>();
+            state->source_cpu->api = state->cpu_api;
+        }
+        status = state->cpu_api->create(&cpu_config, &state->cpu);
+        if (state->source_cpu) { state->source_cpu->service = state->cpu; }
+    }
+    if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        return status;
+    }
+    status = source_core ? state->source_api->create(&state->config, &state->device) : state->device_api->create(config, &state->device);
+    if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        return status;
+    }
+    state->max_regions = config->max_regions;
+    state->regions.reserve(config->max_regions);
+    state->dispatch.reserve(config->max_regions);
+    output = std::move(state);
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+} catch (...) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+
+static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
+        ggml_backend_sched_t sched, const ggml_backend_moe_hybrid_config_v1 * config,
+        const std::shared_ptr<ggml_backend_sched_source_cpu> & shared_cpu = {}) try {
+    if (sched == nullptr || config == nullptr || config->struct_size != sizeof(*config) ||
+            config->backend == nullptr || config->source_owner == nullptr || config->n_threads == 0 ||
+            config->source_owner->struct_size != sizeof(*config->source_owner) ||
+            config->source_owner->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION ||
+            config->cpu_module_acquire == nullptr || config->module_retain == nullptr || config->module_release == nullptr ||
+            config->max_regions == 0 || config->max_prepared_regions < config->max_regions ||
+            config->admission_quota > config->gpu_miss_quota ||
+            config->demand_admission > 1 || config->resident_batch > 1 ||
+            config->executor > GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ||
+            config->profile_adaptation > 2 || (config->profile_adaptation && !config->n_profiles && !config->n_statistics) ||
+            (config->n_profiles && config->n_statistics) || !ggml_moe_source_statistics_valid(config->statistics, config->n_statistics) ||
+            config->n_profiles > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS ||
+            (config->n_profiles && !config->profiles) ||
+            ((config->n_profiles || config->n_statistics) && (config->executor != GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ||
+                !ggml_moe_fidelity_selection().source_pool)) ||
+            sched->n_copies != 1 || sched->callback_eval != nullptr) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    int backend_id = -1;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->backends[i] == config->backend) {
+            if (backend_id >= 0) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+            backend_id = i;
+        }
+    }
+    if (backend_id < 0) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+    auto * existing = sched->hybrids[backend_id];
+    auto shared = shared_cpu;
+    if (!shared) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (sched->hybrids[i] && sched->hybrids[i]->source_cpu) { shared = sched->hybrids[i]->source_cpu; break; }
+        }
+    }
+    if (sched->hybrid != nullptr) {
+        if (!existing && !sched->hybrid->source_api) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        const auto * common = existing ? existing : sched->hybrid;
+        const auto & saved = common->config;
+        const auto & owner = common->source_owner;
+        bool profiles_match = saved.n_profiles == config->n_profiles;
+        for (uint32_t i = 0; profiles_match && i < config->n_profiles; ++i) {
+            const auto & a = saved.profiles[i];
+            const auto & b = config->profiles[i];
+            profiles_match = a.down == b.down && a.n_experts == b.n_experts && b.experts &&
+                !memcmp(a.experts, b.experts, size_t(a.n_experts) * sizeof(int32_t));
+        }
+        bool statistics_match = saved.n_statistics == config->n_statistics;
+        for (uint32_t i = 0; statistics_match && i < config->n_statistics; ++i) {
+            const auto & a = saved.statistics[i];
+            const auto & b = config->statistics[i];
+            statistics_match = a.tensor == b.tensor && a.domain == b.domain && a.observations == b.observations && a.n_experts == b.n_experts &&
+                !memcmp(a.counts, b.counts, size_t(a.n_experts) * sizeof(uint64_t));
+        }
+        const bool matches = (!existing || saved.backend == config->backend) && saved.n_threads == config->n_threads &&
+            (common->source_api ? config->max_regions <= saved.max_regions : config->max_regions == saved.max_regions) &&
+            saved.cpu_flags == config->cpu_flags &&
+            (common->source_api ? config->max_prepared_regions <= saved.max_prepared_regions : config->max_prepared_regions == saved.max_prepared_regions) &&
+            saved.gpu_miss_quota == config->gpu_miss_quota && saved.admission_quota == config->admission_quota &&
+            saved.demand_admission == config->demand_admission &&
+            saved.resident_batch == config->resident_batch && saved.profile_adaptation == config->profile_adaptation &&
+            saved.executor == config->executor &&
+            profiles_match && statistics_match &&
+            saved.cpu_bytes == config->cpu_bytes && saved.device_bytes == config->device_bytes &&
+            saved.pinned_bytes == config->pinned_bytes && owner.owner == config->source_owner->owner &&
+            saved.cpu_module_acquire == config->cpu_module_acquire && saved.module_retain == config->module_retain &&
+            saved.module_release == config->module_release &&
+            owner.generation == config->source_owner->generation && owner.retain == config->source_owner->retain &&
+            owner.release == config->source_owner->release && owner.validate_span == config->source_owner->validate_span &&
+            owner.flags == config->source_owner->flags && owner.reserved32 == config->source_owner->reserved32 &&
+            owner.reserved[0] == config->source_owner->reserved[0] && owner.reserved[1] == config->source_owner->reserved[1];
+        if (!matches) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        if (existing) { return existing->ensure_source(shared); }
+    }
+    std::unique_ptr<ggml_backend_sched_hybrid> state;
+    const auto status = ggml_backend_sched_moe_hybrid_create(config, shared, state);
+    if (status) { return status; }
+    sched->hybrids[backend_id] = state.release();
+    if (!sched->hybrid) { sched->hybrid = sched->hybrids[backend_id]; }
+    ++sched->n_hybrids;
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+} catch (...) {
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+}
+
+int32_t ggml_backend_sched_moe_hybrid_configure_v1(
+        ggml_backend_sched_t sched, const ggml_backend_moe_hybrid_config_v1 * config) {
+    return ggml_backend_sched_moe_hybrid_configure_impl_v1(sched, config);
+}
+
+int32_t ggml_backend_sched_moe_source_clone_v1(ggml_backend_sched_t sched, ggml_backend_sched_t * output) {
+    if (!sched || !output || *output || !sched->hybrid || !sched->hybrid->source_api ||
+            !sched->hybrid->source_cpu || sched->n_copies != 1 || sched->callback_eval) {
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID;
+    }
+    auto clone = ggml_backend_sched_new(sched->backends, sched->bufts, sched->n_backends,
+        sched->hash_set.size, false, sched->op_offload);
+    if (!ggml_gallocr_share_resizable_plan(clone->galloc, sched->galloc)) {
+        ggml_backend_sched_free(clone);
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        const auto * entry = sched->hybrids[i];
+        if (!entry) { continue; }
+        const auto status = ggml_backend_sched_moe_hybrid_configure_impl_v1(clone, &entry->config, entry->source_cpu);
+        if (status) { ggml_backend_sched_free(clone); return status; }
+    }
+    *output = clone;
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+static bool ggml_backend_moe_hybrid_bucket_matches(
+        const ggml_backend_moe_cpu_region_query_v1 & query,
+        const ggml_backend_moe_cpu_region_query_v1 & reference, uint32_t routes_per_row, uint32_t bucket_rows,
+        bool original_body = false) {
+    if (query.n_dynamic_inputs < 2 || query.n_dynamic_inputs != reference.n_dynamic_inputs ||
+            uint64_t(query.n_dynamic_inputs) + query.n_sources + query.n_body_nodes > INT_MAX ||
+            (!original_body && query.n_dynamic_inputs != 2) || query.dynamic_inputs == nullptr ||
+            reference.dynamic_inputs == nullptr || query.n_sources == 0 ||
+            query.n_sources != reference.n_sources || query.sources == nullptr || reference.sources == nullptr ||
+            query.n_body_nodes == 0 || query.n_body_nodes != reference.n_body_nodes ||
+            query.body_nodes == nullptr || reference.body_nodes == nullptr || !query.n_live_outputs ||
+            (!original_body && query.n_live_outputs != 1) ||
+            query.live_outputs == nullptr || (!original_body && query.live_outputs[0] != query.body_nodes[query.n_body_nodes - 1]) ||
+            query.activation != query.dynamic_inputs[0] || query.ids != query.dynamic_inputs[1]) {
+        return false;
+    }
+    const auto role = [](const ggml_backend_moe_cpu_region_query_v1 & graph, const ggml_tensor * tensor) {
+        if (tensor == nullptr) { return -1; }
+        for (uint32_t i = 0; i < graph.n_dynamic_inputs; ++i) {
+            if (tensor == graph.dynamic_inputs[i]) { return int(i); }
+        }
+        for (uint32_t i = 0; i < graph.n_sources; ++i) {
+            if (tensor == graph.sources[i].tensor) { return int(graph.n_dynamic_inputs + i); }
+        }
+        for (uint32_t i = 0; i < graph.n_body_nodes; ++i) {
+            if (tensor == graph.body_nodes[i]) { return int(graph.n_dynamic_inputs + graph.n_sources + i); }
+        }
+        return -2;
+    };
+    for (uint32_t i = 0; i < query.n_sources; ++i) {
+        const auto & a = query.sources[i];
+        const auto & b = reference.sources[i];
+        if (a.tensor == nullptr || b.tensor == nullptr || a.witness != b.witness || a.data != b.data ||
+                a.bytes != b.bytes || a.expert_stride != b.expert_stride || a.generation != b.generation ||
+                a.tensor->type != b.tensor->type || memcmp(a.tensor->ne, b.tensor->ne, sizeof(a.tensor->ne)) != 0 ||
+                memcmp(a.tensor->nb, b.tensor->nb, sizeof(a.tensor->nb)) != 0) {
+            return false;
+        }
+    }
+    if (original_body && (query.n_live_outputs != reference.n_live_outputs || !reference.live_outputs)) { return false; }
+    for (uint32_t i = 0; original_body && i < query.n_live_outputs; ++i) {
+        const int index = role(query, query.live_outputs[i]);
+        if (index < int(query.n_dynamic_inputs + query.n_sources) || index != role(reference, reference.live_outputs[i])) { return false; }
+    }
+    for (uint32_t i = 0; i < query.n_dynamic_inputs + query.n_body_nodes; ++i) {
+        const bool dynamic = i < query.n_dynamic_inputs;
+        const auto * a = dynamic ? query.dynamic_inputs[i] : query.body_nodes[i - query.n_dynamic_inputs];
+        const auto * b = dynamic ? reference.dynamic_inputs[i] : reference.body_nodes[i - query.n_dynamic_inputs];
+        if (!a || !b || a->type != b->type) { return false; }
+        if (original_body) {
+            if (memcmp(a->ne, b->ne, sizeof(a->ne)) || memcmp(a->nb, b->nb, sizeof(a->nb))) { return false; }
+        } else if (a->ne[0] <= 0 || uint64_t(a->ne[0]) > SIZE_MAX / sizeof(float) ||
+                (i < 2 && a->type != (i == 0 ? GGML_TYPE_F32 : GGML_TYPE_I32)) ||
+                a->type != b->type || a->ne[0] != (i == 1 ? routes_per_row : b->ne[0]) ||
+                a->ne[1] != (i == 0 ? 1 : i == 1 ? bucket_rows : routes_per_row) ||
+                a->ne[2] != (i == 1 ? 1 : bucket_rows) || a->ne[3] != 1 || a->nb[0] != b->nb[0] ||
+                a->nb[1] != (i < 2 ? sizeof(float) * a->ne[0] : b->nb[1]) ||
+                a->nb[1] > SIZE_MAX / uint64_t(a->ne[1]) || a->nb[2] != a->nb[1] * a->ne[1] ||
+                a->nb[2] > SIZE_MAX / uint64_t(a->ne[2]) || a->nb[3] != a->nb[2] * a->ne[2]) {
+            return false;
+        }
+        if (dynamic) { continue; }
+        if (a->op != b->op || a->flags != b->flags || a->view_offs != b->view_offs ||
+                memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0 ||
+                role(query, a->view_src) < -1 || role(query, a->view_src) != role(reference, b->view_src)) {
+            return false;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            if (role(query, a->src[source]) < -1 || role(query, a->src[source]) != role(reference, b->src[source])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+int32_t ggml_backend_moe_hybrid_get_geometry_v1(
+        const ggml_tensor * activation, const ggml_tensor * ids, const ggml_tensor * output,
+        uint32_t expert_count, ggml_backend_moe_hybrid_geometry_v1 * geometry) {
+    if (activation == nullptr || ids == nullptr || output == nullptr || geometry == nullptr ||
+            expert_count == 0 || expert_count > INT32_MAX || ids->type != GGML_TYPE_I32 ||
+            ids->ne[0] <= 0 || uint64_t(ids->ne[0]) > expert_count || ids->ne[1] <= 0 ||
+            uint64_t(ids->ne[1]) > UINT32_MAX / uint64_t(ids->ne[0]) || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ids->nb[1] < uint64_t(ids->ne[0]) * sizeof(int32_t) ||
+            ids->nb[1] % sizeof(int32_t) != 0 || uint64_t(ids->ne[1]) > SIZE_MAX / ids->nb[1] ||
+            activation->type != GGML_TYPE_F32 || activation->ne[0] <= 0 ||
+            activation->ne[1] != 1 || activation->ne[2] != ids->ne[1] || activation->ne[3] != 1 ||
+            uint64_t(activation->ne[0]) > SIZE_MAX / sizeof(float) / uint64_t(ids->ne[1]) ||
+            output->type != GGML_TYPE_F32 || output->ne[0] <= 0 ||
+            output->ne[1] != ids->ne[0] || output->ne[2] != ids->ne[1] || output->ne[3] != 1 ||
+            uint64_t(output->ne[0]) > SIZE_MAX / sizeof(float) / uint64_t(ids->ne[0]) / uint64_t(ids->ne[1]) ||
+            !ggml_is_contiguous(activation) || !ggml_is_contiguous(output)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const uint32_t route_capacity = uint32_t(ids->ne[0]) * uint32_t(ids->ne[1]);
+    *geometry = {uint32_t(ids->ne[1]), uint32_t(ids->ne[0]), route_capacity,
+        expert_count, std::min(expert_count, route_capacity)};
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_moe_hybrid_validate_buckets_v1(const ggml_backend_moe_hybrid_region_v1 * region) {
+    if (region && region->struct_size == sizeof(*region) && region->query &&
+            region->query->flags == GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION) {
+        const auto & q = *region->query;
+        if (q.struct_size != sizeof(q) || !q.graph || !q.graph->nodes || q.graph->n_nodes != 1 || q.graph->size < 1 ||
+                !q.graph_uid || q.graph->uid != q.graph_uid || !q.graph_generation ||
+                q.graph_generation != region->allocator_generation || !q.source_generation ||
+                !q.body_nodes || q.n_body_nodes != 1 || !q.body_nodes[0] || q.graph->nodes[0] != q.body_nodes[0] ||
+                !q.dynamic_inputs || q.n_dynamic_inputs != 2 || q.dynamic_inputs[0] != q.activation || q.dynamic_inputs[1] != q.ids ||
+                !q.live_outputs || q.n_live_outputs != 1 || q.live_outputs[0] != q.body_nodes[0] ||
+                !q.sources || q.n_sources != 1 || !q.activation || !q.ids || !q.sources[0].tensor ||
+                region->n_cpu_queries != 0 || region->cpu_queries != nullptr || region->n_cpu_batch_queries != 1 ||
+                !region->cpu_batch_queries || region->cpu_batch_queries[0] != region->query || region->body_query != region->query ||
+                region->first_node != region->last_node || !region->source_graph_uid || !region->split_graph_uid || !region->owner_generation ||
+                !region->output || region->output->op != GGML_OP_MUL_MAT_ID || region->output->view_src ||
+                region->output->src[0] != region->down || region->output->src[1] != region->activation || region->output->src[2] != region->ids ||
+                !region->down || !region->activation || !region->ids || !region->down->data || region->down->ne[2] <= 0 ||
+                uint64_t(region->down->ne[2]) > INT32_MAX || region->ids->ne[0] <= 0 || region->ids->ne[1] <= 0 ||
+                uint64_t(region->ids->ne[0]) > UINT32_MAX || uint64_t(region->ids->ne[1]) > UINT32_MAX / uint64_t(region->ids->ne[0])) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        const auto * projection = q.body_nodes[0];
+        const ggml_tensor * copies[] = {q.sources[0].tensor, q.activation, q.ids, projection};
+        const ggml_tensor * originals[] = {region->down, region->activation, region->ids, region->output};
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (copies[i]->type != originals[i]->type || memcmp(copies[i]->ne, originals[i]->ne, sizeof(copies[i]->ne)) ||
+                    memcmp(copies[i]->nb, originals[i]->nb, sizeof(copies[i]->nb))) {
+                return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+        const auto & source = q.sources[0];
+        const uint32_t rows = region->ids->ne[1], routes = region->ids->ne[0], experts = region->down->ne[2];
+        const ggml_backend_moe_hybrid_geometry_v1 geometry{rows, routes, rows * routes, experts, std::min(experts, rows * routes)};
+        if (projection->op != GGML_OP_MUL_MAT_ID || projection->src[0] != copies[0] || projection->src[1] != q.activation ||
+                projection->src[2] != q.ids || memcmp(projection->op_params, region->output->op_params, sizeof(projection->op_params)) ||
+                source.witness != region->down || source.data != region->down->data || source.bytes != ggml_nbytes(region->down) ||
+                source.expert_stride != region->down->nb[2] || source.generation != q.source_generation ||
+                memcmp(&geometry, &region->geometry, sizeof(geometry)) || q.bucket_rows != rows || q.routes_per_row != routes ||
+                q.source_row_capacity != rows || q.scatter_capacity != geometry.route_capacity || q.n_lanes != 1 || !q.n_threads) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t i = 3; i < GGML_MAX_SRC; ++i) {
+            if (projection->src[i] || region->output->src[i]) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        }
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+    }
+    if (region == nullptr || region->struct_size != sizeof(*region) || region->query == nullptr ||
+            region->ids == nullptr || region->cpu_queries == nullptr || region->n_cpu_queries == 0 ||
+            region->n_cpu_queries != region->ids->ne[0] || region->cpu_queries[0] != region->query ||
+            (region->cpu_batch_queries == nullptr) != (region->n_cpu_batch_queries == 0)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    ggml_backend_moe_hybrid_geometry_v1 geometry = {};
+    if (ggml_backend_moe_hybrid_get_geometry_v1(region->activation, region->ids, region->output,
+            region->geometry.expert_count, &geometry) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK ||
+            memcmp(&geometry, &region->geometry, sizeof(geometry)) != 0) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < region->n_cpu_queries; ++i) {
+        const auto * query = region->cpu_queries[i];
+        if (query == nullptr || query->struct_size != sizeof(*query) || query->bucket_rows != 1 ||
+                query->routes_per_row != i + 1 || query->source_row_capacity != geometry.row_capacity || query->n_lanes != 1 ||
+                query->scatter_capacity != geometry.route_capacity ||
+                query->graph_generation != region->query->graph_generation ||
+                query->source_generation != region->query->source_generation || query->n_threads != region->query->n_threads ||
+                query->flags != GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_NONE ||
+                !ggml_backend_moe_hybrid_bucket_matches(*query, *region->query, i + 1, 1)) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t node = 0; node < query->n_body_nodes; ++node) {
+            const auto * tensor = query->body_nodes[node];
+            if (tensor->op == GGML_OP_MUL_MAT_ID &&
+                    (tensor->src[0] == nullptr || tensor->src[0]->ne[2] != geometry.expert_count)) {
+                return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (region->n_cpu_batch_queries > 1) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < region->n_cpu_batch_queries; ++i) {
+        const auto * query = region->cpu_batch_queries[i];
+        if (query == nullptr || query->struct_size != sizeof(*query) ||
+                query->flags != GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_COMPACT_ROUTES ||
+                query->bucket_rows != geometry.route_capacity || query->routes_per_row != 1 ||
+                query->source_row_capacity != geometry.row_capacity || query->n_lanes != 1 ||
+                query->scatter_capacity != geometry.route_capacity ||
+                query->graph_generation != region->query->graph_generation ||
+                query->source_generation != region->query->source_generation ||
+                query->n_threads != region->query->n_threads ||
+                !ggml_backend_moe_hybrid_bucket_matches(*query, *region->query, 1, geometry.route_capacity)) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t node = 0; node < query->n_body_nodes; ++node) {
+            const auto * tensor = query->body_nodes[node];
+            if (tensor->op == GGML_OP_MUL_MAT_ID &&
+                    (tensor->src[0] == nullptr || tensor->src[0]->ne[2] != geometry.expert_count)) {
+                return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_moe_hybrid_bind_cpu_row_v1(
+        const ggml_backend_moe_hybrid_region_v1 * region, const ggml_backend_moe_hybrid_binding_v1 * routes,
+        uint64_t epoch, uint32_t source_row, const uint32_t * selected_routes, uint32_t count, uint32_t capacity,
+        int32_t * expert_ids, uint32_t * source_rows, uint32_t * scatter, ggml_backend_moe_cpu_region_binding_v1 * binding,
+        uint8_t * marks, size_t marks_bytes) {
+    if (ggml_backend_moe_hybrid_validate_buckets_v1(region) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK ||
+            routes == nullptr || routes->struct_size != sizeof(*routes) || epoch == 0 || routes->epoch != epoch ||
+            routes->source_graph_uid != region->source_graph_uid || routes->split_graph_uid != region->split_graph_uid ||
+            routes->owner_generation != region->owner_generation || routes->allocator_generation != region->allocator_generation ||
+            routes->source_generation != region->query->source_generation ||
+            routes->active_rows == 0 || routes->active_rows > region->geometry.row_capacity || source_row >= routes->active_rows ||
+            routes->n_routes != uint64_t(routes->active_rows) * region->geometry.routes_per_row ||
+            routes->n_weights == 0 || routes->n_weights > region->geometry.weight_capacity ||
+            routes->weight_experts == nullptr || routes->routes == nullptr || count == 0 || count > capacity ||
+            count > region->n_cpu_queries || selected_routes == nullptr || expert_ids == nullptr ||
+            source_rows == nullptr || scatter == nullptr || binding == nullptr || marks == nullptr ||
+            uint64_t(region->geometry.expert_count) + region->geometry.route_capacity > marks_bytes) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+    }
+    const size_t expert_count = region->geometry.expert_count;
+    std::fill_n(marks, expert_count + region->geometry.route_capacity, uint8_t(0));
+    auto * route_marks = marks + expert_count;
+    for (uint32_t i = 0; i < routes->n_weights; ++i) {
+        const int32_t expert = routes->weight_experts[i];
+        if (expert < 0 || uint32_t(expert) >= expert_count || marks[expert] != 0) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+        marks[expert] = 1;
+    }
+    for (uint32_t i = 0; i < routes->n_routes; ++i) {
+        const auto & route = routes->routes[i];
+        if (route.source_row >= routes->active_rows || route.source_route >= region->geometry.routes_per_row ||
+                route.weight_index >= routes->n_weights ||
+                route.scatter_destination != uint64_t(route.source_row) * region->geometry.routes_per_row + route.source_route) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+        if (route_marks[route.scatter_destination] != 0) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+        route_marks[route.scatter_destination] = 1;
+        marks[routes->weight_experts[route.weight_index]] = 2;
+    }
+    for (uint32_t i = 0; i < routes->n_weights; ++i) {
+        if (marks[routes->weight_experts[i]] != 2) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (selected_routes[i] >= routes->n_routes || routes->routes[selected_routes[i]].source_row != source_row) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+        auto & mark = route_marks[routes->routes[selected_routes[i]].scatter_destination];
+        if (mark == 2) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
+        }
+        mark = 2;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto & route = routes->routes[selected_routes[i]];
+        expert_ids[i] = routes->weight_experts[route.weight_index];
+        source_rows[i] = route.source_row;
+        scatter[i] = route.scatter_destination;
+    }
+    *binding = {sizeof(*binding), 1, count, expert_ids, source_rows, scatter};
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
+        ggml_backend_sched_t sched, const ggml_backend_moe_hybrid_region_v1 * region) try {
+    if (sched == nullptr || sched->hybrid == nullptr || sched->source_retirement_failed || !sched->is_alloc || region == nullptr ||
+            ggml_backend_moe_hybrid_validate_buckets_v1(region) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK ||
+            region->source_graph_uid != sched->source_graph_uid || region->split_index >= uint32_t(sched->n_splits) ||
+            region->owner_generation == 0 || region->allocator_generation == 0) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const auto & split = sched->splits[region->split_index];
+    auto * selected = sched->hybrids[split.backend_id];
+    if (!selected) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+    uint64_t n_regions = 0;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->hybrids[i]) {
+            sched->hybrids[i]->each_session([&](ggml_backend_sched_hybrid * entry) { n_regions += entry->regions.size(); });
+        }
+    }
+    if (n_regions >= selected->max_regions) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+    auto * root = selected;
+    if (selected->source_api) {
+        if (auto * found = selected->find_split(region->split_index)) { selected = found; }
+    }
+    uint64_t allocator_generation = 0, shrink_generation = 0;
+    ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    if (region->split_graph_uid != split.graph.uid || sched->backends[split.backend_id] != selected->backend ||
+            region->allocator_generation != allocator_generation ||
+            region->first_node > region->last_node || region->first_node < uint32_t(split.i_start) ||
+            region->last_node >= uint32_t(split.i_end) ||
+            split.graph.nodes[region->last_node - split.i_start] != region->output ||
+            region->last_node - region->first_node + 1 != region->query->n_body_nodes ||
+            selected->regions.size() >= selected->max_regions) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    auto resolved = *region;
+    resolved.first_node -= split.i_start;
+    resolved.last_node -= split.i_start;
+    auto reference = *region->query;
+    std::vector<const ggml_tensor *> body(reference.n_body_nodes);
+    const ggml_tensor * dynamic[] = {region->activation, region->ids};
+    std::vector<ggml_backend_moe_cpu_region_source_v1> sources(reference.n_sources);
+    for (uint32_t i = 0; i < reference.n_body_nodes; ++i) {
+        body[i] = split.graph.nodes[resolved.first_node + i];
+    }
+    for (uint32_t i = 0; i < reference.n_sources; ++i) {
+        sources[i] = reference.sources[i];
+        const auto * witness = static_cast<const ggml_tensor *>(sources[i].witness);
+        bool found = false;
+        for (uint32_t node = 0; node < reference.n_body_nodes; ++node) {
+            for (const auto * source : body[node]->src) {
+                found |= source != nullptr && source == witness;
+            }
+        }
+        if (!found || sources[i].data != witness->data || sources[i].bytes != ggml_nbytes(witness) ||
+                sources[i].expert_stride != witness->nb[2]) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        sources[i].tensor = witness;
+    }
+    reference.body_nodes = body.data();
+    reference.dynamic_inputs = dynamic;
+    reference.sources = sources.data();
+    const bool routed_operation = region->query->flags == GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION;
+    const ggml_tensor * projection_output[] = {region->output};
+    if (routed_operation) { reference.live_outputs = projection_output; }
+    if (!ggml_backend_moe_hybrid_bucket_matches(*region->query, reference, 1, 1, routed_operation)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    if (region->body_query) {
+        const auto & original = *region->body_query;
+        if (original.struct_size != sizeof(original) || original.graph_generation != allocator_generation ||
+                original.source_generation != reference.source_generation || original.n_body_nodes != reference.n_body_nodes ||
+                !original.graph || !original.graph_uid || original.graph_uid != original.graph->uid ||
+                !original.graph->nodes || original.graph->n_nodes <= 0 || original.graph->n_nodes > original.graph->size ||
+                uint32_t(original.graph->n_nodes) != original.n_body_nodes ||
+                !original.body_nodes || original.n_dynamic_inputs != reference.n_dynamic_inputs ||
+                !original.live_outputs || original.n_live_outputs != reference.n_live_outputs ||
+                original.n_live_outputs > GGML_BACKEND_MOE_CPU_REGION_MAX_LIVE_OUTPUTS_V1) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t i = 0; i < original.n_body_nodes; ++i) {
+            if (original.graph->nodes[i] != original.body_nodes[i]) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        }
+        auto semantic_reference = original;
+        std::vector<const ggml_tensor *> outputs;
+        for (uint32_t i = 0; i < original.n_live_outputs; ++i) {
+            const auto * end = original.body_nodes + original.n_body_nodes;
+            const auto * found = std::find(original.body_nodes, end, original.live_outputs[i]);
+            if (found == end) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+            const auto * expected_end = region->query->body_nodes + region->query->n_body_nodes;
+            const auto * expected = std::find(region->query->body_nodes, expected_end, region->query->live_outputs[i]);
+            if (expected == expected_end || expected - region->query->body_nodes != found - original.body_nodes) {
+                return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+            outputs.push_back(body[found - original.body_nodes]);
+        }
+        semantic_reference.body_nodes = body.data();
+        semantic_reference.dynamic_inputs = dynamic;
+        semantic_reference.sources = sources.data();
+        semantic_reference.live_outputs = outputs.data();
+        if (!ggml_backend_moe_hybrid_bucket_matches(original, semantic_reference, 0, 0, true)) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+    }
+    std::unique_ptr<ggml_backend_sched_hybrid> pending;
+    if (root->source_api && selected == root && !root->regions.empty() && root->regions.front().split_index != region->split_index) {
+        root->split_sessions.reserve(root->split_sessions.size() + 1);
+        const auto status = ggml_backend_sched_moe_hybrid_create(&root->config, root->source_cpu, pending);
+        if (status) { return status; }
+        selected = pending.get();
+    }
+    auto & state = *selected;
+    ggml_backend_sched_hybrid_region prepared = {};
+    struct preparation_guard {
+        ggml_backend_sched_hybrid & state;
+        ggml_backend_sched_hybrid_region & region;
+        bool published = false;
+        ~preparation_guard() { if (!published) { state.release(region); } }
+    } guard{state, prepared};
+    prepared.split_index = region->split_index;
+    prepared.allocator_generation = allocator_generation;
+    prepared.cpu.resize(uint64_t(region->n_cpu_queries) + region->n_cpu_batch_queries);
+    prepared.witnesses.reserve(region->query->n_body_nodes * (GGML_MAX_SRC + 1));
+    const auto record = [&](const ggml_tensor * tensor) {
+        if (tensor != nullptr && std::none_of(prepared.witnesses.begin(), prepared.witnesses.end(),
+                [&](const auto & witness) { return witness.first == tensor; })) {
+            prepared.witnesses.emplace_back(tensor, *tensor);
+        }
+    };
+    for (uint32_t i = resolved.first_node; i <= resolved.last_node; ++i) {
+        record(split.graph.nodes[i]);
+        for (const auto * source : split.graph.nodes[i]->src) {
+            record(source);
+        }
+    }
+    for (uint32_t i = 0; i < region->n_cpu_queries; ++i) {
+        const auto * query = region->cpu_queries[i];
+        ggml_backend_moe_cpu_prepared_requirements_v1 requirements = {};
+        requirements.struct_size = sizeof(requirements);
+        requirements.abi_version = 1;
+        const int32_t status = state.cpu_api->prepare(state.cpu, query, &requirements, &prepared.cpu[i]);
+        if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+            GGML_LOG_ERROR("%s: CPU prepare failed status=%d count=%u graph=%llu\n", __func__, status, i + 1,
+                           (unsigned long long) query->graph_uid);
+            return status;
+        }
+    }
+    for (uint32_t i = 0; i < region->n_cpu_batch_queries; ++i) {
+        const auto * query = region->cpu_batch_queries[i];
+        ggml_backend_moe_cpu_prepared_requirements_v1 requirements = {};
+        requirements.struct_size = sizeof(requirements);
+        requirements.abi_version = 1;
+        const uint32_t prepared_index = region->n_cpu_queries + i;
+        const int32_t status = state.cpu_api->prepare(state.cpu, query, &requirements, &prepared.cpu[prepared_index]);
+        if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+            GGML_LOG_ERROR("%s: CPU batch prepare failed status=%d count=%u graph=%llu\n", __func__, status, i + 1,
+                           (unsigned long long) query->graph_uid);
+            return status;
+        }
+    }
+    const int32_t status = state.source_api ? state.source_api->prepare(
+        state.device, &resolved, state.cpu_api, state.cpu, prepared.cpu.data(), &prepared.device) : state.device_api->prepare(
+        state.device, &resolved, state.cpu_api, state.cpu, prepared.cpu.data(), &prepared.device);
+    if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        return status;
+    }
+    state.regions.push_back(std::move(prepared));
+    if (pending) { root->split_sessions.push_back(std::move(pending)); }
+    guard.published = true;
+    sched->source_preparation_epoch = sched->source_retirement_epoch;
+    sched->source_preparation_graph_uid = region->source_graph_uid;
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+} catch (...) {
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+}
+
+bool ggml_backend_sched_moe_hybrid_state_v1(
+        ggml_backend_sched_t sched, ggml_backend_moe_hybrid_state_v1 * state) {
+    if (!sched || !sched->hybrid || !sched->hybrid->device || !state || state->struct_size != sizeof(*state)) { return false; }
+    auto & hybrid = *sched->hybrid;
+    const bool single = sched->n_hybrids == 1 && hybrid.split_sessions.empty();
+    if (single && !hybrid.source_api) { return hybrid.device_api->state(hybrid.device, state); }
+    ggml_backend_moe_hybrid_state_v1 aggregate = {}; aggregate.struct_size = sizeof(aggregate);
+    if (single && !hybrid.source_api->state(hybrid.device, &aggregate)) { return false; }
+    uint64_t ggml_backend_moe_hybrid_state_v1::* additive[] = {
+        &ggml_backend_moe_hybrid_state_v1::resident_routes,
+        &ggml_backend_moe_hybrid_state_v1::transfer_routes,
+        &ggml_backend_moe_hybrid_state_v1::cpu_routes,
+        &ggml_backend_moe_hybrid_state_v1::h2d_bytes,
+        &ggml_backend_moe_hybrid_state_v1::device_bytes,
+        &ggml_backend_moe_hybrid_state_v1::pinned_bytes,
+        &ggml_backend_moe_hybrid_state_v1::distinct_experts,
+        &ggml_backend_moe_hybrid_state_v1::resident_experts,
+        &ggml_backend_moe_hybrid_state_v1::transfer_experts,
+        &ggml_backend_moe_hybrid_state_v1::cpu_experts,
+        &ggml_backend_moe_hybrid_state_v1::cpu_jobs,
+        &ggml_backend_moe_hybrid_state_v1::cpu_upload_bytes,
+        &ggml_backend_moe_hybrid_state_v1::cpu_us,
+        &ggml_backend_moe_hybrid_state_v1::gpu_enqueue_us,
+        &ggml_backend_moe_hybrid_state_v1::join_us,
+        &ggml_backend_moe_hybrid_state_v1::errors,
+        &ggml_backend_moe_hybrid_state_v1::capacity_errors,
+        &ggml_backend_moe_hybrid_state_v1::cancellations,
+        &ggml_backend_moe_hybrid_state_v1::submit_to_start_us,
+        &ggml_backend_moe_hybrid_state_v1::gpu_branch_us,
+        &ggml_backend_moe_hybrid_state_v1::admission_reserved,
+        &ggml_backend_moe_hybrid_state_v1::admission_committed,
+        &ggml_backend_moe_hybrid_state_v1::admission_replacements,
+        &ggml_backend_moe_hybrid_state_v1::admission_no_slot,
+        &ggml_backend_moe_hybrid_state_v1::admission_bytes,
+        &ggml_backend_moe_hybrid_state_v1::admission_aborted,
+        &ggml_backend_moe_hybrid_state_v1::resident_batches,
+        &ggml_backend_moe_hybrid_state_v1::resident_body_submissions,
+        &ggml_backend_moe_hybrid_state_v1::gpu_body_submissions,
+        &ggml_backend_moe_hybrid_state_v1::readback_us,
+        &ggml_backend_moe_hybrid_state_v1::publication_us,
+        &ggml_backend_moe_hybrid_state_v1::admission_fence_us,
+        &ggml_backend_moe_hybrid_state_v1::prepared_device_bytes,
+        &ggml_backend_moe_hybrid_state_v1::packet_regions,
+        &ggml_backend_moe_hybrid_state_v1::producer_events,
+        &ggml_backend_moe_hybrid_state_v1::producer_fences,
+        &ggml_backend_moe_hybrid_state_v1::producer_drain_events,
+        &ggml_backend_moe_hybrid_state_v1::window_launches,
+        &ggml_backend_moe_hybrid_state_v1::window_captures,
+        &ggml_backend_moe_hybrid_state_v1::window_waits,
+        &ggml_backend_moe_hybrid_state_v1::window_fallbacks,
+        &ggml_backend_moe_hybrid_state_v1::window_fused_nodes,
+        &ggml_backend_moe_hybrid_state_v1::window_combined_regions,
+        &ggml_backend_moe_hybrid_state_v1::window_direct_regions,
+        &ggml_backend_moe_hybrid_state_v1::window_compact_select_regions,
+        &ggml_backend_moe_hybrid_state_v1::window_fused_expert_bodies,
+        &ggml_backend_moe_hybrid_state_v1::cpu_execute_calls,
+        &ggml_backend_moe_hybrid_state_v1::cpu_batch_rows,
+    };
+    bool valid = true;
+    for (int i = 0; !single && i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * entry) {
+            if (!valid) { return; }
+            ggml_backend_moe_hybrid_state_v1 part = {}; part.struct_size = sizeof(part);
+            if (!entry->device || !entry->source_api || !entry->source_api->state(entry->device, &part)) { valid = false; return; }
+            for (auto field : additive) {
+                if (aggregate.*field > UINT64_MAX - part.*field) { valid = false; return; }
+                aggregate.*field += part.*field;
+            }
+            aggregate.work_peak = std::max(aggregate.work_peak, part.work_peak);
+            // Every entry borrows the same worker service. Its active jobs are one shared count.
+            aggregate.cpu_active_jobs = std::max(aggregate.cpu_active_jobs, part.cpu_active_jobs);
+            aggregate.dispatch_active |= part.dispatch_active;
+            aggregate.quiescing |= part.quiescing;
+        });
+    }
+    if (!valid) { return false; }
+    ggml_backend_moe_cpu_service_state_v1 cpu = {}; cpu.struct_size = sizeof(cpu);
+    if (!hybrid.cpu_api || !hybrid.cpu || hybrid.cpu_api->state(hybrid.cpu, &cpu)) { return false; }
+    aggregate.cpu_active_jobs = std::max(aggregate.cpu_active_jobs, cpu.active_jobs);
+    aggregate.prepared_cpu_bytes = cpu.prepared_payload_bytes;
+    *state = aggregate;
+    return true;
+}
+
+void ggml_backend_sched_moe_hybrid_quiesce_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return; }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * hybrid) {
+            if (hybrid->source_api) {
+                if (hybrid->device) {
+                    GGML_ASSERT(hybrid->source_api->close(hybrid->device) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+                    GGML_ASSERT(hybrid->source_api->drain(hybrid->device) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+                }
+            } else { hybrid->device_api->quiesce(hybrid->device); }
+        });
+    }
+}
+
+bool ggml_backend_sched_moe_hybrid_set_test_hook_v1(
+        ggml_backend_sched_t sched, ggml_backend_moe_hybrid_test_hook_v1_t hook, void * data) {
+    if (!sched || !sched->hybrid || !sched->hybrid->device) { return false; }
+    bool result = true;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * hybrid) {
+            const bool applied = hybrid->device && (hybrid->source_api ? hybrid->source_api->set_test_hook &&
+                hybrid->source_api->set_test_hook(hybrid->device, hook, data) :
+                hybrid->device_api->set_test_hook && hybrid->device_api->set_test_hook(hybrid->device, hook, data));
+            result = applied && result;
+        });
+    }
+    return result;
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1313,6 +2307,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        memset(split->direct_dependencies, 0, sizeof(split->direct_dependencies));
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1362,6 +2357,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                memset(split->direct_dependencies, 0, sizeof(split->direct_dependencies));
                 cur_backend_id = node_backend_id;
             }
 
@@ -1397,6 +2393,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                } else if (src_backend_id != cur_backend_id && src->op != GGML_OP_NONE && !ggml_is_empty(src)) {
+                    split->direct_dependencies[src_backend_id] = true;
                 }
             }
         }
@@ -1720,19 +2718,84 @@ static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_gra
     return true;
 }
 
+static bool ggml_backend_sched_hybrid_certificate_supported(
+        const ggml_graph_execution_certificate & certificate, bool source) {
+    const bool main = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+    const bool required = certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
+    if (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL) {
+        return main || (source && required && certificate.n_sequences <= certificate.n_rows);
+    }
+    if (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT) {
+        return certificate.n_sequences == certificate.n_rows && (source || certificate.n_rows == 1) &&
+            (main ? certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE : source && required);
+    }
+    return main && required && certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
+        certificate.n_rows > 1 && certificate.n_sequences < certificate.n_rows;
+}
+
+static struct ggml_graph_execution_certificate ggml_backend_sched_split_certificate(
+        uint64_t source_graph_uid, uint64_t split_graph_uid, struct ggml_graph_execution_certificate certificate) {
+    if (certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) { return {}; }
+    certificate.source_graph_uid = source_graph_uid;
+    certificate.split_graph_uid = split_graph_uid;
+    return certificate;
+}
+
+static enum ggml_status ggml_backend_sched_hybrid_dispatch_prepare(
+        ggml_backend_sched_t sched, int split_id, uint64_t source_graph_uid,
+        const struct ggml_graph_execution_certificate & certificate, ggml_backend_sched_hybrid ** output) {
+    *output = nullptr;
+    auto * hybrid = sched->hybrid;
+    const bool independent = certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+    const bool speculative = certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+    if (!hybrid || (!hybrid->source_api && certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN && !independent && !speculative)) { return GGML_STATUS_SUCCESS; }
+    if (!ggml_backend_sched_hybrid_certificate_supported(certificate, hybrid->source_api != nullptr)) {
+        GGML_LOG_ERROR("%s: hybrid certificate rejected: graph_uid=%llu split=%d domain=%u semantics=%u rows=%u sequences=%u flags=%u\n",
+            __func__, (unsigned long long) source_graph_uid, split_id, certificate.domain,
+            certificate.row_semantics, certificate.n_rows, certificate.n_sequences, certificate.flags);
+        return GGML_STATUS_FAILED;
+    }
+    auto * selected = sched->hybrids[sched->splits[split_id].backend_id];
+    if (selected && selected->source_api) { selected = selected->find_split(split_id); }
+    if (selected) { selected->dispatch.clear(); }
+    uint64_t allocator_generation = 0, shrink_generation = 0;
+    ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    bool valid = true;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * entry) {
+            for (const auto & region : entry->regions) {
+                if (region.allocator_generation != allocator_generation || !region.matches()) {
+                    GGML_LOG_ERROR("%s: hybrid region storage witness rejected: graph_uid=%llu split=%d region_split=%u generation=%llu expected_generation=%llu\n",
+                        __func__, (unsigned long long) source_graph_uid, split_id, region.split_index,
+                        (unsigned long long) region.allocator_generation, (unsigned long long) allocator_generation);
+                    valid = false; return;
+                }
+                if (region.split_index == uint32_t(split_id)) {
+                    if (entry != selected) { valid = false; return; }
+                    selected->dispatch.push_back(region.device);
+                }
+            }
+        });
+    }
+    if (!valid) { return GGML_STATUS_FAILED; }
+    if (selected && (!selected->source_api || !selected->dispatch.empty())) { *output = selected; }
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_sched_dispatch_split(
         ggml_backend_t backend,
         struct ggml_cgraph * graph,
         uint64_t source_graph_uid,
-        const struct ggml_graph_execution_certificate & certificate) {
-    graph->execution_certificate = {};
-    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
-        graph->execution_certificate = certificate;
-        graph->execution_certificate.source_graph_uid = source_graph_uid;
-        graph->execution_certificate.split_graph_uid = graph->uid;
-    }
+        const struct ggml_graph_execution_certificate & certificate,
+        ggml_backend_sched_hybrid * hybrid = nullptr) {
+    graph->execution_certificate = ggml_backend_sched_split_certificate(source_graph_uid, graph->uid, certificate);
 
-    const enum ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+    const enum ggml_status status = hybrid != nullptr ? (hybrid->source_api ?
+        hybrid->source_api->compute(hybrid->device, graph, hybrid->dispatch.data(), hybrid->dispatch.size()) :
+        hybrid->device_api->compute(hybrid->device, graph, hybrid->dispatch.data(), hybrid->dispatch.size())) :
+        ggml_backend_graph_compute_async(backend, graph);
     graph->execution_certificate = {};
     return status;
 }
@@ -1745,11 +2808,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(
     struct ggml_backend_sched_split * splits = sched->splits;
     const bool required_grouped =
         (certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
-    const auto fail = [&](enum ggml_status status) {
-        if (required_grouped) {
-            for (int i = 0; i < sched->n_backends; ++i) {
-                ggml_backend_synchronize(sched->backends[i]);
+    bool previous_split_effects = false;
+    const auto fail = [&](enum ggml_status status, ggml_backend_sched_hybrid * failed = nullptr) {
+        if (sched->hybrid && sched->hybrid->source_api) {
+            ggml_backend_moe_hybrid_state_v1 state = {}; state.struct_size = sizeof(state);
+            const bool safe_rejection = failed && failed->source_api && failed->device && !previous_split_effects &&
+                failed->source_api->state(failed->device, &state) &&
+                state.ticket_state == GGML_BACKEND_MOE_SOURCE_CORE_TICKET_V1_REJECTED_BEFORE_EFFECTS &&
+                !state.quiescing && !state.dispatch_active && !state.cpu_active_jobs;
+            if (!safe_rejection) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
+            const int32_t drained = ggml_backend_sched_moe_source_drain_v1(sched);
+            if (drained != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
+            if (previous_split_effects && drained == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
+                // Source retirement also covers earlier ordinary backend work.
+                for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
             }
+            GGML_LOG_ERROR("%s: source failure status=%d safe_rejection=%d previous_split_effects=%d drain_status=%d\n",
+                __func__, int(status), int(safe_rejection), int(previous_split_effects), drained);
+            return status;
+        }
+        if (required_grouped || sched->hybrid != nullptr) {
+            for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
         }
         return status;
     };
@@ -1774,6 +2853,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
     }
 
+    if (!sched->callback_eval && sched->hybrid && sched->hybrid->source_api) {
+        // Check static source metadata before any split copies or execution.
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            ggml_backend_sched_hybrid * hybrid = nullptr;
+            const auto prepared = ggml_backend_sched_hybrid_dispatch_prepare(sched, split_id, source_graph_uid, certificate, &hybrid);
+            if (prepared != GGML_STATUS_SUCCESS) { return fail(prepared); }
+            if (!hybrid) { continue; }
+            const auto & graph = splits[split_id].graph;
+            const auto projected = ggml_backend_sched_split_certificate(source_graph_uid, graph.uid, certificate);
+            const auto status = hybrid->source_api->preflight(hybrid->device, &graph, &projected,
+                hybrid->dispatch.data(), hybrid->dispatch.size());
+            if (status != GGML_STATUS_SUCCESS) { return fail(status, hybrid); }
+        }
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1785,35 +2879,72 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+        // Directly readable inputs and shared allocations still need producer ordering.
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            const bool previous = backend_id == prev_backend_id && backend_id != split_backend_id &&
+                (split->n_inputs == 0 || sched->bufts[backend_id] == sched->bufts[split_backend_id]);
+            if (!previous && !split->direct_dependencies[backend_id]) { continue; }
+            if (sched->events[backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                ggml_backend_synchronize(sched->backends[backend_id]);
             }
         }
+
+        const auto * source_entry = sched->hybrids[split_backend_id];
+        const bool source_input_batch = split->n_inputs > 0 && source_entry && source_entry->source_api &&
+            source_entry->backend == split_backend && !sched->callback_eval &&
+            ggml_backend_sched_hybrid_certificate_supported(certificate, true) &&
+            (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+             certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE ||
+             certificate.domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN) &&
+            sched->events[split_backend_id][sched->cur_copy] == NULL;
+        if (source_input_batch) {
+            ggml_backend_synchronize(split_backend);
+        }
+        bool source_input_pending = false;
+        const auto source_input_buft = source_input_batch ? ggml_backend_get_default_buffer_type(split_backend) : nullptr;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            auto * input_cpy_buffer = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+            const bool source_async_input = source_input_batch && split_backend->iface.set_tensor_async &&
+                input->buffer && ggml_backend_buffer_is_host(input->buffer) && input_cpy_buffer &&
+                input_cpy_buffer->buft == source_input_buft;
+            auto copy_input = [&]() {
+                if (source_async_input) {
+                    GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
+                    if (input == input_cpy) { return; }
+                    const size_t bytes = ggml_nbytes(input);
+                    if (bytes) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, bytes);
+                        source_input_pending = true;
+                    }
+                } else {
+                    if (source_input_pending) {
+                        ggml_backend_synchronize(split_backend);
+                        source_input_pending = false;
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
+            };
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                // complete user input copies before dispatch or return so the user can overwrite the data
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!source_input_batch) {
                     ggml_backend_synchronize(split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                copy_input();
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!source_input_batch) {
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -1919,27 +3050,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
+                        } else if (ranged || !source_async_input) {
                             ggml_backend_synchronize(split_backend);
+                            source_input_pending = false;
                         }
                         if (ranged) {
                             // blocking like the copy it replaces: the split backend is idle here, so the ranges go on its own stream and the host waits for them
                             ggml_backend_tensor_set_2d_async(split_backend, input_cpy, input->data, 0, rg.used, rg.n, rg.stride, rg.stride);
                             ggml_backend_synchronize(split_backend);
+                            source_input_pending = false;
                         } else {
-                            ggml_backend_tensor_copy(input, input_cpy);
+                            copy_input();
                         }
                     }
                 }
             }
         }
+        if (source_input_pending) {
+            // finish host reads before dispatch, validation failure or scheduler return
+            ggml_backend_synchronize(split_backend);
+        }
 
         if (!sched->callback_eval) {
+            ggml_backend_sched_hybrid * hybrid = nullptr;
+            const auto prepared = ggml_backend_sched_hybrid_dispatch_prepare(sched, split_id, source_graph_uid, certificate, &hybrid);
+            if (prepared != GGML_STATUS_SUCCESS) { return fail(prepared); }
             enum ggml_status ec = ggml_backend_sched_dispatch_split(
-                split_backend, &split->graph, source_graph_uid, certificate);
+                split_backend, &split->graph, source_graph_uid, certificate, hybrid);
             if (ec != GGML_STATUS_SUCCESS) {
-                return fail(ec);
+                return fail(ec, hybrid);
             }
+            previous_split_effects = true;
         } else {
             split->graph.execution_certificate = {};
             // similar to ggml_backend_compare_graph_backend
@@ -1985,6 +3126,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(
 
     return GGML_STATUS_SUCCESS;
 }
+
+static bool ggml_backend_sched_retire_buffer_bindings(void * user_data);
 
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
@@ -2051,6 +3194,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    ggml_gallocr_set_buffer_replacement_callback(sched->galloc, ggml_backend_sched_retire_buffer_bindings, sched);
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
@@ -2061,6 +3205,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * entry = sched->hybrids[i];
+        if (entry && entry->source_api) { GGML_ASSERT(entry->clear_source() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK); }
+        delete entry;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2089,6 +3238,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner) {
     GGML_ASSERT(sched != nullptr);
+    if (sched->hybrid != nullptr && !sched->hybrid->source_api && owner != nullptr) {
+        return false;
+    }
     return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);
 }
 
@@ -2107,6 +3259,9 @@ void ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->hybrids[i]) { sched->hybrids[i]->clear(); }
+    }
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2117,6 +3272,131 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
     sched->source_graph = nullptr;
     sched->source_graph_uid = 0;
+}
+
+bool ggml_backend_sched_moe_source_selected_v1(ggml_backend_sched_t sched) {
+    return sched && sched->hybrid && sched->hybrid->source_api;
+}
+
+static int32_t ggml_backend_sched_moe_source_clear(ggml_backend_sched_t sched, bool keep_cpu) {
+    int32_t result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * entry = sched->hybrids[i];
+        if (!entry || !entry->source_api) { continue; }
+        const auto status = entry->clear_source(keep_cpu);
+        if (!result) { result = status; }
+    }
+    return result;
+}
+
+uint64_t ggml_backend_sched_moe_source_retirement_epoch_v1(ggml_backend_sched_t sched) {
+    return sched ? sched->source_retirement_epoch : 0;
+}
+
+int32_t ggml_backend_sched_moe_source_retire_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    if (sched->source_retirement_epoch == UINT64_MAX) {
+        sched->source_retirement_failed = true;
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED;
+    }
+    ++sched->source_retirement_epoch;
+    const auto status = ggml_backend_sched_moe_source_clear(sched, true);
+    sched->source_retirement_failed = status != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    if (status) { return status; }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+static bool ggml_backend_sched_retire_buffer_bindings(void * user_data) {
+    auto * sched = static_cast<ggml_backend_sched_t>(user_data);
+    return !ggml_backend_sched_moe_source_selected_v1(sched) ||
+        ggml_backend_sched_moe_source_retire_v1(sched) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_sched_moe_source_reset_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    const auto status = ggml_backend_sched_moe_source_clear(sched, false);
+    if (status) { return status; }
+    sched->source_retirement_failed = false;
+    sched->source_preparation_graph_uid = 0;
+    ggml_backend_sched_reset(sched);
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_sched_moe_source_reset_graph_v1(ggml_backend_sched_t sched) {
+    if (!sched || !sched->hybrid || !sched->hybrid->source_api) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    const auto status = ggml_backend_sched_moe_source_clear(sched, true);
+    if (status) { return status; }
+    sched->source_retirement_failed = false;
+    sched->source_preparation_graph_uid = 0;
+    ggml_backend_sched_reset(sched);
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_sched_moe_source_drain_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    int32_t result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root || !root->source_api) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * state) {
+            std::lock_guard<std::mutex> lock(state->source_mutex);
+            const auto status = state->device ? state->source_api->drain(state->device) : GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+            if (!result) { result = status; }
+        });
+    }
+    return result;
+}
+
+int32_t ggml_backend_sched_moe_source_close_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    int32_t result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        auto * root = sched->hybrids[i];
+        if (!root || !root->source_api) { continue; }
+        root->each_session([&](ggml_backend_sched_hybrid * state) {
+            std::lock_guard<std::mutex> lock(state->source_mutex);
+            const auto status = state->device ? state->source_api->close(state->device) : GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+            if (!result) { result = status; }
+        });
+    }
+    return result;
+}
+
+int32_t ggml_backend_sched_moe_source_fallback_v1(ggml_backend_sched_t sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    if (!sched->hybrid || !sched->hybrid->source_api) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    const auto status = ggml_backend_sched_moe_source_clear(sched, false);
+    if (status) { return status; }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        delete sched->hybrids[i]; sched->hybrids[i] = nullptr;
+    }
+    sched->hybrid = nullptr; sched->n_hybrids = 0;
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+int32_t ggml_backend_sched_moe_source_free_v1(ggml_backend_sched_t * sched) {
+    if (!sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_INVALID; }
+    if (!*sched) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    const auto status = ggml_backend_sched_moe_source_clear(*sched, false);
+    if (status) { return status; }
+    int32_t result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    for (int i = 0; i < (*sched)->n_backends; ++i) {
+        auto * state = (*sched)->hybrids[i];
+        if (!state || !state->source_api) { continue; }
+        for (auto * module : {&state->device_module, &state->cpu_module}) {
+            if (*module) {
+                if (state->config.module_release(*module)) { *module = nullptr; }
+                else { result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED; }
+            }
+        }
+    }
+    if (result) { return result; }
+    ggml_backend_sched_free(*sched);
+    *sched = nullptr;
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2184,6 +3464,10 @@ enum ggml_status ggml_backend_sched_graph_compute_ext(
         struct ggml_cgraph * graph,
         const struct ggml_graph_execution_certificate * certificate) {
     enum ggml_status err = ggml_backend_sched_graph_compute_async_ext(sched, graph, certificate);
+    if (ggml_backend_sched_moe_source_selected_v1(sched)) {
+        if (err != GGML_STATUS_SUCCESS) { return err; }
+        if (ggml_backend_sched_moe_source_drain_v1(sched) != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { return GGML_STATUS_FAILED; }
+    }
     ggml_backend_sched_synchronize(sched);
     return err;
 }
@@ -2201,6 +3485,14 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
     const bool certificate_valid = ggml_backend_sched_execution_certificate_valid(certificate);
     const bool required_grouped = certificate != nullptr &&
         (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    if (sched->hybrid != nullptr && (!certificate_valid || sched->callback_eval != nullptr ||
+            !ggml_backend_sched_hybrid_certificate_supported(*certificate, sched->hybrid->source_api != nullptr))) {
+        GGML_LOG_ERROR("%s: hybrid execution certificate rejected: graph_uid=%llu valid=%d callback=%d domain=%u semantics=%u rows=%u sequences=%u\n",
+            __func__, (unsigned long long) graph->uid, certificate_valid, sched->callback_eval != nullptr,
+            certificate ? certificate->domain : 0, certificate ? certificate->row_semantics : 0,
+            certificate ? certificate->n_rows : 0, certificate ? certificate->n_sequences : 0);
+        return GGML_STATUS_FAILED;
+    }
     if (required_grouped && !certificate_valid) {
         GGML_LOG_ERROR("%s: invalid required grouped execution certificate\n", __func__);
         return GGML_STATUS_FAILED;
@@ -2224,18 +3516,27 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
     }
 
     if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
-        if (required_grouped) {
+        if (required_grouped || sched->hybrid != nullptr) {
             GGML_LOG_ERROR("%s: required grouped execution certificate does not match the source graph\n", __func__);
             return GGML_STATUS_FAILED;
         }
         certificate_value = {};
     }
 
+    if (sched->source_retirement_failed || (sched->hybrid && sched->hybrid->source_api &&
+            (required_grouped || sched->source_preparation_graph_uid == sched->source_graph_uid) &&
+            sched->source_preparation_epoch != sched->source_retirement_epoch)) {
+        GGML_LOG_ERROR("%s: retired source bindings require checked preparation\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
     return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (ggml_backend_sched_moe_source_selected_v1(sched)) {
+        GGML_ASSERT(ggml_backend_sched_moe_source_drain_v1(sched) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+    }
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
@@ -2256,6 +3557,314 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+int32_t ggml_backend_sched_region_finalize_v1(
+        ggml_backend_sched_t                                  sched,
+        const ggml_backend_sched_region_query_v1 *            region,
+        ggml_backend_sched_region_handoff_v1 *                handoff) {
+    if (handoff == nullptr || handoff->struct_size != sizeof(*handoff) ||
+            handoff->abi_version != GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    *handoff = {};
+    ggml_backend_sched_region_handoff_v1 result = {};
+    result.struct_size = sizeof(result);
+    result.abi_version = GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION;
+    if (sched == nullptr || region == nullptr || region->struct_size != sizeof(*region) ||
+            region->abi_version != GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION || region->reserved32 != 0 ||
+            region->graph == nullptr || region->body_nodes == nullptr || region->n_body_nodes == 0 ||
+            (region->n_dynamic_inputs != 0 && region->dynamic_inputs == nullptr) ||
+            (region->n_live_outputs != 0 && region->live_outputs == nullptr)) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const ggml_cgraph * graph = region->graph;
+    if (graph->uid == 0 || graph->n_nodes <= 0 || graph->nodes == nullptr || graph->n_nodes > graph->size ||
+            !sched->is_alloc || sched->source_graph != graph || sched->source_graph_uid != graph->uid) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_NOT_FINALIZED;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == nullptr) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_NOT_FINALIZED;
+        }
+    }
+    if (sched->callback_eval != nullptr) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_CALLBACK;
+    }
+    if (region->n_dynamic_inputs > GGML_BACKEND_SCHED_REGION_MAX_DYNAMIC_INPUTS_V1) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_CAPACITY;
+    }
+
+    int first = -1;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == region->body_nodes[0]) {
+            first = i;
+            break;
+        }
+    }
+    if (first < 0 || region->n_body_nodes > (uint32_t) (graph->n_nodes - first)) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+    }
+    for (uint32_t i = 0; i < region->n_body_nodes; ++i) {
+        if (region->body_nodes[i] == nullptr || graph->nodes[first + i] != region->body_nodes[i]) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (region->body_nodes[i] == region->body_nodes[j]) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+        }
+    }
+    const int last = first + region->n_body_nodes - 1;
+    const int tail = last + 1;
+    if ((tail < graph->n_nodes ? graph->nodes[tail] : nullptr) != region->tail_resume) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+    }
+
+    int split_index = -1;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & split = sched->splits[i];
+        if (first >= split.i_start && last < split.i_end) {
+            split_index = i;
+            break;
+        }
+    }
+    if (split_index < 0 || sched->splits[split_index].graph.uid == 0) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_CROSS_SPLIT;
+    }
+    const auto & split = sched->splits[split_index];
+    if (split.graph.n_nodes != split.i_end - split.i_start || split.graph.nodes == nullptr ||
+            split.graph.nodes != graph->nodes + split.i_start) {
+        return GGML_BACKEND_SCHED_REGION_STATUS_V1_NOT_FINALIZED;
+    }
+
+    const auto body_index = [&](const ggml_tensor * tensor) {
+        for (uint32_t i = 0; i < region->n_body_nodes; ++i) {
+            if (region->body_nodes[i] == tensor) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+    result.n_dynamic_inputs = region->n_dynamic_inputs;
+    for (uint32_t i = 0; i < region->n_dynamic_inputs; ++i) {
+        const ggml_tensor * input = region->dynamic_inputs[i];
+        if (input == nullptr || body_index(input) >= 0) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (region->dynamic_inputs[j] == input) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+        const ggml_tensor * finalized = input;
+        bool referenced = false;
+        for (uint32_t node = 0; node < region->n_body_nodes && !referenced; ++node) {
+            const auto * body = region->body_nodes[node];
+            referenced = body->view_src == input;
+            for (int src = 0; src < GGML_MAX_SRC && !referenced; ++src) {
+                referenced = body->src[src] == input;
+            }
+        }
+        for (int j = 0; !referenced && j < split.n_inputs; ++j) {
+            if (split.inputs[j] != input) {
+                continue;
+            }
+            finalized = tensor_copy(const_cast<ggml_tensor *>(input), split.backend_id, sched->cur_copy);
+            for (uint32_t node = 0; node < region->n_body_nodes && !referenced; ++node) {
+                const auto * body = region->body_nodes[node];
+                referenced = body->view_src == finalized;
+                for (int src = 0; src < GGML_MAX_SRC && !referenced; ++src) {
+                    referenced = body->src[src] == finalized;
+                }
+            }
+        }
+        if (!referenced || finalized == nullptr || body_index(finalized) >= 0) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+        }
+        result.dynamic_inputs[i] = finalized;
+    }
+
+    const auto dynamic_input = [&](const ggml_tensor * tensor) {
+        for (uint32_t i = 0; i < result.n_dynamic_inputs; ++i) {
+            if (result.dynamic_inputs[i] == tensor) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (uint32_t i = 0; i < region->n_body_nodes; ++i) {
+        const auto * node = region->body_nodes[i];
+        const bool metadata_view = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                                   node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+        if (node->view_src != nullptr && !metadata_view) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+        }
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            const auto * tensor = node->src[src];
+            const int dependency = body_index(tensor);
+            if (dependency >= (int) i ||
+                    (tensor != nullptr && dependency < 0 && !dynamic_input(tensor) && tensor->op != GGML_OP_NONE)) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+        }
+        const int view_dependency = body_index(node->view_src);
+        if (view_dependency >= (int) i ||
+                (node->view_src != nullptr && view_dependency < 0 && !dynamic_input(node->view_src) &&
+                 node->view_src->op != GGML_OP_NONE)) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+        }
+    }
+
+    for (uint32_t i = 0; i < region->n_live_outputs; ++i) {
+        const auto & live = region->live_outputs[i];
+        if (live.reserved != 0 || live.tensor == nullptr || body_index(live.tensor) < 0 ||
+                (live.n_consumers == 0 && (live.tensor->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) ||
+                (live.n_consumers != 0 && live.consumers == nullptr)) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (region->live_outputs[j].tensor == live.tensor) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+            }
+        }
+        for (uint32_t j = 0; j < live.n_consumers; ++j) {
+            const ggml_tensor * consumer = live.consumers[j];
+            for (uint32_t previous = 0; previous < j; ++previous) {
+                if (live.consumers[previous] == consumer) {
+                    return GGML_BACKEND_SCHED_REGION_STATUS_V1_INVALID_ARGUMENT;
+                }
+            }
+            int consumer_index = -1;
+            for (int node = last + 1; node < graph->n_nodes; ++node) {
+                if (graph->nodes[node] == consumer) {
+                    consumer_index = node;
+                    break;
+                }
+            }
+            const bool consumes = ggml_backend_sched_region_consumes_v1(consumer, live.tensor);
+            if (consumer_index < 0 || !consumes) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+        }
+    }
+    for (uint32_t body = 0; body < region->n_body_nodes; ++body) {
+        if ((region->body_nodes[body]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            continue;
+        }
+        bool declared = false;
+        for (uint32_t i = 0; i < region->n_live_outputs; ++i) {
+            declared = declared || region->live_outputs[i].tensor == region->body_nodes[body];
+        }
+        if (!declared) {
+            return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+        }
+    }
+    for (int node = 0; node < graph->n_nodes; ++node) {
+        if (node >= first && node <= last) {
+            continue;
+        }
+        const auto * consumer = graph->nodes[node];
+        for (uint32_t body = 0; body < region->n_body_nodes; ++body) {
+            const auto * tensor = region->body_nodes[body];
+            const bool consumes = ggml_backend_sched_region_consumes_v1(consumer, tensor);
+            if (!consumes) {
+                continue;
+            }
+            bool declared = false;
+            for (uint32_t i = 0; i < region->n_live_outputs && !declared; ++i) {
+                const auto & live = region->live_outputs[i];
+                if (live.tensor != tensor) {
+                    continue;
+                }
+                for (uint32_t j = 0; j < live.n_consumers; ++j) {
+                    declared = live.consumers[j] == consumer;
+                    if (declared) {
+                        break;
+                    }
+                }
+            }
+            if (!declared) {
+                return GGML_BACKEND_SCHED_REGION_STATUS_V1_INCOMPLETE_CUT;
+            }
+        }
+    }
+
+    result.source_graph_uid = graph->uid;
+    result.split_graph_uid  = split.graph.uid;
+    result.split_index      = (uint32_t) split_index;
+    result.first_node_index = (uint32_t) first;
+    result.last_node_index  = (uint32_t) last;
+    result.tail_node_index  = (uint32_t) tail;
+    *handoff = result;
+    return GGML_BACKEND_SCHED_REGION_STATUS_V1_OK;
+}
+
+uint64_t ggml_backend_moe_graph_uid_v1(const ggml_cgraph * graph) {
+    return graph != nullptr ? graph->uid : 0;
+}
+
+bool ggml_backend_moe_graph_assign_uid_v1(ggml_cgraph * graph) {
+    if (graph == nullptr) {
+        return false;
+    }
+    graph->uid = ggml_graph_next_uid();
+    return graph->uid != 0;
+}
+
+bool ggml_backend_sched_region_snapshot_graph_v1(
+        ggml_cgraph *                                  graph,
+        const ggml_backend_sched_region_handoff_v1 *   handoff,
+        ggml_tensor * const *                          nodes,
+        uint32_t                                       n_nodes,
+        ggml_tensor * const *                          leafs,
+        uint32_t                                       n_leafs) {
+    if (graph == nullptr || handoff == nullptr || handoff->struct_size != sizeof(*handoff) ||
+            handoff->abi_version != GGML_BACKEND_SCHED_REGION_FINALIZE_V1_VERSION ||
+            handoff->source_graph_uid == 0 || handoff->split_graph_uid == 0 || n_nodes == 0 || nodes == nullptr ||
+            (n_leafs != 0 && leafs == nullptr) || graph->size <= 0 || graph->nodes == nullptr || graph->leafs == nullptr ||
+            n_nodes > (uint32_t) graph->size || n_leafs > (uint32_t) graph->size) {
+        return false;
+    }
+    if ((size_t) n_leafs > SIZE_MAX - (size_t) n_nodes ||
+            (size_t) n_nodes > SIZE_MAX / sizeof(*nodes) || (size_t) n_leafs > SIZE_MAX / sizeof(*leafs)) {
+        return false;
+    }
+    const size_t n_tensors = (size_t) n_leafs + n_nodes;
+    if (n_tensors > graph->visited_hash_set.size) {
+        return false;
+    }
+    ggml_hash_set_reset(&graph->visited_hash_set);
+    memset(graph->use_counts, 0, graph->visited_hash_set.size * sizeof(*graph->use_counts));
+    for (size_t i = 0; i < n_tensors; ++i) {
+        ggml_tensor * tensor = i < n_leafs ? leafs[i] : nodes[i - n_leafs];
+        if (tensor == nullptr || ggml_hash_insert(&graph->visited_hash_set, tensor) == GGML_HASHSET_ALREADY_EXISTS) {
+            ggml_hash_set_reset(&graph->visited_hash_set);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n_tensors; ++i) {
+        const ggml_tensor * tensor = i < n_leafs ? leafs[i] : nodes[i - n_leafs];
+        for (const auto * src : tensor->src) {
+            if (src == nullptr) {
+                continue;
+            }
+            const size_t source = ggml_hash_find(&graph->visited_hash_set, src);
+            if (source == GGML_HASHSET_FULL || !ggml_bitset_get(graph->visited_hash_set.used, source) ||
+                    graph->use_counts[source] == INT32_MAX) {
+                ggml_hash_set_reset(&graph->visited_hash_set);
+                return false;
+            }
+            graph->use_counts[source]++;
+        }
+    }
+    graph->n_nodes = n_nodes;
+    graph->n_leafs = n_leafs;
+    memcpy(graph->nodes, nodes, n_nodes * sizeof(*nodes));
+    if (n_leafs != 0) {
+        memcpy(graph->leafs, leafs, n_leafs * sizeof(*leafs));
+    }
+    return true;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
@@ -2715,4 +4324,65 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+// This process selection is fixed before a prepared region is measured.
+const ggml_moe_fidelity_config & ggml_moe_fidelity_selection() {
+    static const ggml_moe_fidelity_config config = [] {
+        ggml_moe_fidelity_config c;
+        const char * mode = std::getenv("GGML_MOE_FIDELITY_PIPELINE");
+        if (mode && std::strcmp(mode, "control") && std::strcmp(mode, "reference") &&
+                std::strcmp(mode, "conversion") && std::strcmp(mode, "reference-conversion")) { c.valid = false; }
+        c.reference = mode && (!std::strcmp(mode, "reference") || !std::strcmp(mode, "reference-conversion"));
+        c.source_pool = mode && (!std::strcmp(mode, "conversion") || !std::strcmp(mode, "reference-conversion"));
+        const char * executor = std::getenv("GGML_MOE_HYBRID_EXECUTOR");
+        const bool source_executor = executor && !std::strcmp(executor, "source");
+        if (source_executor) {
+            if (mode && std::strcmp(mode, "reference-conversion")) { c.valid = false; }
+            c.reference = c.source_pool = true;
+        }
+        const char * value = std::getenv(source_executor ? "GGML_MOE_SOURCE_GPU_MISS_FRACTION" : "GGML_MOE_FIDELITY_PCIE_FRAC");
+        if (c.reference && !value) { c.valid = false; }
+        if (value) {
+            char * end = nullptr;
+            errno = 0;
+            const double fraction = std::strtod(value, &end);
+            if (errno || end == value || *end || !std::isfinite(fraction) || fraction < 0 || fraction > 1) { c.valid = false; }
+            else { c.pcie_num = unsigned(std::floor(fraction * 256.0 + 0.5)); }
+        }
+        const char * cache = std::getenv("GGML_MOE_FIDELITY_CACHE_POLICY");
+        if (cache && std::strcmp(cache, "static")) { c.valid = false; }
+        const auto unsupported_adapt = [](const char * entry) {
+            constexpr char prefix[] = "GGML_MOE_FIDELITY_ADAPT_";
+            for (size_t i = 0; i < sizeof(prefix) - 1; ++i) {
+                char character = entry[i];
+#ifdef _WIN32
+                if (character >= 'a' && character <= 'z') { character -= 'a' - 'A'; }
+#endif
+                if (character != prefix[i]) { return false; }
+            }
+            return true;
+        };
+#ifdef _WIN32
+        char * environment = GetEnvironmentStringsA();
+        if (!environment) { c.valid = false; }
+        else {
+            for (const char * entry = environment; *entry; entry += std::strlen(entry) + 1) {
+                if (unsupported_adapt(entry)) { c.valid = false; break; }
+            }
+            FreeEnvironmentStringsA(environment);
+        }
+#else
+#ifdef __APPLE__
+        char ** environment = *_NSGetEnviron();
+#else
+        char ** environment = environ;
+#endif
+        for (char ** entry = environment; entry && *entry; ++entry) {
+            if (unsupported_adapt(*entry)) { c.valid = false; break; }
+        }
+#endif
+        return c;
+    }();
+    return config;
 }

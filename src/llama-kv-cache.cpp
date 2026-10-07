@@ -1365,7 +1365,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool graph_reserve) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -1378,7 +1378,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
-    return result;
+    return graph_reserve ? llama_memory_graph_extent(result, get_size(), n_pad_cur) : result;
 }
 
 uint32_t llama_kv_cache::get_reserve_n_kv(const slot_info_vec_t & sinfos) const {
@@ -3115,7 +3115,7 @@ bool llama_kv_cache_context::next() {
     return true;
 }
 
-bool llama_kv_cache_context::apply() {
+bool llama_kv_cache_context::apply(bool graph_reserve) {
     assert(!llama_memory_status_is_fail(status));
 
     // no ubatches -> this is a KV cache update
@@ -3126,7 +3126,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], graph_reserve);
 
     return true;
 }

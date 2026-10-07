@@ -124,6 +124,7 @@ struct test_context {
         cparams.n_samplers = configs.size();
         cparams.kv_unified = kv_unified;
         cparams.n_rs_seq = params.sampled_decode ? 1 : 0;
+        cparams.decode_boundary_overlap = params.sampled_decode;
         if (params.sampled_host_inputs) {
             cparams.type_k = GGML_TYPE_Q8_0;
             cparams.type_v = GGML_TYPE_Q8_0;

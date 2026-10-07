@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-ext.h"
+#include "llama-draft-vocab.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -30,24 +31,285 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <locale>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 bool llama_internal_model_no_alloc(const llama_model * model);
 
 static bool is_moe_cache_source_buft(ggml_backend_buffer_type_t buft);
+
+class llama_moe_source_lifetime {
+    struct readable_span {
+        const void * witness = nullptr;
+        const void * data = nullptr;
+        uint64_t bytes = 0;
+        uint64_t expert_stride = 0;
+        int32_t type = GGML_TYPE_COUNT;
+        int64_t ne[GGML_MAX_DIMS] = {};
+        uint64_t nb[GGML_MAX_DIMS] = {};
+
+        bool operator==(const readable_span & other) const {
+            return witness == other.witness && data == other.data && bytes == other.bytes &&
+                expert_stride == other.expert_stride && type == other.type &&
+                std::equal(std::begin(ne), std::end(ne), std::begin(other.ne)) &&
+                std::equal(std::begin(nb), std::end(nb), std::begin(other.nb));
+        }
+    };
+
+public:
+    llama_moe_source_lifetime() : generation(next_generation.fetch_add(1, std::memory_order_relaxed)) {
+        GGML_ASSERT(generation != 0);
+    }
+
+    ggml_backend_moe_source_owner_v1 owner_v1() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_backend_moe_source_owner_v1 result = {};
+        result.struct_size = sizeof(result);
+        result.abi_version = GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION;
+        result.owner = this;
+        result.generation = generation;
+        result.flags = borrowed ? GGML_BACKEND_MOE_SOURCE_OWNER_FLAG_V1_BORROWED : GGML_BACKEND_MOE_SOURCE_OWNER_FLAG_V1_NONE;
+        result.retain = retain_v1;
+        result.release = release_v1;
+        result.validate_span = validate_span_v1;
+        return result;
+    }
+
+    bool register_readable_span(const ggml_tensor * tensor, const void * data, size_t bytes) {
+        if (tensor == nullptr || data == nullptr || bytes == 0 || tensor->data != data || ggml_nbytes(tensor) != bytes) {
+            return false;
+        }
+        readable_span span = {};
+        span.witness       = tensor;
+        span.data          = data;
+        span.bytes         = bytes;
+        span.expert_stride = tensor->nb[2];
+        span.type          = tensor->type;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            span.ne[i] = tensor->ne[i];
+            span.nb[i] = tensor->nb[i];
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!accepting || borrowed || active_leases != 0 || readable_spans.size() >= GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {
+            return false;
+        }
+        for (const auto & current : readable_spans) {
+            if (current.witness == tensor) {
+                return current == span;
+            }
+        }
+        readable_spans.push_back(span);
+        return true;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex);
+        accepting = false;
+    }
+
+    void close_and_drain() {
+        std::unique_lock<std::mutex> lock(mutex);
+        accepting = false;
+        drained.wait(lock, [this] { return active_leases == 0; });
+    }
+
+    void reject_borrowed() {
+        std::unique_lock<std::mutex> lock(mutex);
+        borrowed = true;
+        accepting = false;
+        drained.wait(lock, [this] { return active_leases == 0; });
+    }
+
+private:
+    static int32_t retain_impl_v1(
+            const ggml_backend_moe_source_owner_v1 * owner,
+            uint64_t expected_generation,
+            ggml_backend_moe_source_lease_v1 * lease) {
+        if (owner == nullptr || lease == nullptr || owner->struct_size != sizeof(*owner) ||
+                owner->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION || owner->owner == nullptr ||
+                lease->struct_size != sizeof(*lease) || lease->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ABI;
+        }
+        if (owner->reserved32 != 0 || owner->reserved[0] != 0 || owner->reserved[1] != 0 ||
+                lease->owner != nullptr || lease->owner_generation != 0 || lease->lease_id != 0 ||
+                lease->reserved[0] != 0 || lease->reserved[1] != 0) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+        }
+        auto * self = static_cast<llama_moe_source_lifetime *>(owner->owner);
+        if (owner->generation != self->generation || expected_generation != self->generation) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_GENERATION_MISMATCH;
+        }
+
+        std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->borrowed) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_BORROWED;
+        }
+        if (!self->accepting) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_CLOSED;
+        }
+        if (self->next_lease_id == 0 || self->active_leases >= self->leases.size()) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_CAPACITY;
+        }
+
+        size_t slot = 0;
+        while (slot < self->leases.size() && self->leases[slot] != 0) {
+            ++slot;
+        }
+        if (slot == self->leases.size()) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_CAPACITY;
+        }
+        const uint64_t lease_id = self->next_lease_id++;
+        self->leases[slot] = lease_id;
+        ++self->active_leases;
+        ggml_backend_moe_source_lease_v1 result = {};
+        result.struct_size = sizeof(result);
+        result.abi_version = GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION;
+        result.owner = self;
+        result.owner_generation = self->generation;
+        result.lease_id = lease_id;
+        *lease = result;
+        return GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK;
+    }
+
+    static int32_t release_impl_v1(ggml_backend_moe_source_lease_v1 * lease) {
+        if (lease == nullptr || lease->struct_size != sizeof(*lease) ||
+                lease->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ABI;
+        }
+        if (lease->reserved[0] != 0 || lease->reserved[1] != 0) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+        }
+        if (lease->owner == nullptr || lease->lease_id == 0) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_ALREADY_RELEASED;
+        }
+
+        auto * self = static_cast<llama_moe_source_lifetime *>(lease->owner);
+        const uint64_t lease_id = lease->lease_id;
+        const uint64_t owner_generation = lease->owner_generation;
+        if (owner_generation != self->generation) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_GENERATION_MISMATCH;
+        }
+
+        std::lock_guard<std::mutex> lock(self->mutex);
+        bool found = false;
+        for (uint64_t & active : self->leases) {
+            if (active == lease_id) {
+                active = 0;
+                --self->active_leases;
+                found = true;
+                break;
+            }
+        }
+        lease->owner = nullptr;
+        lease->owner_generation = 0;
+        lease->lease_id = 0;
+        if (!found) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_ALREADY_RELEASED;
+        }
+        if (self->active_leases == 0) {
+            self->drained.notify_all();
+        }
+        return GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK;
+    }
+
+    static int32_t validate_span_impl_v1(
+            const ggml_backend_moe_source_owner_v1 * owner,
+            uint64_t expected_generation,
+            const ggml_backend_moe_source_span_v1 * span) {
+        if (owner == nullptr || span == nullptr || owner->struct_size != sizeof(*owner) ||
+                owner->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION || owner->owner == nullptr ||
+                span->struct_size != sizeof(*span) || span->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ABI;
+        }
+        if (owner->reserved32 != 0 || owner->reserved[0] != 0 || owner->reserved[1] != 0 ||
+                span->reserved32 != 0 || span->witness == nullptr || span->data == nullptr || span->bytes == 0) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+        }
+        auto * self = static_cast<llama_moe_source_lifetime *>(owner->owner);
+        if (owner->generation != self->generation || expected_generation != self->generation) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_GENERATION_MISMATCH;
+        }
+
+        std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->borrowed) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_BORROWED;
+        }
+        for (const auto & current : self->readable_spans) {
+            if (current.witness != span->witness) {
+                continue;
+            }
+            if (current.data != span->data || current.bytes != span->bytes ||
+                    current.expert_stride != span->expert_stride || current.type != span->type ||
+                    !std::equal(std::begin(current.ne), std::end(current.ne), std::begin(span->ne)) ||
+                    !std::equal(std::begin(current.nb), std::end(current.nb), std::begin(span->nb))) {
+                return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+            }
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK;
+        }
+        return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+    }
+
+    static int32_t retain_v1(
+            const ggml_backend_moe_source_owner_v1 * owner,
+            uint64_t expected_generation,
+            ggml_backend_moe_source_lease_v1 * lease) {
+        try {
+            return retain_impl_v1(owner, expected_generation, lease);
+        } catch (...) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_CAPACITY;
+        }
+    }
+
+    static int32_t release_v1(ggml_backend_moe_source_lease_v1 * lease) {
+        try {
+            return release_impl_v1(lease);
+        } catch (...) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+        }
+    }
+
+    static int32_t validate_span_v1(
+            const ggml_backend_moe_source_owner_v1 * owner,
+            uint64_t expected_generation,
+            const ggml_backend_moe_source_span_v1 * span) {
+        try {
+            return validate_span_impl_v1(owner, expected_generation, span);
+        } catch (...) {
+            return GGML_BACKEND_MOE_SOURCE_STATUS_V1_INVALID_ARGUMENT;
+        }
+    }
+
+    static std::atomic<uint64_t> next_generation;
+
+    std::mutex                                                     mutex;
+    std::condition_variable                                        drained;
+    std::array<uint64_t, GGML_BACKEND_MOE_SOURCE_MAX_LEASES_V1>   leases = {};
+    std::vector<readable_span>                                    readable_spans;
+    const uint64_t                                                 generation;
+    uint64_t                                                       next_lease_id = 1;
+    size_t                                                         active_leases = 0;
+    bool                                                           accepting = true;
+    bool                                                           borrowed = false;
+};
+
+std::atomic<uint64_t> llama_moe_source_lifetime::next_generation { 1 };
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1200,7 +1462,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        source_lifetime.close_and_drain();
+    }
 
     uint64_t n_elements = 0;
 
@@ -1220,6 +1484,8 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::vector<llama_moe_source_group> moe_sources;
+    std::vector<llm_tensor_use> tensor_uses;
+    llama_moe_source_lifetime source_lifetime;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1362,6 +1628,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    pimpl->source_lifetime.close_and_drain();
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2034,6 +2301,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    pimpl->tensor_uses = std::move(ml.tensor_uses);
     build_moe_sources();
     finalize_moe_expert_cache();
 
@@ -2053,6 +2321,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+    for (const auto & source : ml.moe_readable_sources) {
+        if (!record_moe_readable_source(source.tensor, source.data, source.bytes)) {
+            throw std::runtime_error("unable to retain an MoE readable source certificate");
         }
     }
 
@@ -2538,6 +2811,7 @@ void llama_model::record_shared_tensor(
         std::string owner_canonical_id, std::string owner_identity_kind,
         std::string owner_backend, bool resolved_storage_available,
         bool current_storage_available, std::string storage_provenance) {
+    pimpl->source_lifetime.reject_borrowed();
     llama_moe_shared_tensor shared;
     shared.name = tensor_name;
     shared.tensor_bytes = tensor_bytes;
@@ -2554,6 +2828,22 @@ void llama_model::record_shared_tensor(
     shared.current_storage_available = current_storage_available;
     shared.storage_provenance = std::move(storage_provenance);
     pimpl->borrowed_tensors.emplace(std::move(tensor_name), std::move(shared));
+}
+
+bool llama_model::record_moe_readable_source(const ggml_tensor * tensor, const void * data, size_t bytes) {
+    return pimpl->source_lifetime.register_readable_span(tensor, data, bytes);
+}
+
+bool llama_model::moe_source_owner_v1(ggml_backend_moe_source_owner_v1 * owner) const {
+    if (owner == nullptr) {
+        return false;
+    }
+    *owner = pimpl->source_lifetime.owner_v1();
+    return true;
+}
+
+void llama_model::close_moe_source_owner() {
+    pimpl->source_lifetime.close();
 }
 
 void llama_model::record_artifact_source(
@@ -3127,7 +3417,41 @@ void llama_model::build_moe_sources() {
             chunk->layer = static_cast<int32_t>(il);
         }
     }
+    std::unordered_set<ggml_tensor *> described;
+    for (const auto & group : result) {
+        for (const auto & bank : group.banks) {
+            described.insert(bank.tensor);
+        }
+    }
+    for (const auto & use : tensor_uses()) {
+        if (use.op != GGML_OP_MUL_MAT_ID || !described.insert(use.tensor).second) {
+            continue;
+        }
+        result.push_back({GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX,
+            GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, true,
+            {{use.tensor, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT,
+                GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE}}, use.layer});
+    }
+    std::unordered_map<const ggml_tensor *, std::vector<std::string>> names;
+    for (const auto & use : tensor_uses()) {
+        if (!use.name.empty()) { names[use.tensor].push_back(use.name); }
+    }
+    for (auto & entry : names) {
+        auto & aliases = entry.second;
+        std::sort(aliases.begin(), aliases.end());
+        aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
+    }
+    for (auto & group : result) {
+        for (auto & bank : group.banks) {
+            const auto found = names.find(bank.tensor);
+            if (found != names.end()) { bank.names = found->second; }
+        }
+    }
     pimpl->moe_sources = std::move(result);
+}
+
+const std::vector<llm_tensor_use> & llama_model::tensor_uses() const {
+    return pimpl->tensor_uses;
 }
 
 const std::vector<llama_moe_source_group> & llama_model::moe_sources() const {
@@ -4421,6 +4745,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+
+    if (params.draft_vocab) {
+        params.draft_vocab->apply(*this, params);
+    }
 
     // add backend sampling layers (if any)
     llm->build_sampling();

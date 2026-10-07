@@ -465,6 +465,7 @@ extern "C" {
         bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
+        bool moe_source_graph_capacity; // experimental: reserve hybrid source graph capacity; may change output
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
         bool decode_boundary_overlap; // experimental: overlap decode boundary preparation and update CUDA graphs
 
@@ -611,6 +612,12 @@ extern "C" {
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
+
+    // Source conversion close is checked. Failure retains the context and all borrowed owners.
+    // Close may overlap an admitted source decode. Free requires no new calls or concurrent destruction.
+    // Status: 0 success, 1 busy, 2 timeout, 3 invalid argument, 4 release failure.
+    LLAMA_API int32_t llama_moe_source_context_close_v1(struct llama_context * ctx);
+    LLAMA_API int32_t llama_moe_source_context_free_v1(struct llama_context ** ctx);
 
     LLAMA_API int64_t llama_time_us(void);
 

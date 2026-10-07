@@ -16,6 +16,8 @@
 #include "common.h"
 
 #include <vector>
+#include <array>
+#include <unordered_map>
 
 // n-gram simple
 //
@@ -113,3 +115,32 @@ void common_ngram_map_draft(
 
 // Update the statistics of a value after a draft was processed.
 void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted);
+
+// History indexes contain committed tokens only. Pending tokens form a temporary query.
+struct common_ngram_history {
+    void update(const llama_tokens & tokens);
+    void clear();
+    llama_tokens propose(const llama_tokens & pending, int32_t n_max, int32_t min_match, int32_t & match) const;
+
+private:
+    llama_tokens history;
+    std::unordered_map<uint64_t, std::array<size_t, COMMON_NGRAM_MAX_VALUES>> positions;
+};
+
+struct common_ngram_chain_policy {
+    explicit common_ngram_chain_policy(int32_t n_max = 0);
+    int32_t choose(int32_t primary, int32_t available, int32_t match, const std::vector<float> & probabilities = {}) const;
+    int32_t choose_replacement(int32_t primary, int32_t available, int32_t match, const std::vector<float> & probabilities) const;
+    void observe(int32_t primary, int32_t extra, int32_t accepted, int32_t match, double round_ms, bool replacement = false);
+
+private:
+    double cost(int32_t n) const;
+    std::vector<double> costs;
+    std::vector<double> primary_tokens;
+    std::vector<uint32_t> observations;
+    struct acceptance { double ok = 0.0; double bad = 0.0; };
+    std::unordered_map<int32_t, acceptance> chain_acceptance;
+    std::unordered_map<int32_t, acceptance> replacement_acceptance;
+    double probability(int32_t match, bool replacement) const;
+    double expected_primary(int32_t primary, const std::vector<float> & probabilities, double & prefix) const;
+};

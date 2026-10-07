@@ -53,3 +53,7 @@ The llama runtime publishes complete V2 candidate snapshots and refreshes them a
 - Draft context namespace: `LLAMA_CONTEXT_TYPE_DRAFT` distinguishes a separate speculative draft context from the default target and `LLAMA_CONTEXT_TYPE_MTP` contexts. Common speculative setup assigns it automatically; the default context type and MTP behavior are unchanged.
 
 - Dense penalty counts: the penalties sampler automatically uses a vocabulary-sized dense count table for valid token IDs, with a map fallback for out-of-range IDs. This has no flag or API change and preserves repeat, frequency, and presence penalty semantics, including duplicate candidate IDs, reset, and clone behavior.
+
+## Experimental generic CPU/GPU execution
+
+The opt-in [source executor](moe-hybrid.md) shares grouped residency ownership and uses original graph/operator/backend capabilities. Static expert statistics, hardware miss split and online adaptation are independent controls. Source mode has focused single-GPU Linux qualification; existing grouped-cache multi-GPU tests do not qualify every generic hybrid multi-GPU or parallel serving configuration.
