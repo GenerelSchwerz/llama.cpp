@@ -5193,6 +5193,7 @@ struct test_mul_mat : public test_case {
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
 
     const bool repeat_rhs;
+    const bool repeat_columns;
     const bool norm_rhs;
 
     std::string vars() override {
@@ -5200,6 +5201,7 @@ struct test_mul_mat : public test_case {
         if (repeat_rhs) { s += "," + VAR_TO_STR(repeat_rhs); }
         if (norm_rhs) { s += "," + VAR_TO_STR(norm_rhs); }
         if (type_a2 != GGML_TYPE_COUNT) { s += "," + VAR_TO_STR(type_a2); }
+        if (repeat_columns) { s += "," + VAR_TO_STR(repeat_columns); }
         return s;
     }
 
@@ -5231,8 +5233,8 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, bool repeat_rhs = false, bool norm_rhs = false, ggml_type type_a2 = GGML_TYPE_COUNT)
-        : type_a(type_a), type_b(type_b), type_a2(type_a2), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), repeat_rhs(repeat_rhs), norm_rhs(norm_rhs) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, bool repeat_rhs = false, bool norm_rhs = false, ggml_type type_a2 = GGML_TYPE_COUNT, bool repeat_columns = false)
+        : type_a(type_a), type_b(type_b), type_a2(type_a2), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), repeat_rhs(repeat_rhs), repeat_columns(repeat_columns), norm_rhs(norm_rhs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5240,11 +5242,12 @@ struct test_mul_mat : public test_case {
         ggml_tensor * b;
 
         GGML_ASSERT(type_a2 == GGML_TYPE_COUNT || (repeat_rhs && o >= 4 && ggml_is_quantized(type_a2) && k % ggml_blck_size(type_a2) == 0));
+        GGML_ASSERT(!repeat_columns || repeat_rhs);
         const int npermuted = (per[0] != 0) + (per[1] != 1) + (per[2] != 2) + (per[3] != 3);
         if (repeat_rhs) {
             GGML_ASSERT(type_b == GGML_TYPE_F32 && npermuted == 0 && !src_overlap && k_v == 0 && m_v == 0 && pad == 0);
             a = ggml_new_tensor_4d(ctx, type_a, k, m, bs[0], bs[1]);
-            b = ggml_new_tensor_2d(ctx, type_b, k, n);
+            b = ggml_new_tensor_2d(ctx, type_b, k, repeat_columns ? 1 : n);
             ggml_set_name(a, "a");
             ggml_set_name(b, "b_compact");
             b = ggml_repeat_4d(ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1]);
@@ -10469,6 +10472,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 65, 4, 512, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 65, 17, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true, false, GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 65, 17, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 2, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 65, 4, 512, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
 
     for (ggml_type second : {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 65, 17, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true, false, second));

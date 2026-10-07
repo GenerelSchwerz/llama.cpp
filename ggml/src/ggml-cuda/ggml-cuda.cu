@@ -5606,7 +5606,7 @@ static bool ggml_cuda_repeat_mm_compatible(ggml_backend_cuda_context & ctx, ggml
     bool expanded = false;
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         if (input->ne[d] != repeat->ne[d]) {
-            if (d < 2 || input->ne[d] != 1) { return false; }
+            if (d == 0 || input->ne[d] != 1) { return false; }
             expanded = true;
         }
         if (input->ne[d] <= 0 || repeat->ne[d] > INT_MAX || input->nb[d] % sizeof(float) || input->nb[d]/sizeof(float) > INT_MAX) { return false; }
@@ -5618,6 +5618,7 @@ static bool ggml_cuda_repeat_mm_compatible(ggml_backend_cuda_context & ctx, ggml
     }
     const auto kernel = ggml_cuda_mul_mat_kernel(mm->src[0], repeat, mm, ctx.device);
     const bool quantized = kernel == GGML_CUDA_MM_MMVQ || kernel == GGML_CUDA_MM_MMQ;
+    if (input->ne[1] != repeat->ne[1] && !quantized) { return false; }
     if (kernel != GGML_CUDA_MM_MMVF && kernel != GGML_CUDA_MM_MMF && !quantized) { return false; }
     if (allocated) {
         const ggml_tensor * reads[] = {input, mm->src[0]};
