@@ -10466,6 +10466,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : all_types) {
+        if (!ggml_is_quantized(type)) { continue; }
+        for (int tokens : {1, 3, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, tokens, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true));
+        }
+    }
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));

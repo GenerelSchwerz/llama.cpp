@@ -5613,7 +5613,8 @@ static ggml_cuda_repeat_mm_match ggml_cuda_match_repeat_mm(ggml_backend_cuda_con
         if (input->ne[d] > 1 && input->nb[d] % (2*sizeof(float))) { return {}; }
     }
     const auto kernel = ggml_cuda_mul_mat_kernel(mm->src[0], repeat, mm, ctx.device);
-    if (kernel != GGML_CUDA_MM_MMVF && kernel != GGML_CUDA_MM_MMF) { return {}; }
+    const bool quantized = kernel == GGML_CUDA_MM_MMVQ || kernel == GGML_CUDA_MM_MMQ;
+    if (kernel != GGML_CUDA_MM_MMVF && kernel != GGML_CUDA_MM_MMF && !quantized) { return {}; }
     int next = i + 2;
     while (next < graph->n_nodes && (ggml_cuda_affine_unary_view_op(graph->nodes[next]->op) || graph->nodes[next]->op == GGML_OP_NONE)) { ++next; }
     if (next < graph->n_nodes) {
@@ -5633,11 +5634,33 @@ static ggml_cuda_repeat_mm_match ggml_cuda_match_repeat_mm(ggml_backend_cuda_con
             for (const ggml_tensor * read : reads) {
                 const ggml_tensor * root = read->view_src ? read->view_src : read;
                 uintptr_t rb, re;
-                if (!ggml_cuda_affine_unary_range(read, ctx.device, rb, re) || rb % (2*ggml_type_size(read->type)) ||
+                if (!ggml_cuda_affine_unary_range(read, ctx.device, rb, re) || rb % (ggml_is_quantized(read->type) ? 16 : 2*ggml_type_size(read->type)) ||
                         !ggml_cuda_affine_unary_range(root, ctx.device, rb, re) || (wb[j] < re && rb < we[j])) { return {}; }
             }
         }
         if (wb[0] < we[1] && wb[1] < we[0]) { return {}; }
+        if (quantized) {
+            const ggml_tensor * weight = mm->src[0];
+            if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                const size_t size = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+                const uintptr_t begin = (uintptr_t) weight->data;
+                if (size > UINTPTR_MAX - begin) { return {}; }
+                const uintptr_t end = begin + size;
+                const uintptr_t padding = begin + ggml_nbytes(weight);
+                const ggml_tensor * root = input->view_src ? input->view_src : input;
+                uintptr_t rb, re;
+                if (!ggml_cuda_affine_unary_range(root, ctx.device, rb, re)) { return {}; }
+                if (padding < end && ((padding < re && rb < end) ||
+                        (padding < we[0] && wb[0] < end) || (padding < we[1] && wb[1] < end))) { return {}; }
+            }
+            if (kernel == GGML_CUDA_MM_MMQ) {
+                ggml_tensor reader = *input;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) { if (input->ne[d] == 1) { reader.nb[d] = 0; } }
+                const auto prec = ggml_cuda_mmq_get_prec_src1(weight, mm, ggml_cuda_info().devices[ctx.device].cc);
+                if (prec == GGML_PREC_Q8 && !ggml_cuda_is_aligned(&reader, 16)) { return {}; }
+                if (prec == GGML_PREC_Q4 && ggml_cuda_is_aligned(&reader, 32) != ggml_cuda_is_aligned(repeat, 32)) { return {}; }
+            }
+        }
     }
     return {repeat, mm};
 }
