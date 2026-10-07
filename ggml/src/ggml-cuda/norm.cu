@@ -313,7 +313,11 @@ struct ggml_cuda_norm_mxfp4_store {
     }
 };
 
-template <int block_size, bool do_multiply, bool do_add, bool do_scale, typename Write>
+struct ggml_cuda_norm_load {
+    __device__ __forceinline__ float operator()(const float * x, int col) const { return x[col]; }
+};
+
+template <int block_size, bool do_multiply, bool do_add, bool do_scale, typename Write, typename Read = ggml_cuda_norm_load>
 static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -338,7 +342,8 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
-                                    const float   scale_out            = 1.0f) {
+                                    const float   scale_out            = 1.0f,
+                                    const Read    read                 = {}) {
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -373,7 +378,7 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
 
     ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
+        const float xi = read(x, col);
         tmp += xi * xi;
     }
 
@@ -419,6 +424,77 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
         }
     }
     }
+}
+
+struct ggml_cuda_norm_mul_input {
+    const float * data;
+    uint3 ne[GGML_MAX_DIMS];
+    uint32_t stride[GGML_MAX_DIMS];
+
+    __device__ __forceinline__ float load(const uint32_t * coords) const {
+        uint64_t offset = 0;
+#pragma unroll
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) { offset += uint64_t(fastmodulo(coords[d], ne[d])) * stride[d]; }
+        return data[offset];
+    }
+};
+
+struct ggml_cuda_norm_pre_mul_load {
+    ggml_cuda_norm_mul_input inputs[2];
+    uint3 ne[3];
+    uint32_t offset;
+    float * product;
+    float * repeat;
+    int repeated;
+
+    __device__ __forceinline__ float operator()(const float * x, int col) const {
+        const uint32_t index = offset + col;
+        uint32_t coords[GGML_MAX_DIMS];
+        uint32_t remainder = index;
+#pragma unroll
+        for (int d = 0; d < 3; ++d) {
+            const uint2 pair = fast_div_modulo(remainder, ne[d]);
+            coords[d] = pair.y; remainder = pair.x;
+        }
+        coords[3] = remainder;
+        const float a = inputs[0].load(coords);
+        const float b = inputs[1].load(coords);
+        if (repeat) { repeat[index] = repeated == 0 ? a : b; }
+        const float value = __fmul_rn(a, b);
+        product[index] = value;
+        GGML_UNUSED(x);
+        return value;
+    }
+};
+
+struct ggml_cuda_norm_pre_mul_store {
+    static constexpr int width = 1;
+    ggml_cuda_norm_mul_input weight;
+    float * weighted;
+    uint32_t offset;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float value) const {
+        dst[col] = value;
+        if (weighted) { weighted[offset + col] = __fmul_rn(value, weight.data[uint64_t(fastmodulo(col, weight.ne[0])) * weight.stride[0]]); }
+        GGML_UNUSED(base);
+    }
+};
+
+template <int block_size>
+static __global__ __launch_bounds__(block_size) void rms_norm_pre_mul_f32(
+        ggml_cuda_norm_pre_mul_load read, ggml_cuda_norm_pre_mul_store write,
+        float * dst, int ncols, float eps) {
+    const uint32_t row = (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+    read.offset = write.offset = row * ncols;
+    if (write.weighted) {
+        write.weight.data += uint64_t(fastmodulo(blockIdx.x, write.weight.ne[1])) * write.weight.stride[1] +
+            uint64_t(fastmodulo(blockIdx.y, write.weight.ne[2])) * write.weight.stride[2] +
+            uint64_t(fastmodulo(blockIdx.z, write.weight.ne[3])) * write.weight.stride[3];
+    }
+    rms_norm_f32_impl<block_size, false, false, false>(read.product, dst, ncols, ncols,
+        int64_t(ncols)*gridDim.x, int64_t(ncols)*gridDim.x*gridDim.y, eps, write,
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f, read);
 }
 
 template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
@@ -958,6 +1034,41 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_pre_mul(ggml_backend_cuda_context & ctx, ggml_tensor * product,
+        ggml_tensor * norm, ggml_tensor * weighted, ggml_tensor * repeat) {
+    const auto input = [](const ggml_tensor * tensor) {
+        ggml_cuda_norm_mul_input value{};
+        if (!tensor) { return value; }
+        value.data = (const float *) tensor->data;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            value.ne[d] = init_fastdiv_values(tensor->ne[d]);
+            value.stride[d] = tensor->nb[d]/sizeof(float);
+        }
+        return value;
+    };
+    ggml_cuda_norm_pre_mul_load read{};
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * src = product->src[j];
+        if (src == repeat) { src = repeat->src[0]; read.repeated = j; }
+        read.inputs[j] = input(src);
+    }
+    for (int d = 0; d < 3; ++d) { read.ne[d] = init_fastdiv_values(product->ne[d]); }
+    read.product = (float *) product->data;
+    read.repeat = repeat ? (float *) repeat->data : nullptr;
+    ggml_cuda_norm_pre_mul_store write{};
+    if (weighted) {
+        write.weight = input(weighted->src[weighted->src[0] == norm ? 1 : 0]);
+        write.weighted = (float *) weighted->data;
+    }
+    const int ncols = norm->ne[0];
+    const dim3 blocks(norm->ne[1], norm->ne[2], norm->ne[3]);
+    const float eps = ggml_get_op_params_f32(norm, 0);
+    GGML_ASSERT(eps >= 0.0f);
+    const ggml_cuda_kernel_launch_params params = {blocks, dim3(ncols < 1024 ? 256 : 1024), 32*sizeof(float), ctx.stream()};
+    if (ncols < 1024) { ggml_cuda_kernel_launch(rms_norm_pre_mul_f32<256>, params, read, write, (float *) norm->data, ncols, eps); }
+    else { ggml_cuda_kernel_launch(rms_norm_pre_mul_f32<1024>, params, read, write, (float *) norm->data, ncols, eps); }
 }
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {

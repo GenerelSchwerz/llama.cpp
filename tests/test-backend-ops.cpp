@@ -3837,26 +3837,47 @@ struct test_rms_norm_mul_add : public test_case {
     const bool post_mul;
     const bool alias_rms_input;
     const bool weight_broadcast;
+    const bool pre_mul;
+    const bool repeat;
+    std::vector<ggml_tensor *> stages;
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "RMS_NORM_MUL_ADD";
+        return pre_mul ? "MUL_RMS_NORM" : "RMS_NORM_MUL_ADD";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR8(type, ne, eps, broadcast, multi_add, post_mul, alias_rms_input, weight_broadcast);
+        return VARS_TO_STR8(type, ne, eps, broadcast, multi_add, post_mul, alias_rms_input, weight_broadcast) + (pre_mul ? "," + VARS_TO_STR2(pre_mul, repeat) : "");
     }
 
     test_rms_norm_mul_add(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
             float eps = 1e-6f, bool broadcast = false, bool multi_add = false, bool post_mul = false,
-            bool alias_rms_input = false, bool weight_broadcast = false)
+            bool alias_rms_input = false, bool weight_broadcast = false, bool pre_mul = false, bool repeat = false)
         : type(type), ne(ne), eps(eps), broadcast(broadcast), multi_add(multi_add), post_mul(post_mul),
-          alias_rms_input(alias_rms_input), weight_broadcast(weight_broadcast) {}
+          alias_rms_input(alias_rms_input), weight_broadcast(weight_broadcast), pre_mul(pre_mul), repeat(repeat) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        stages.clear();
+        if (pre_mul) {
+            GGML_ASSERT(type == GGML_TYPE_F32 && !broadcast && !multi_add && !post_mul && !alias_rms_input);
+            ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], repeat ? 1 : ne[1], ne[2], ne[3]);
+            ggml_tensor * b = ggml_new_tensor_4d(ctx, type, 1, ne[1], ne[2], ne[3]);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, ne[0], ne[1]);
+            for (ggml_tensor * input : {a, b, w}) { ggml_set_param(input); }
+            if (repeat) { a = ggml_repeat_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]); stages.push_back(a); }
+            ggml_tensor * product = ggml_mul(ctx, a, b);
+            ggml_tensor * grouped = ggml_reshape_3d(ctx, product, ne[0], ne[1], ne[2]*ne[3]);
+            ggml_tensor * norm = ggml_rms_norm(ctx, grouped, eps);
+            ggml_tensor * out = ggml_mul(ctx, norm, w);
+            for (ggml_tensor * stage : {product, norm, out}) { stages.push_back(stage); }
+            for (ggml_tensor * stage : stages) { ggml_set_output(stage); }
+            return out;
+        }
         std::array<int64_t, 4> broadcast_dims = {ne[0]*2, ne[1]*3, ne[2]*3, ne[3]*4};
 
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, broadcast ? broadcast_dims.data() : ne.data());
@@ -10258,6 +10279,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+    }
+
+    for (int64_t n : {257, 1536}) {
+        for (bool repeat : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 4, 3, 2}, 1e-6f, false, false, false, false, true, true, repeat));
+        }
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
