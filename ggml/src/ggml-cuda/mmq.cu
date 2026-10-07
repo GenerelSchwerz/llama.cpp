@@ -187,8 +187,9 @@ void ggml_cuda_quantize_mmq_input(ggml_backend_cuda_context & ctx, const ggml_te
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mmq_input * input) {
+        const ggml_cuda_mmq_input * input, const int64_t * quantized_ne) {
     GGML_ASSERT(!ids || !input);
+    GGML_ASSERT(!quantized_ne || input);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -233,6 +234,14 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         ggml_cuda_mmq_input local_input(ctx.pool());
         ggml_tensor packed = *src1;
+        if (quantized_ne) {
+            GGML_ASSERT(quantized_ne[0] == ne10 && quantized_ne[1] == ne11);
+            GGML_ASSERT(!use_native_fp4 || src0->type != GGML_TYPE_NVFP4);
+            for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                GGML_ASSERT(quantized_ne[d] == 1 || quantized_ne[d] == src1->ne[d]);
+                packed.ne[d] = quantized_ne[d];
+            }
+        }
         if (!input) {
             // NVFP4 row scales still use the full logical bank/sample layout.
             if (!use_native_fp4 || src0->type != GGML_TYPE_NVFP4) {
