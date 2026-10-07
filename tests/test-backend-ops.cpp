@@ -5192,10 +5192,12 @@ struct test_mul_mat : public test_case {
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
 
     const bool repeat_rhs;
+    const bool norm_rhs;
 
     std::string vars() override {
         std::string s = VARS_TO_STR13(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad);
         if (repeat_rhs) { s += "," + VAR_TO_STR(repeat_rhs); }
+        if (norm_rhs) { s += "," + VAR_TO_STR(norm_rhs); }
         return s;
     }
 
@@ -5227,8 +5229,8 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, bool repeat_rhs = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), repeat_rhs(repeat_rhs) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, bool repeat_rhs = false, bool norm_rhs = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), repeat_rhs(repeat_rhs), norm_rhs(norm_rhs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5310,6 +5312,10 @@ struct test_mul_mat : public test_case {
             ggml_set_name(b, "b");
         }
 
+        if (norm_rhs) {
+            GGML_ASSERT(type_b == GGML_TYPE_F32 && !repeat_rhs);
+            b = ggml_rms_norm(ctx, b, 1e-6f);
+        }
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         ggml_set_name(out, "out");
         for (uint32_t i = 1; i < o; ++i) {
@@ -5321,7 +5327,7 @@ struct test_mul_mat : public test_case {
         return out;
     }
 
-    bool run_whole_graph() override { return o > 1 || repeat_rhs; }
+    bool run_whole_graph() override { return o > 1 || repeat_rhs || norm_rhs; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -10459,6 +10465,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        for (int tokens : {1, 17}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 65, tokens, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 2, false, 0, 0, false, true));
+        }
+    }
 
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         for (int tokens : {1, 17}) {
