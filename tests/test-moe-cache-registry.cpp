@@ -4482,10 +4482,51 @@ void test_moe_cache_proc_api() {
         alignas(TENSOR_ALIGNMENT) uint8_t mapped_data[64] = {};
         ggml_backend_buffer_ptr mapped(from_host_ptr(bounded, mapped_data, sizeof(mapped_data)));
         CHECK(mapped != nullptr);
+        CHECK(ggml_backend_buffer_get_alignment(mapped.get()) == ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type()));
+        CHECK(ggml_backend_buffer_get_base(mapped.get()) == mapped_data);
         CHECK(writable_load_data(mapped.get(), mapped_data, sizeof(mapped_data)) == nullptr);
         CHECK(readable_source(mapped.get(), mapped_data, sizeof(mapped_data)));
     }
     free_buft(bounded);
+    if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
+        auto * aligned_buft = bounded_buft(1024 * 1024);
+        CHECK(aligned_buft != nullptr);
+        ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context_ptr ctx(ggml_init(params));
+        CHECK(ctx != nullptr);
+        std::array<ggml_tensor *, 4> banks;
+        for (size_t i = 0; i < banks.size(); ++i) {
+            banks[i] = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q4_0, 32, i % 2 == 0 ? 64 : 32, 8);
+        }
+        ggml_backend_buffer_ptr storage(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), aligned_buft));
+        CHECK(storage != nullptr);
+        const size_t alignment = ggml_backend_buft_get_alignment(aligned_buft);
+        size_t registered_bytes = 0;
+        for (auto * bank : banks) {
+            CHECK(reinterpret_cast<uintptr_t>(bank->data) % alignment == 0);
+            registered_bytes += GGML_PAD(ggml_nbytes(bank), alignment);
+        }
+        const ggml_backend_moe_candidate_group_v2 groups[] = {
+            {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+            {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+        };
+        const ggml_backend_moe_candidate_tensor_v2 tensors[] = {
+            {banks[0], 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+            {banks[1], 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+            {banks[2], 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+            {banks[3], 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+        };
+        const auto sources = candidate_snapshot_v2(4, groups, 2, tensors, 4);
+        CHECK(ggml_backend_cuda_moe_cached_configure_sources(aligned_buft, &sources));
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        std::unique_ptr<ggml_cuda_moe_cache, decltype(&ggml_cuda_moe_cache_free)> cache(
+            ggml_cuda_moe_cache_init(device, banks[3]->nb[2], 4), ggml_cuda_moe_cache_free);
+        CHECK(cache.get() != nullptr && ggml_cuda_moe_cache_set_source_for_test(cache.get(), banks[3]));
+        CHECK(ggml_cuda_moe_cache_staging_state_for_test(cache.get(), false).host_source_bytes == registered_bytes);
+        free_buft(aligned_buft);
+        fprintf(stderr, "test-moe-cache: allocated bank page isolation and mapped alignment OK\n");
+    }
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_cache_set_slots") == nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME) != nullptr);

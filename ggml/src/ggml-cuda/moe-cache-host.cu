@@ -262,6 +262,8 @@ struct moe_host_buffer {
     bool read_only;
     bool auto_pin;
     void * registered_base;
+    ggml_backend_buffer_type type;
+    void * base;
 };
 
 static void moe_host_buffer_free(ggml_backend_buffer_t buffer) {
@@ -281,7 +283,7 @@ static void moe_host_buffer_free(ggml_backend_buffer_t buffer) {
 }
 
 static void * moe_host_buffer_base(ggml_backend_buffer_t buffer) {
-    return ggml_backend_buffer_get_base(static_cast<moe_host_buffer *>(buffer->context)->backing);
+    return static_cast<moe_host_buffer *>(buffer->context)->base;
 }
 
 static void moe_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -295,7 +297,17 @@ static ggml_backend_buffer_t moe_host_buffer_wrap(
     }
     auto * owner = moe_host_budget_for(buft);
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> storage(backing, ggml_backend_buffer_free);
-    std::unique_ptr<moe_host_buffer> context(new moe_host_buffer{owner, backing, read_only, auto_pin, nullptr});
+    std::unique_ptr<moe_host_buffer> context(new moe_host_buffer{owner, backing, read_only, auto_pin, nullptr, *buft, nullptr});
+    if (read_only) {
+        context->type.iface.get_alignment = ggml_backend_cpu_buffer_type()->iface.get_alignment;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(&context->type);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(backing));
+    if (base > UINTPTR_MAX - (alignment - 1) || (!read_only && backing->size < alignment - 1)) {
+        return nullptr;
+    }
+    context->base = reinterpret_cast<void *>(GGML_PAD(base, alignment));
+    const size_t size = read_only ? backing->size : backing->size - (alignment - 1);
     auto iface = backing->iface;
     iface.free_buffer = moe_host_buffer_free;
     iface.get_base = moe_host_buffer_base;
@@ -305,7 +317,7 @@ static ggml_backend_buffer_t moe_host_buffer_wrap(
     }
     ggml_backend_buffer_t result = nullptr;
     try {
-        result = ggml_backend_buffer_init(buft, iface, context.get(), backing->size);
+        result = ggml_backend_buffer_init(read_only ? &context->type : buft, iface, context.get(), size);
         if (result != nullptr) {
             if (owner != nullptr) {
                 std::lock_guard<std::mutex> lock(owner->mutex);
@@ -339,7 +351,8 @@ static ggml_backend_buffer_t ggml_cuda_moe_cached_registered_buffer(ggml_backend
         (void) cudaGetLastError();
         return nullptr;
     }
-    auto * buffer = moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size), false);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    auto * buffer = moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size + alignment - 1), false);
     if (buffer == nullptr) {
         return nullptr;
     }
@@ -387,8 +400,13 @@ static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
 static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
 
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (size > SIZE_MAX - (alignment - 1)) {
+        return nullptr;
+    }
+    const size_t backing_size = size + alignment - 1;
     if (moe_host_budget_for(buft) != nullptr) {
-        return moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size), false);
+        return moe_host_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), backing_size), false);
     }
 
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -399,10 +417,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     }
 #endif
 
-    void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    void * ptr = ggml_cuda_moe_cached_pinned_malloc(backing_size);
 
     if (ptr == nullptr) {
-        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), backing_size);
         if (buffer == nullptr) {
             return nullptr;
         }
@@ -410,14 +428,24 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     }
 
     std::unique_ptr<void, decltype(&cudaFreeHost)> allocation(ptr, cudaFreeHost);
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, backing_size);
     if (buffer == nullptr) {
         return nullptr;
     }
-    buffer->buft             = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_buffer_free_buffer;
     allocation.release();
-    return buffer;
+    return moe_host_buffer_wrap(buft, buffer, false);
+}
+
+static size_t ggml_backend_cuda_moe_cached_buffer_type_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return alignment;
+#else
+    // Keep allocated banks on separate pages so group registrations cannot split a bank.
+    return std::max(alignment, moe_host_page_size());
+#endif
 }
 
 // is_host MUST return false (or be NULL) for this buffer type, even though
@@ -448,7 +476,9 @@ void * ggml_backend_cuda_moe_cached_writable_load_data(ggml_backend_buffer_t buf
         return nullptr;
     }
     if (buffer->iface.free_buffer == moe_host_buffer_free) {
-        if (static_cast<const moe_host_buffer *>(buffer->context)->read_only) {
+        const auto * context = static_cast<const moe_host_buffer *>(buffer->context);
+        if (context->read_only || (context->owner == nullptr && !context->auto_pin && context->registered_base == nullptr &&
+                context->backing->iface.free_buffer != ggml_backend_cuda_moe_cached_buffer_free_buffer)) {
             return nullptr;
         }
     } else if (buffer->iface.free_buffer != ggml_backend_cuda_moe_cached_buffer_free_buffer) {
@@ -487,7 +517,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_cuda_moe_cached_buffer_type_name,
             /* .alloc_buffer     = */ ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_alignment    = */ ggml_backend_cuda_moe_cached_buffer_type_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cuda_moe_cached_buffer_type_is_host,

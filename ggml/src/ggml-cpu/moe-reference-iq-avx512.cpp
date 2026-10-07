@@ -1,5 +1,4 @@
 // Adapted from MIT-licensed expert primitives; see moe-reference-LICENSE.
-// See moe-reference-LICENSE and the source inventory in LLAMA-INTEGRATION-DELTA.md.
 #include "moe-reference.h"
 
 #define GGML_COMMON_DECL_CPP

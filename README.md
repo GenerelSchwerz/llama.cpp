@@ -89,5 +89,6 @@ If this fork has been useful, you can support my work on Ko-fi.
 ## References
 
 - Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml).
+- Hybrid MoE execution includes [MIT-licensed components](ggml/src/ggml-cpu/moe-reference-LICENSE) adapted from [Strata](https://github.com/Niko1221/Strata). Their integration was substantially reworked for ggml, generic model execution and shared expert-cache ownership. This fork maintains its own execution architecture.
 - Code is under the repository's [MIT license](LICENSE); model files have their own licenses.
 - [Ko-fi button artwork](https://more.ko-fi.com/brand-assets) is from Ko-fi's brand kit.

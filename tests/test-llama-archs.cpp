@@ -3728,6 +3728,107 @@ static void test_phase_workspace_qwen4exp_mtp_reserve(size_t seed, float stdev) 
     }
 }
 
+static void (*mtp_input_set_async)(ggml_backend_t, ggml_tensor *, const void *, size_t, size_t) = nullptr;
+static size_t mtp_hidden_uploads = 0;
+static void (*mtp_device_props)(ggml_backend_dev_t, ggml_backend_dev_props *) = nullptr;
+
+static void mtp_device_no_events(ggml_backend_dev_t device, ggml_backend_dev_props * props) {
+    mtp_device_props(device, props);
+    props->caps.events = false;
+}
+
+static void count_mtp_input_upload(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    mtp_hidden_uploads += strcmp(tensor->name, "mtp_h_input") == 0;
+    mtp_input_set_async(backend, tensor, data, offset, size);
+}
+
+static void test_mtp_input_staging(size_t seed, float stdev) {
+    auto * gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!gpu || strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") != 0) {
+        printf("test_mtp_input_staging: skipped, CUDA device required\n");
+        return;
+    }
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    auto model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.n_gpu_layers = 99;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { gpu, nullptr };
+    model_params.devices = devices;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    GGML_ASSERT(model);
+
+    mtp_device_props = gpu->iface.get_props;
+    for (bool events : { true, false }) {
+        gpu->iface.get_props = events ? mtp_device_props : mtp_device_no_events;
+        for (auto kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            auto params = llama_context_default_params();
+            params.n_ctx = 64;
+            params.n_batch = params.n_ubatch = 16;
+            params.n_seq_max = params.n_outputs_max = 2;
+            params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.type_k = params.type_v = kv_type;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            llama_context_ptr reference(llama_init_from_model(model.get(), params));
+            params.decode_boundary_overlap = true;
+            llama_context_ptr staged(llama_init_from_model(model.get(), params));
+            GGML_ASSERT(reference && staged);
+            auto * backend = ggml_backend_sched_get_backend(staged->get_sched(), 0);
+            mtp_input_set_async = backend->iface.set_tensor_async;
+            GGML_ASSERT(mtp_input_set_async);
+            backend->iface.set_tensor_async = count_mtp_input_upload;
+            mtp_hidden_uploads = 0;
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(gpu, &props);
+            const size_t expected_uploads = props.caps.async && props.caps.events && ggml_backend_dev_host_buffer_type(gpu) ? 8 : 0;
+            const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            const int32_t n_embd = llama_model_n_embd_out(model.get());
+            int32_t positions[2] = {};
+            int step = 0;
+            for (int n_tokens : { 1, 3, 1, 4, 2, 1, 3, 1 }) {
+                const llama_seq_id seq_id = step % 2;
+                const bool both_sequences = n_tokens == 4;
+                llama_batch batch = make_mtp_batch(n_tokens, n_embd, positions[seq_id], n_vocab, seed + step++);
+                for (int i = 0; i < n_tokens; ++i) {
+                    const llama_seq_id row_seq = both_sequences && i >= 2 ? seq_id ^ 1 : seq_id;
+                    batch.seq_id[i][0] = row_seq;
+                    batch.pos[i] = positions[row_seq] + (both_sequences ? i % 2 : i);
+                  }
+                GGML_ASSERT(llama_decode(reference.get(), batch) == 0);
+                const float * expected = llama_get_logits_ith(reference.get(), n_tokens - 1);
+                GGML_ASSERT(expected);
+                std::vector<float> logits_expected(expected, expected + n_vocab);
+                GGML_ASSERT(llama_decode(staged.get(), batch) == 0);
+                // Decode owns submitted inputs after returning, even while GPU work is pending.
+                std::fill_n(batch.token, n_tokens, -1);
+                std::fill_n(batch.embd, (size_t) n_tokens * n_embd, -123.0f);
+                const float * actual = llama_get_logits_ith(staged.get(), n_tokens - 1);
+                GGML_ASSERT(actual);
+                GGML_ASSERT(nmse(logits_expected, std::vector<float>(actual, actual + n_vocab)) < 1e-7);
+                for (llama_seq_id s = 0; s < 2; ++s) {
+                    const size_t size = llama_state_seq_get_size(reference.get(), s);
+                    std::vector<uint8_t> a(size), b(size);
+                    GGML_ASSERT(llama_state_seq_get_data(reference.get(), a.data(), size, s) == size);
+                    GGML_ASSERT(llama_state_seq_get_data(staged.get(), b.data(), size, s) == size);
+                    GGML_ASSERT(a == b);
+                  }
+                if (both_sequences) {
+                    positions[0] += 2;
+                    positions[1] += 2;
+                  } else {
+                    positions[seq_id] += n_tokens;
+                  }
+                llama_batch_free(batch);
+              }
+            backend->iface.set_tensor_async = mtp_input_set_async;
+            GGML_ASSERT(expected_uploads ? mtp_hidden_uploads >= expected_uploads : mtp_hidden_uploads == 0);
+            fprintf(stderr, "test_mtp_input_staging: kv=%s events=%d hidden_uploads=%zu input lifetime and exact KV OK\n", ggml_type_name(kv_type), events, mtp_hidden_uploads);
+        }
+    }
+    gpu->iface.get_props = mtp_device_props;
+}
+
 static void test_phase_workspace_mismatched_placement(size_t seed, float stdev) {
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -6485,6 +6586,7 @@ int main(int argc, char ** argv) {
             test_phase_workspace_mtp_lifecycle(seed, stdev);
             test_phase_workspace_qwen4exp_mtp_reserve(seed, stdev);
             test_phase_workspace_mismatched_placement(seed, stdev);
+            test_mtp_input_staging(seed, stdev);
             test_phase_workspace_late_pipeline_fallback(seed, stdev);
             return 0;
         }

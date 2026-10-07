@@ -1061,6 +1061,7 @@ public:
     bool can_decode_sampled() const;
     const std::vector<ggml_tensor *> & get_inp_token_tensors() const { return inp_token_tensors; }
     const std::vector<ggml_tensor *> & get_inp_tensors();
+    const std::vector<ggml_tensor *> & get_inp_mtp_tensors() const { return inp_mtp_tensors; }
     void set_inputs(const llama_ubatch * ubatch, bool skip_token_upload = false);
     void set_outputs(const llm_graph_params & params);
     void retain_state_computation();
@@ -1132,6 +1133,7 @@ private:
     std::vector<ggml_tensor *> inp_token_tensors;
     std::vector<ggml_tensor *> inp_tensors;
     size_t inp_tensors_context_used = SIZE_MAX;
+    std::vector<ggml_tensor *> inp_mtp_tensors;
     std::vector<llm_graph_moe_region> moe_regions;
 
     // keep a copy of the previous graph parameters

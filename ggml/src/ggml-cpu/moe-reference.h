@@ -1,5 +1,4 @@
 // Adapted from MIT-licensed expert primitives; see moe-reference-LICENSE.
-// See moe-reference-LICENSE and the source inventory in LLAMA-INTEGRATION-DELTA.md.
 #pragma once
 #include <cstddef>
 #include <cstdint>
