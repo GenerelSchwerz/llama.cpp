@@ -124,11 +124,12 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter, bool use_aligned_float8>
-static __global__ void quantize_mmq_nvfp4(
+template <bool scatter, bool use_aligned_float8, bool compact>
+static __device__ __forceinline__ void quantize_mmq_nvfp4_impl(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used,
+        const int64_t scale_base_stride, const int64_t scale_stride, const int64_t scale_count) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
     const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
@@ -186,12 +187,19 @@ static __global__ void quantize_mmq_nvfp4(
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
                     scale[i] = warp_amax[0];
                 }
-            } else {
+            } else if constexpr (!compact) {
                 scale[blockIdx.y * ne1 + blockIdx.x] = warp_amax[0];
             }
         }
     }
     __syncthreads();
+
+    if constexpr (compact) {
+        const int64_t base = blockIdx.y * scale_base_stride + blockIdx.x;
+        for (int64_t i = threadIdx.x; i < scale_count; i += blockDim.x) {
+            scale[base + i * scale_stride] = warp_amax[0];
+        }
+    }
 
     block_fp4_mmq * y = (block_fp4_mmq *) vy;
     const int64_t n_subblocks = (ne0 + QK_NVFP4_SUB - 1) / QK_NVFP4_SUB;
@@ -325,10 +333,26 @@ static __global__ void quantize_mmq_nvfp4(
         }
     }
 #else
-    GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
+    GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, scale_base_stride, scale_stride, scale_count);
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+}
+
+template <bool scatter, bool use_aligned_float8>
+static __global__ void quantize_mmq_nvfp4(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
+    quantize_mmq_nvfp4_impl<scatter, use_aligned_float8, false>(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, 0, 0, 0);
+}
+
+template <bool use_aligned_float8>
+static __global__ void quantize_mmq_nvfp4_compact(
+        const float * __restrict__ x, void * __restrict__ vy, float * __restrict__ scale,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t scale_base_stride, const int64_t scale_stride, const int64_t scale_count) {
+    quantize_mmq_nvfp4_impl<false, use_aligned_float8, true>(x, nullptr, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, 0, scale_base_stride, scale_stride, scale_count);
 }
 
 // quantize values in the format mxfp4 is stored which is interleaved nibbles
@@ -693,5 +717,26 @@ void quantize_mmq_fp4_cuda(
         const dim3    block_size(WARP_SIZE, nwarps, 1);
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+    }
+}
+
+void quantize_mmq_nvfp4_compact_cuda(
+        const float * x, void * vy, float * scale, bool use_aligned_float8,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, int64_t scale_ne2, int64_t scale_ne3, cudaStream_t stream) {
+    GGML_ASSERT(scale && ne0 > 0 && ne00 % QK_NVFP4 == 0);
+    GGML_ASSERT(ne2 > 0 && ne3 > 0);
+    GGML_ASSERT((ne2 == 1 || ne2 == scale_ne2) && (ne3 == 1 || ne3 == scale_ne3));
+    const int64_t scale_base_stride = ne2 == 1 ? scale_ne2 * ne1 : ne1;
+    const int64_t scale_stride = ne2 == 1 ? ne1 : scale_ne2 * ne1;
+    const int64_t scale_count = (scale_ne2 / ne2) * (scale_ne3 / ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const dim3 num_blocks(ne1, ne2 * ne3, 1);
+    if (use_aligned_float8) {
+        quantize_mmq_nvfp4_compact<true><<<num_blocks, block_size, 0, stream>>>(
+            x, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, scale_base_stride, scale_stride, scale_count);
+    } else {
+        quantize_mmq_nvfp4_compact<false><<<num_blocks, block_size, 0, stream>>>(
+            x, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, scale_base_stride, scale_stride, scale_count);
     }
 }

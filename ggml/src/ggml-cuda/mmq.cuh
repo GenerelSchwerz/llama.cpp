@@ -1623,7 +1623,7 @@ struct ggml_cuda_mmq_input {
 size_t ggml_cuda_mmq_input_size(const ggml_tensor * node, int cc);
 
 void ggml_cuda_quantize_mmq_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
-        size_t size, ggml_cuda_mmq_input & input);
+        size_t size, ggml_cuda_mmq_input & input, const ggml_tensor * logical_src1 = nullptr);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

@@ -7022,16 +7022,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 const ggml_tensor * node = cgraph->nodes[mmq_reuse.groups[group].node];
                 if (!quantized_repeats.empty() && quantized_repeats[mmq_reuse.groups[group].prepare]) {
                     ggml_tensor reader = ggml_cuda_repeat_mm_reader(node->src[1]);
-                    const bool compact = ggml_cuda_mmq_get_prec_src1(node->src[0], node, mmq_cc) != GGML_PREC_Q4 || node->src[0]->type != GGML_TYPE_NVFP4;
-                    if (compact) {
-                        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
-                            if (reader.nb[d] == 0) { reader.ne[d] = 1; }
-                        }
+                    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                        if (reader.nb[d] == 0) { reader.ne[d] = 1; }
                     }
                     ggml_tensor prepared = *node;
                     prepared.src[1] = &reader;
-                    ggml_cuda_quantize_mmq_input(*cuda_ctx, &prepared, mmq_reuse.groups[group].size - scale_size(node), mmq_inputs[group]);
-                    if (compact) { std::copy(reader.ne, reader.ne + GGML_MAX_DIMS, mmq_shapes[group].begin()); }
+                    ggml_cuda_quantize_mmq_input(*cuda_ctx, &prepared, mmq_reuse.groups[group].size - scale_size(node), mmq_inputs[group], node->src[1]);
+                    std::copy(reader.ne, reader.ne + GGML_MAX_DIMS, mmq_shapes[group].begin());
                 } else {
                     ggml_cuda_quantize_mmq_input(*cuda_ctx, node, mmq_reuse.groups[group].size - scale_size(node), mmq_inputs[group]);
                 }

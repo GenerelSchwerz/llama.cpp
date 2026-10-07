@@ -157,11 +157,12 @@ size_t ggml_cuda_mmq_input_size(const ggml_tensor * node, const int cc) {
 }
 
 static void ggml_cuda_quantize_mmq_input_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-        const ggml_tensor * src1, ggml_prec prec, size_t size, ggml_cuda_mmq_input & input) {
+        const ggml_tensor * src1, ggml_prec prec, size_t size, ggml_cuda_mmq_input & input, const ggml_tensor * logical_src1 = nullptr) {
     input.quantized.alloc(size);
     const bool use_fp4 = prec == GGML_PREC_Q4;
     if (src0->type == GGML_TYPE_NVFP4 && use_fp4) {
-        input.scale.alloc(src1->ne[3]*src1->ne[2]*src1->ne[1]);
+        const ggml_tensor * scale_src1 = logical_src1 ? logical_src1 : src1;
+        input.scale.alloc(scale_src1->ne[3]*scale_src1->ne[2]*scale_src1->ne[1]);
     }
     const int64_t padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
     const int64_t s11 = src1->nb[1]/sizeof(float);
@@ -169,8 +170,15 @@ static void ggml_cuda_quantize_mmq_input_impl(ggml_backend_cuda_context & ctx, c
     const int64_t s13 = src1->nb[3]/sizeof(float);
     if (use_fp4) {
         const bool aligned = ggml_cuda_is_aligned(src1, 32);
-        quantize_mmq_fp4_cuda((const float *) src1->data, nullptr, input.quantized.get(), input.scale.ptr, src0->type,
-            aligned, src1->ne[0], s11, s12, s13, padded, src1->ne[1], src1->ne[2], src1->ne[3], ctx.stream());
+        if (src0->type == GGML_TYPE_NVFP4 && logical_src1 &&
+                (src1->ne[2] != logical_src1->ne[2] || src1->ne[3] != logical_src1->ne[3])) {
+            GGML_ASSERT(src1->ne[0] == logical_src1->ne[0] && src1->ne[1] == logical_src1->ne[1]);
+            quantize_mmq_nvfp4_compact_cuda((const float *) src1->data, input.quantized.get(), input.scale.ptr,
+                aligned, src1->ne[0], s11, s12, s13, padded, src1->ne[1], src1->ne[2], src1->ne[3], logical_src1->ne[2], logical_src1->ne[3], ctx.stream());
+        } else {
+            quantize_mmq_fp4_cuda((const float *) src1->data, nullptr, input.quantized.get(), input.scale.ptr, src0->type,
+                aligned, src1->ne[0], s11, s12, s13, padded, src1->ne[1], src1->ne[2], src1->ne[3], ctx.stream());
+        }
     } else {
         quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, input.quantized.get(), src0->type,
             src1->ne[0], s11, s12, s13, padded, src1->ne[1], src1->ne[2], src1->ne[3], ctx.stream());
@@ -179,10 +187,10 @@ static void ggml_cuda_quantize_mmq_input_impl(ggml_backend_cuda_context & ctx, c
 }
 
 void ggml_cuda_quantize_mmq_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
-        size_t size, ggml_cuda_mmq_input & input) {
+        size_t size, ggml_cuda_mmq_input & input, const ggml_tensor * logical_src1) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     ggml_cuda_quantize_mmq_input_impl(ctx, node->src[0], node->src[1],
-        ggml_cuda_mmq_get_prec_src1(node->src[0], node, cc), size, input);
+        ggml_cuda_mmq_get_prec_src1(node->src[0], node, cc), size, input, logical_src1);
 }
 
 void ggml_cuda_mul_mat_q(
@@ -236,25 +244,21 @@ void ggml_cuda_mul_mat_q(
         ggml_tensor packed = *src1;
         if (quantized_ne) {
             GGML_ASSERT(quantized_ne[0] == ne10 && quantized_ne[1] == ne11);
-            GGML_ASSERT(!use_native_fp4 || src0->type != GGML_TYPE_NVFP4);
+            GGML_ASSERT(!use_native_fp4 || src0->type != GGML_TYPE_NVFP4 || input->scale.ptr);
             for (int d = 2; d < GGML_MAX_DIMS; ++d) {
                 GGML_ASSERT(quantized_ne[d] == 1 || quantized_ne[d] == src1->ne[d]);
                 packed.ne[d] = quantized_ne[d];
             }
         }
         if (!input) {
-            // NVFP4 row scales still use the full logical bank/sample layout.
-            if (!use_native_fp4 || src0->type != GGML_TYPE_NVFP4) {
-                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
-                    if (packed.nb[d] == 0) {
-                        packed.ne[d] = 1;
-                    }
-                }
+            for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                if (packed.nb[d] == 0) { packed.ne[d] = 1; }
             }
             const int J_max = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
-            const size_t size = packed.ne[3]*packed.ne[2]*ne11*ne10_padded*y_block_size/y_values_per_block +
+            const ggml_tensor * allocation_src1 = use_native_fp4 && src0->type == GGML_TYPE_NVFP4 ? src1 : &packed;
+            const size_t size = allocation_src1->ne[3]*allocation_src1->ne[2]*ne11*ne10_padded*y_block_size/y_values_per_block +
                 J_max*sizeof(block_q8_1_mmq);
-            ggml_cuda_quantize_mmq_input_impl(ctx, src0, &packed, prec_src1, size, local_input);
+            ggml_cuda_quantize_mmq_input_impl(ctx, src0, &packed, prec_src1, size, local_input, src1);
             input = &local_input;
         }
 
