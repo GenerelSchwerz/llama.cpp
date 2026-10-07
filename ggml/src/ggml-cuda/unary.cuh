@@ -96,6 +96,8 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add);
 void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add);
 
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1);
+
 constexpr int GGML_CUDA_ORDERED_MUL_ADD_MAX = 128;
 void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count);
 

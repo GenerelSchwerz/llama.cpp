@@ -3302,10 +3302,11 @@ struct test_bin_bcast : public test_case {
     const bool coefficient_gap;
     std::vector<ggml_tensor *> stages;
 
-    bool run_whole_graph() override { return nf > 1 || add_after; }
+    bool run_whole_graph() override { return nf > 1 || add_after || repeat_input >= 0; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
     std::string op_desc(ggml_tensor * t) override {
+        if (op == ggml_add && repeat_input >= 0) { return coefficient_gap ? "DEFERRED_REPEAT_ADD" : "REPEAT_ADD"; }
         return coefficient_gap ? "DEFERRED_REPEAT_MUL_ADD" : repeat_input >= 0 ? "REPEAT_MUL_ADD" : add_after ? "MUL_ADD" : test_case::op_desc(t);
     }
 
@@ -3337,7 +3338,7 @@ struct test_bin_bcast : public test_case {
         stages.clear();
 
         std::array<int64_t, 4> expanded = {ne[0]*nr[0], ne[1]*nr[1], ne[2]*nr[2], ne[3]*nr[3]};
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, repeat_input == 0 ? ne.data() : expanded.data());
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, (repeat_input == 0 || repeat_input == 2) ? ne.data() : expanded.data());
         ggml_set_name(a, "a");
 
         const ggml_type tb = type_b == GGML_TYPE_COUNT ? type : type_b;
@@ -3358,16 +3359,16 @@ struct test_bin_bcast : public test_case {
         }
 
         if (repeat_input >= 0) {
-            GGML_ASSERT(op == ggml_mul && nf == 1 && add_after && !src_overlap && repeat_input <= 1);
-            ggml_tensor * repeated = ggml_repeat_4d(ctx, repeat_input == 0 ? a : b[0], expanded[0], expanded[1], expanded[2], expanded[3]);
+            GGML_ASSERT(nf == 1 && !src_overlap && ((op == ggml_mul && add_after && repeat_input <= 1) || (op == ggml_add && !add_after && repeat_input <= 2)));
+            ggml_tensor * repeated = ggml_repeat_4d(ctx, repeat_input == 1 ? b[0] : a, expanded[0], expanded[1], expanded[2], expanded[3]);
             ggml_set_output(repeated);
             stages.push_back(repeated);
-            if (repeat_input == 0) a = repeated;
+            if (repeat_input != 1) a = repeated;
             else b[0] = repeated;
         }
 
         if (coefficient_gap) {
-            GGML_ASSERT(repeat_input == 0 && tb == GGML_TYPE_F32 && !perm1 && !src_overlap);
+            GGML_ASSERT((repeat_input == 0 || repeat_input == 2) && tb == GGML_TYPE_F32 && !perm1 && !src_overlap);
             b[0] = ggml_scale(ctx, b[0], 0.25f);
             ggml_set_output(b[0]); stages.push_back(b[0]);
             b[0] = ggml_sigmoid(ctx, b[0]);
@@ -3376,8 +3377,13 @@ struct test_bin_bcast : public test_case {
             ggml_set_output(b[0]); stages.push_back(b[0]);
         }
 
+        if (repeat_input == 2) {
+            b[0] = ggml_repeat_4d(ctx, b[0], expanded[0], expanded[1], expanded[2], expanded[3]);
+            ggml_set_output(b[0]); stages.push_back(b[0]);
+        }
+
         // The backward pass supports broadcasting only for GGML_ADD:
-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
+        const bool grad_supported = op == ggml_add && repeat_input < 0 && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
         if (grad_supported) {
             ggml_set_param(a);
             ggml_set_param(b[0]);
@@ -3394,6 +3400,8 @@ struct test_bin_bcast : public test_case {
         for (int i = 0; i < nf; ++i) {
             out = op(ctx, out, b[i]);
         }
+
+        if (op == ggml_add && repeat_input >= 0) { ggml_set_output(out); stages.push_back(out); }
 
         if (add_after) {
             GGML_ASSERT(op == ggml_mul && nf == 1);
@@ -10111,6 +10119,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int repeated : {0, 1, 2}) {
+            test_cases.emplace_back(new test_bin_bcast(ggml_add, type, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, false, false, GGML_TYPE_COUNT, false, false, repeated));
+        }
+        test_cases.emplace_back(new test_bin_bcast(ggml_add, type, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, false, false, GGML_TYPE_F32, false, false, 2, true));
+    }
+
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_BF16, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, false, false, GGML_TYPE_F32, false, false, 1));
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (bool permute : {false, true}) {

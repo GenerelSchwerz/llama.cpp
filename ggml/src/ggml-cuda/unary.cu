@@ -494,6 +494,54 @@ void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_kernel_launch(repeat_mul_add_kernel, launch, binary, mul->src[0] == repeat ? 0 : 1, add->src[0] == mul);
 }
 
+static __global__ void repeat_add_kernel(mul_add_args binary) {
+    const affine_unary_args & args = binary.affine;
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) { return; }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint2 part = fast_div_modulo(remaining, binary.ne[d]);
+        remaining = part.x;
+        pos[d] = part.y;
+    }
+    ggml_cuda_pdl_sync();
+    float lhs = mul_add_read(args.input[0], binary.repeat[0], pos, binary.repeat_mask[0]);
+    float rhs = mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]);
+    if (args.output[1]) { lhs = affine_unary_store(args.output[1], args.output_type[1], i, lhs); }
+    if (args.output[2]) { rhs = affine_unary_store(args.output[2], args.output_type[2], i, rhs); }
+    affine_unary_store(args.output[0], args.output_type[0], i, lhs + rhs);
+}
+
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1) {
+    mul_add_args binary{};
+    affine_unary_args & args = binary.affine;
+    const ggml_tensor * repeats[] = {repeat0, repeat1};
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * read = repeats[j] ? repeats[j]->src[0] : add->src[j];
+        args.input[j].data = read->data;
+        args.input[j].type = read->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = read->ne[d];
+            args.input[j].nb[d] = read->ne[d] == 1 ? 0 : read->nb[d];
+            binary.repeat[j][d] = init_fastdiv_values(read->ne[d]);
+            if (read->ne[d] != 1 && read->ne[d] != add->ne[d]) { binary.repeat_mask[j] |= 1u << d; }
+        }
+        if (repeats[j] && (j == 0 || repeat1 != repeat0)) {
+            args.output[j + 1] = repeats[j]->data;
+            args.output_type[j + 1] = repeats[j]->type;
+        }
+    }
+    args.output[0] = add->data;
+    args.output_type[0] = add->type;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) { binary.ne[d] = init_fastdiv_values(add->ne[d]); }
+    args.count = ggml_nelements(add);
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(repeat_add_kernel, launch, binary);
+}
+
 struct ordered_mul_add_args {
     const char * input[2];
     size_t row_stride[2];
