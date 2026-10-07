@@ -1509,7 +1509,7 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     ggml_tensor packed = *src1;
     if (!ids && !quantized) {
-        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
             if (packed.nb[d] == 0) {
                 packed.ne[d] = 1;
             }
@@ -1521,15 +1521,16 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
-    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t row_size_y = ne10_padded / QK8_1;
+    const int64_t s11 = packed.ne[1] == ne11 ? row_size_y : 0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const int64_t s12 = packed.ne[2] == ne12 ? ne11*s11 : 0;
-    const int64_t s13 = packed.ne[3] == ne13 ? packed.ne[2]*ne11*s11 : 0;
+    const int64_t s12 = packed.ne[2] == ne12 ? packed.ne[1]*row_size_y : 0;
+    const int64_t s13 = packed.ne[3] == ne13 ? packed.ne[2]*packed.ne[1]*row_size_y : 0;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
