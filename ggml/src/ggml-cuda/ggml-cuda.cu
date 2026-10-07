@@ -5244,6 +5244,68 @@ static ggml_cuda_cublas_affine_match ggml_cuda_match_cublas_affine(ggml_backend_
     return {mm, affine, count};
 }
 
+static int ggml_cuda_repeat_first_consumer(ggml_cgraph * graph, int i, bool & compute) {
+    const ggml_tensor * repeat = graph->nodes[i];
+    int m = i + 1;
+    compute = false;
+    for (; m < graph->n_nodes; ++m) {
+        const ggml_tensor * node = graph->nodes[m];
+        bool used = node->view_src == repeat;
+        for (const ggml_tensor * src : node->src) { used |= src && (src == repeat || src->view_src == repeat); }
+        if (used) { break; }
+        compute |= !ggml_cuda_affine_unary_view_op(node->op);
+    }
+    return m;
+}
+
+static bool ggml_cuda_repeat_interval_ok(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, int m,
+        std::initializer_list<const ggml_tensor *> writes, bool allocated, bool normalization = false) {
+    const ggml_tensor * repeat = graph->nodes[i];
+    for (int j = i + 1; j < m; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        switch (node->op) {
+            case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT: case GGML_OP_SCALE: case GGML_OP_UNARY: case GGML_OP_MUL:
+            case GGML_OP_SUM_ROWS: case GGML_OP_SUB: case GGML_OP_CONT: break;
+            case GGML_OP_NONE:
+                if (!normalization || (node->flags & GGML_TENSOR_FLAG_COMPUTE)) { return false; }
+                break;
+            case GGML_OP_RMS_NORM: case GGML_OP_SQRT: case GGML_OP_CLAMP: case GGML_OP_ADD:
+                if (!normalization) { return false; }
+                break;
+            default: return false;
+        }
+    }
+    if (allocated) {
+        const ggml_tensor * input = repeat->src[0]->view_src ? repeat->src[0]->view_src : repeat->src[0];
+        uintptr_t ib, ie, wb, we;
+        if (!ggml_cuda_affine_unary_range(input, ctx.device, ib, ie) || !ggml_cuda_affine_unary_range(repeat, ctx.device, wb, we)) { return false; }
+        for (const ggml_tensor * write : writes) {
+            if (!write) { continue; }
+            uintptr_t begin, end;
+            if (!ggml_cuda_affine_unary_range(write, ctx.device, begin, end) || (begin < ie && ib < end)) { return false; }
+        }
+        for (int j = i + 1; j < m; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            uintptr_t begin, end;
+            if (!ggml_cuda_affine_unary_range(node, ctx.device, begin, end)) { return false; }
+            if (normalization && node->op == GGML_OP_NONE) {
+                const ggml_tensor * root = node->view_src ? node->view_src : node;
+                if (!ggml_cuda_affine_unary_range(root, ctx.device, begin, end) || (begin < we && wb < end)) { return false; }
+            }
+            if (!ggml_cuda_affine_unary_view_op(node->op) && node->op != GGML_OP_NONE && ((begin < ie && ib < end) || (begin < we && wb < end))) { return false; }
+            for (const ggml_tensor * src : node->src) {
+                if (src && (!ggml_cuda_affine_unary_range(src, ctx.device, begin, end) || (begin < we && wb < end))) { return false; }
+                if (normalization && src) {
+                    const ggml_tensor * root = src->view_src ? src->view_src : src;
+                    if (!ggml_cuda_affine_unary_range(root, ctx.device, begin, end) || (begin < we && wb < end)) { return false; }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_pre_mul_norm_match {
     ggml_tensor * repeat = nullptr;
     ggml_tensor * product = nullptr;
@@ -5251,12 +5313,13 @@ struct ggml_cuda_pre_mul_norm_match {
     ggml_tensor * weighted = nullptr;
     int norm_i = -1;
     int count = 0;
+    int product_i = -1;
 };
 
 static ggml_cuda_pre_mul_norm_match ggml_cuda_match_pre_mul_norm(ggml_backend_cuda_context & ctx,
-        ggml_cgraph * graph, int i, bool allocated = true) {
+        ggml_cgraph * graph, int i, bool allocated = true, int consumer = -1) {
     ggml_tensor * repeat = graph->nodes[i]->op == GGML_OP_REPEAT ? graph->nodes[i] : nullptr;
-    const int m = i + int(repeat != nullptr);
+    const int m = consumer < 0 ? i + int(repeat != nullptr) : consumer;
     if (m >= graph->n_nodes) { return {}; }
     ggml_tensor * product = graph->nodes[m];
     if (product->op != GGML_OP_MUL || !product->src[0] || !product->src[1] || product->type != GGML_TYPE_F32 ||
@@ -5279,14 +5342,19 @@ static ggml_cuda_pre_mul_norm_match ggml_cuda_match_pre_mul_norm(ggml_backend_cu
             !ggml_are_same_shape(norm, norm->src[0]) || norm->ne[0] > INT_MAX - 1023 || norm->ne[2] > 65535 || norm->ne[3] > 65535) { return {}; }
     ggml_tensor * weighted = nullptr;
     int end = n + 1;
-    while (end < graph->n_nodes && ggml_cuda_affine_unary_view_op(graph->nodes[end]->op)) {
-        if (!ggml_cuda_affine_unary_prior_view(graph, i, graph->nodes[end], true)) { return {}; }
+    while (end < graph->n_nodes && (ggml_cuda_affine_unary_view_op(graph->nodes[end]->op) || graph->nodes[end]->op == GGML_OP_NONE)) {
+        const ggml_tensor * meta = graph->nodes[end];
+        if (meta->op == GGML_OP_NONE) {
+            if (meta->flags & GGML_TENSOR_FLAG_COMPUTE) { return {}; }
+        } else if (!ggml_cuda_affine_unary_prior_view(graph, m, meta, true)) { return {}; }
         ++end;
     }
     if (end < graph->n_nodes && graph->nodes[end]->op == GGML_OP_MUL &&
             (graph->nodes[end]->src[0] == norm) != (graph->nodes[end]->src[1] == norm)) {
         weighted = graph->nodes[end++];
         if (!ggml_are_same_shape(norm, weighted) || !ggml_is_contiguous(weighted)) { return {}; }
+    } else {
+        end = n + 1;
     }
     // Leave longer normalization fusions to the existing dispatch.
     if (end < graph->n_nodes && (graph->nodes[end]->op == GGML_OP_ROPE || graph->nodes[end]->op == GGML_OP_ADD || graph->nodes[end]->op == GGML_OP_SCALE)) { return {}; }
@@ -5309,10 +5377,13 @@ static ggml_cuda_pre_mul_norm_match ggml_cuda_match_pre_mul_norm(ggml_backend_cu
     }
     std::vector<int> indices;
     std::vector<ggml_op> ops;
-    for (int j = i; j < end; ++j) { indices.push_back(j); ops.push_back(graph->nodes[j]->op); }
+    if (repeat) { indices.push_back(i); ops.push_back(GGML_OP_REPEAT); }
+    for (int j = m; j < end; ++j) {
+        if (graph->nodes[j]->op != GGML_OP_NONE) { indices.push_back(j); ops.push_back(graph->nodes[j]->op); }
+    }
     if (!ggml_can_fuse_subgraph_ext(graph, indices.data(), indices.size(), ops.data(), indices.data(), indices.size())) { return {}; }
     if (allocated) {
-        for (int j = i; j < end; ++j) {
+        for (int j : indices) {
             uintptr_t begin, stop;
             if (!ggml_cuda_affine_unary_range(graph->nodes[j], ctx.device, begin, stop) || begin % sizeof(float)) { return {}; }
         }
@@ -5332,7 +5403,27 @@ static ggml_cuda_pre_mul_norm_match ggml_cuda_match_pre_mul_norm(ggml_backend_cu
             }
         }
     }
-    return {repeat, product, norm, weighted, n, end - i};
+    return {repeat, product, norm, weighted, n, end - (consumer < 0 ? i : m), m};
+}
+
+static ggml_cuda_pre_mul_norm_match ggml_cuda_match_deferred_repeat_norm(ggml_backend_cuda_context & ctx,
+        ggml_cgraph * graph, int i, bool allocated = true) {
+    const ggml_tensor * repeat = graph->nodes[i];
+    if (repeat->op != GGML_OP_REPEAT || !repeat->src[0]) { return {}; }
+    bool compute;
+    const int m = ggml_cuda_repeat_first_consumer(graph, i, compute);
+    if (m <= i + 1 || m == graph->n_nodes) { return {}; }
+    const auto match = ggml_cuda_match_pre_mul_norm(ctx, graph, i, allocated, m);
+    if (!match.count) { return {}; }
+    // Do not displace an earlier producer fusion that consumes the product.
+    const ggml_tensor * prior = graph->nodes[m - 1];
+    if (!ggml_cuda_affine_unary_view_op(prior->op) && prior->op != GGML_OP_SCALE && prior->op != GGML_OP_CONT && prior->op != GGML_OP_NONE) {
+        if (prior->op != GGML_OP_UNARY || ggml_are_same_shape(prior, repeat)) { return {}; }
+    }
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (ggml_cuda_match_moe_weighted_reduction(graph, m, reduction) ||
+            !ggml_cuda_repeat_interval_ok(ctx, graph, i, m, {match.repeat, match.product, match.norm, match.weighted}, allocated, true)) { return {}; }
+    return match;
 }
 
 struct ggml_cuda_repeat_mul_add_match {
@@ -5391,15 +5482,8 @@ static ggml_cuda_repeat_mul_add_match ggml_cuda_match_repeat_mul_add(ggml_backen
 static ggml_cuda_repeat_mul_add_match ggml_cuda_match_deferred_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
     ggml_tensor * repeat = graph->nodes[i];
     if (repeat->op != GGML_OP_REPEAT || !repeat->src[0]) { return {}; }
-    int m = i + 1;
-    bool compute = false;
-    for (; m < graph->n_nodes; ++m) {
-        const ggml_tensor * node = graph->nodes[m];
-        bool used = node->view_src == repeat;
-        for (const ggml_tensor * src : node->src) { used |= src && (src == repeat || src->view_src == repeat); }
-        if (used) { break; }
-        compute |= !ggml_cuda_affine_unary_view_op(node->op);
-    }
+    bool compute;
+    const int m = ggml_cuda_repeat_first_consumer(graph, i, compute);
     if (!compute || m == graph->n_nodes) { return {}; }
     const auto match = ggml_cuda_match_repeat_mul_add(ctx, graph, i, allocated, m);
     if (!match.count) { return {}; }
@@ -5408,33 +5492,7 @@ static ggml_cuda_repeat_mul_add_match ggml_cuda_match_deferred_repeat_mul_add(gg
     if (!ggml_cuda_affine_unary_view_op(prior->op) && prior->op != GGML_OP_SCALE && prior->op != GGML_OP_CONT) { return {}; }
     ggml_cuda_moe_weighted_reduction_match reduction;
     if (ggml_cuda_match_moe_weighted_reduction(graph, m, reduction)) { return {}; }
-    for (int j = i + 1; j < m; ++j) {
-        const ggml_tensor * node = graph->nodes[j];
-        switch (node->op) {
-            case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
-            case GGML_OP_MUL_MAT: case GGML_OP_SCALE: case GGML_OP_UNARY: case GGML_OP_MUL:
-            case GGML_OP_SUM_ROWS: case GGML_OP_SUB: case GGML_OP_CONT: break;
-            default: return {};
-        }
-    }
-    if (allocated) {
-        const ggml_tensor * input = repeat->src[0]->view_src ? repeat->src[0]->view_src : repeat->src[0];
-        uintptr_t ib, ie, wb, we;
-        if (!ggml_cuda_affine_unary_range(input, ctx.device, ib, ie) || !ggml_cuda_affine_unary_range(repeat, ctx.device, wb, we)) { return {}; }
-        for (const ggml_tensor * write : {repeat, match.binary.mul, match.binary.add}) {
-            uintptr_t begin, end;
-            if (!ggml_cuda_affine_unary_range(write, ctx.device, begin, end) || (begin < ie && ib < end)) { return {}; }
-        }
-        for (int j = i + 1; j < m; ++j) {
-            const ggml_tensor * node = graph->nodes[j];
-            uintptr_t begin, end;
-            if (!ggml_cuda_affine_unary_range(node, ctx.device, begin, end)) { return {}; }
-            if (!ggml_cuda_affine_unary_view_op(node->op) && ((begin < ie && ib < end) || (begin < we && wb < end))) { return {}; }
-            for (const ggml_tensor * src : node->src) {
-                if (src && (!ggml_cuda_affine_unary_range(src, ctx.device, begin, end) || (begin < we && wb < end))) { return {}; }
-            }
-        }
-    }
+    if (!ggml_cuda_repeat_interval_ok(ctx, graph, i, m, {repeat, match.binary.mul, match.binary.add}, allocated)) { return {}; }
     return match;
 }
 
@@ -6618,6 +6676,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             };
 
             std::unordered_map<const ggml_tensor *, ggml_cuda_repeat_mul_add_match> repeat_emits;
+            std::unordered_map<const ggml_tensor *, ggml_cuda_pre_mul_norm_match> repeat_norm_emits;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -6662,11 +6721,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
                     if (node->op == GGML_OP_REPEAT) {
+                        const auto norm = ggml_cuda_match_deferred_repeat_norm(*cuda_ctx, cgraph, i);
+                        if (norm.count && (norm_emits.empty() || !norm_emits[norm.norm_i].norm) &&
+                                (q8_emits.empty() || !q8_emits[norm.norm_i].norm) && (mmq_emits.empty() || !mmq_emits[norm.norm_i].norm)) {
+                            repeat_norm_emits.emplace(norm.product, norm);
+                            continue;
+                        }
                         const auto deferred = ggml_cuda_match_deferred_repeat_mul_add(*cuda_ctx, cgraph, i);
                         if (deferred.count) {
                             repeat_emits.emplace(deferred.binary.mul, deferred);
                             continue;
                         }
+                    }
+                    const auto norm_emit = repeat_norm_emits.find(node);
+                    if (norm_emit != repeat_norm_emits.end()) {
+                        const auto & match = norm_emit->second;
+                        ggml_cuda_op_rms_norm_pre_mul(*cuda_ctx, match.product, match.norm, match.weighted, match.repeat);
+                        i += match.count - 1;
+                        continue;
                     }
                     const auto emit = repeat_emits.find(node);
                     if (emit != repeat_emits.end()) {
@@ -7105,6 +7177,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (hc_up.count) {
                 params->add_alloc_dep(params->user_data, hc_up.mm->src[0], hc_up.dst);
                 params->add_alloc_dep(params->user_data, hc_up.mm->src[1], hc_up.dst);
+            }
+
+            const auto repeat_norm = ggml_cuda_match_deferred_repeat_norm(*cuda_ctx, cgraph, i, false);
+            if (repeat_norm.count) {
+                ggml_tensor * last = cgraph->nodes[repeat_norm.product_i + repeat_norm.count - 1];
+                ggml_tensor * read = repeat_norm.repeat->src[0];
+                params->add_alloc_dep(params->user_data, read, last);
+                if (read->view_src) { params->add_alloc_dep(params->user_data, read->view_src, last); }
+                params->add_alloc_dep(params->user_data, repeat_norm.repeat, last);
             }
 
             const auto pre = ggml_cuda_match_pre_mul_norm(*cuda_ctx, cgraph, i, false);
