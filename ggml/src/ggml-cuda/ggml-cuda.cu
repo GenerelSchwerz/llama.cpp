@@ -5741,40 +5741,55 @@ static std::vector<int> ggml_cuda_match_repeat_mm_readers(ggml_backend_cuda_cont
     return readers;
 }
 
-static std::vector<bool> ggml_cuda_plan_repeat_mm(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, ggml_cuda_reuse_plan & reuse) {
-    if (reuse.groups.empty() || ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) { return {}; }
-    if (std::none_of(reuse.groups.begin(), reuse.groups.end(), [&](const ggml_cuda_reuse_group & group) { return graph->nodes[group.node]->src[1]->op == GGML_OP_REPEAT; })) { return {}; }
-    ggml_cuda_reuse_plan candidate = reuse;
+static std::vector<bool> ggml_cuda_plan_repeat_mm(ggml_backend_cuda_context & ctx, ggml_cgraph * graph,
+        ggml_cuda_reuse_plan & q8_reuse, ggml_cuda_reuse_plan & mmq_reuse) {
+    if (ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) { return {}; }
+    ggml_cuda_reuse_plan * reuses[] = {&q8_reuse, &mmq_reuse};
+    bool repeated = false;
+    for (const auto * reuse : reuses) {
+        for (const auto & group : reuse->groups) { repeated |= graph->nodes[group.node]->src[1]->op == GGML_OP_REPEAT; }
+    }
+    if (!repeated) { return {}; }
+    ggml_cuda_reuse_plan candidates[] = {q8_reuse, mmq_reuse};
     std::unordered_map<const ggml_tensor *, int> indices;
     for (int i = 0; i < graph->n_nodes; ++i) { indices.emplace(graph->nodes[i], i); }
     std::vector<bool> repeats(graph->n_nodes, false);
-    bool moved = false;
-    for (size_t g = 0; g < candidate.groups.size(); ++g) {
-        auto & group = candidate.groups[g];
-        ggml_tensor * input = graph->nodes[group.node]->src[1];
-        const auto found = indices.find(input);
-        if (input->op != GGML_OP_REPEAT || found == indices.end() || found->second >= group.node || group.after || group.prepare != group.node) { continue; }
-        const auto readers = ggml_cuda_match_repeat_mm_readers(ctx, graph, found->second);
-        if (readers.empty()) { continue; }
-        std::vector<int> groups;
-        bool valid = true;
-        for (int reader : readers) {
-            const int member = candidate.nodes[reader];
-            if (member < 0) { valid = false; break; }
-            const auto & image = candidate.groups[member];
-            if (graph->nodes[image.node]->src[1] != input || image.after || image.prepare != image.node) { valid = false; break; }
-            if (std::find(groups.begin(), groups.end(), member) == groups.end()) { groups.push_back(member); }
+    bool moved[2] = {};
+    for (auto & candidate : candidates) {
+        for (const auto & group : candidate.groups) {
+            ggml_tensor * input = graph->nodes[group.node]->src[1];
+            const auto found = indices.find(input);
+            if (input->op != GGML_OP_REPEAT || found == indices.end() || found->second >= group.node || group.after || group.prepare != group.node) { continue; }
+            const auto readers = ggml_cuda_match_repeat_mm_readers(ctx, graph, found->second);
+            if (readers.empty()) { continue; }
+            std::vector<int> groups[2];
+            bool valid = true;
+            for (int reader : readers) {
+                const int q8 = candidates[0].nodes.empty() ? -1 : candidates[0].nodes[reader];
+                const int mmq = candidates[1].nodes.empty() ? -1 : candidates[1].nodes[reader];
+                if ((q8 >= 0) == (mmq >= 0)) { valid = false; break; }
+                const int family = q8 >= 0 ? 0 : 1;
+                const int member = q8 >= 0 ? q8 : mmq;
+                const auto & image = candidates[family].groups[member];
+                if (graph->nodes[image.node]->src[1] != input || image.after || image.prepare != image.node) { valid = false; break; }
+                if (std::find(groups[family].begin(), groups[family].end(), member) == groups[family].end()) { groups[family].push_back(member); }
+            }
+            if (!valid) { continue; }
+            // Prepare every original image before skipping its common REPEAT.
+            for (int family = 0; family < 2; ++family) {
+                for (int member : groups[family]) { candidates[family].groups[member].prepare = found->second; }
+                moved[family] |= !groups[family].empty();
+            }
+            repeats[found->second] = true;
         }
-        if (!valid) { continue; }
-        // Prepare every original image before skipping its common REPEAT.
-        for (int member : groups) { candidate.groups[member].prepare = found->second; }
-        repeats[found->second] = true;
-        moved = true;
     }
-    if (moved) {
-        candidate.pack();
-        if (candidate.groups.empty()) { return {}; }
-        reuse = std::move(candidate);
+    for (int family = 0; family < 2; ++family) {
+        if (!moved[family]) { continue; }
+        candidates[family].pack();
+        if (candidates[family].groups.empty()) { return {}; }
+    }
+    for (int family = 0; family < 2; ++family) {
+        if (moved[family]) { *reuses[family] = std::move(candidates[family]); }
     }
     return repeats;
 }
@@ -6897,26 +6912,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
                 q8_emits = ggml_cuda_plan_norm_q8(cgraph, cuda_ctx->device, mmvq_keys, mmvq_sizes, q8_reuse);
             }
-            const auto q8_repeats = ggml_cuda_plan_repeat_mm(*cuda_ctx, cgraph, q8_reuse);
-            ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> q8_inputs(cuda_ctx->pool(), q8_reuse);
-            const auto prepare_q8_group = [&](int group) {
-                if (q8_inputs[group].get()) { return; }
-                const ggml_tensor * node = cgraph->nodes[q8_reuse.groups[group].node];
-                if (!q8_repeats.empty() && q8_repeats[q8_reuse.groups[group].prepare]) {
-                    const ggml_tensor reader = ggml_cuda_repeat_mm_reader(node->src[1]);
-                    ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], &reader, q8_inputs[group]);
-                } else {
-                    ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], node->src[1], q8_inputs[group]);
-                }
-            };
-            const auto prepare_q8_shared = [&](int i, bool after) {
-                if (q8_reuse.starts.empty()) { return; }
-                for (int group = q8_reuse.starts[i]; group >= 0; group = q8_reuse.groups[group].next) {
-                    if (q8_reuse.groups[group].after == after) {
-                        prepare_q8_group(group);
-                    }
-                }
-            };
             std::vector<int> mmq_keys;
             std::vector<size_t> mmq_sizes;
             const int mmq_cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
@@ -6957,12 +6952,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
                 mmq_emits = ggml_cuda_plan_norm_mmq(cgraph, cuda_ctx->device, mmq_keys, mmq_sizes, mmq_reuse);
             }
-            const auto mmq_repeats = ggml_cuda_plan_repeat_mm(*cuda_ctx, cgraph, mmq_reuse);
+            const auto quantized_repeats = ggml_cuda_plan_repeat_mm(*cuda_ctx, cgraph, q8_reuse, mmq_reuse);
+            ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> q8_inputs(cuda_ctx->pool(), q8_reuse);
+            const auto prepare_q8_group = [&](int group) {
+                if (q8_inputs[group].get()) { return; }
+                const ggml_tensor * node = cgraph->nodes[q8_reuse.groups[group].node];
+                if (!quantized_repeats.empty() && quantized_repeats[q8_reuse.groups[group].prepare]) {
+                    const ggml_tensor reader = ggml_cuda_repeat_mm_reader(node->src[1]);
+                    ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], &reader, q8_inputs[group]);
+                } else {
+                    ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], node->src[1], q8_inputs[group]);
+                }
+            };
+            const auto prepare_q8_shared = [&](int i, bool after) {
+                if (q8_reuse.starts.empty()) { return; }
+                for (int group = q8_reuse.starts[i]; group >= 0; group = q8_reuse.groups[group].next) {
+                    if (q8_reuse.groups[group].after == after) {
+                        prepare_q8_group(group);
+                    }
+                }
+            };
             ggml_cuda_reuse_inputs<ggml_cuda_mmq_input> mmq_inputs(cuda_ctx->pool(), mmq_reuse);
             const auto prepare_mmq_group = [&](int group) {
                 if (mmq_inputs[group].quantized.get()) { return; }
                 const ggml_tensor * node = cgraph->nodes[mmq_reuse.groups[group].node];
-                if (!mmq_repeats.empty() && mmq_repeats[mmq_reuse.groups[group].prepare]) {
+                if (!quantized_repeats.empty() && quantized_repeats[mmq_reuse.groups[group].prepare]) {
                     ggml_tensor reader = ggml_cuda_repeat_mm_reader(node->src[1]);
                     ggml_tensor prepared = *node;
                     prepared.src[1] = &reader;
@@ -7109,7 +7123,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 const ggml_tensor * shared_input = q8_group >= 0 ? node->src[1] : nullptr;
                 const char * quantized = q8_group >= 0 ? q8_inputs[q8_group].get() : nullptr;
-                if (node->op == GGML_OP_REPEAT && ((!q8_repeats.empty() && q8_repeats[i]) || (!mmq_repeats.empty() && mmq_repeats[i]))) {
+                if (node->op == GGML_OP_REPEAT && (!quantized_repeats.empty() && quantized_repeats[i])) {
                     prepare_mmq_shared(i, false);
                     continue;
                 }
