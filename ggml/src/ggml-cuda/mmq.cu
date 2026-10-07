@@ -232,11 +232,20 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         ggml_cuda_mmq_input local_input(ctx.pool());
+        ggml_tensor packed = *src1;
         if (!input) {
+            // NVFP4 row scales still use the full logical bank/sample layout.
+            if (!use_native_fp4 || src0->type != GGML_TYPE_NVFP4) {
+                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                    if (packed.nb[d] == 0) {
+                        packed.ne[d] = 1;
+                    }
+                }
+            }
             const int J_max = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
-            const size_t size = ne13*ne12*ne11*ne10_padded*y_block_size/y_values_per_block +
+            const size_t size = packed.ne[3]*packed.ne[2]*ne11*ne10_padded*y_block_size/y_values_per_block +
                 J_max*sizeof(block_q8_1_mmq);
-            ggml_cuda_quantize_mmq_input_impl(ctx, src0, src1, prec_src1, size, local_input);
+            ggml_cuda_quantize_mmq_input_impl(ctx, src0, &packed, prec_src1, size, local_input);
             input = &local_input;
         }
 
@@ -244,14 +253,15 @@ void ggml_cuda_mul_mat_q(
         const int64_t s12 = use_native_fp4 ?
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-        const int64_t s13 = ne12*s12;
+        const int64_t stride_channel_y = packed.ne[2] == ne12 ? s12 : 0;
+        const int64_t stride_sample_y  = packed.ne[3] == ne13 ? packed.ne[2]*s12 : 0;
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) input->quantized.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? input->scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
-            ne03, ne13, s03, s13, s3,
+            ne02, ne12, s02, stride_channel_y, s2,
+            ne03, ne13, s03, stride_sample_y, s3,
             ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;

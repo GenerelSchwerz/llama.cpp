@@ -1507,8 +1507,16 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    ggml_tensor packed = *src1;
+    if (!ids && !quantized) {
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            if (packed.nb[d] == 0) {
+                packed.ne[d] = 1;
+            }
+        }
+    }
     if (!quantized) {
-        ggml_cuda_quantize_mmvq_input(ctx, src0, src1, src1_q8_1);
+        ggml_cuda_quantize_mmvq_input(ctx, src0, &packed, src1_q8_1);
         quantized = src1_q8_1.get();
     }
 
@@ -1520,8 +1528,8 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const int64_t s12 = ne11*s11;
-    const int64_t s13 = ne12*s12;
+    const int64_t s12 = packed.ne[2] == ne12 ? ne11*s11 : 0;
+    const int64_t s13 = packed.ne[3] == ne13 ? packed.ne[2]*ne11*s11 : 0;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
