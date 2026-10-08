@@ -4319,7 +4319,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if (keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
+            if (keys[node] < 0 || keys[node] > 3 ||
                     norm_group_invalid(node) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }

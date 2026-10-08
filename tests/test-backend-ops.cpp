@@ -10716,6 +10716,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hc_norm({3, 1}, GGML_TYPE_Q4_0, 16));
     test_cases.emplace_back(new test_mul_mat_hc_norm({3, 1}, GGML_TYPE_Q2_K, 16));
     test_cases.emplace_back(new test_mul_mat_hc_norm({1, 3}, GGML_TYPE_Q8_0, 17));
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mul_mat_hc_norm({3, 1}, type, 16));
+        test_cases.emplace_back(new test_mul_mat_hc_norm({1, 3}, type, 17));
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
