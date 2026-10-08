@@ -1,5 +1,9 @@
 # Crash recovery and containment
 
+## Owner build override, 2026-10-08
+
+The owner explicitly removed the recovery-specific build guard and requested j18. The active own-tree build uses plain cmake --parallel18 under the two ordered shared locks, with ordinary finite command/process-group cleanup and no recovery cgroup memory/swap/affinity wrapper. Historical build containment records remain preserved. This changes build invocation only; GPU/model fatal detection, owned teardown, shared locks, incident evidence and the prohibition on blindly retrying the implicated frozen workload remain in force. candidate-prefill-demand-12 is the first qualified build under this override; model/prefill correctness and speed are separate gates.
+
 ## Current bounded component qualification
 
 The containment prerequisites below now pass, including an actual cgroup OOM with group teardown. All model-server/original Flash attempts remain blocked by GPU-RUNS-BLOCKED.json; the original CUDA/root allocation chain is unproven. Scoped tiny corrected component runs are allowed only with verified3072MiB hard RAM, zero swap,120s runtime, both ordered locks, fatal-log watcher and exact process-tree teardown.

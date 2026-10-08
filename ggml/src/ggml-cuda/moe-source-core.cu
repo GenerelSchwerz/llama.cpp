@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -497,6 +498,8 @@ struct core_session {
     bool caller_active = false, closed = false, stopping = false, dispatch = false, resources_live = false;
     bool prepared = false, segmented = false, noalias = false, effect_failure = false;
     bool prefill = false;
+    bool prefill_cpu_enabled = false;
+    size_t shared_prefill_bytes = 0;
     uint64_t prefill_timeout_ns = 300'000'000'000ull;
     bool overlap_enabled = true, overlap_probe = false;
     bool weighted_enabled = false;
@@ -583,6 +586,10 @@ struct core_session {
         return reinterpret_cast<source_control *>((mapped ? alias : host) + layers[i].control_offset);
     }
     ggml_cuda_moe_grouped_context & owner() const { return *parent->moe_grouped_context; }
+    bool fits_device_budget(size_t private_bytes) const {
+        return private_bytes <= SIZE_MAX - shared_prefill_bytes &&
+            (!config.device_bytes || private_bytes + shared_prefill_bytes <= config.device_bytes);
+    }
 
     bool wait_stream(cudaStream_t target, uint64_t expiry) const {
         if (!target) { return true; }
@@ -929,36 +936,40 @@ bool core_session::validate_operations(const std::vector<prepared_operation> & o
     for (const auto & operation : operations) {
         if (operation.operation.effect == ggml_moe_source_effect::metadata) { continue; }
         const auto * tensor = operation.operation.tensor;
-        if (operation.source_kind == 4 && !weighted_binding_matches(operation, parent->device)) { return false; }
+        const auto rejected = [&](const char * resource) {
+            if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=operation_binding resource=%s node=%llu name=%s op=%s\n", resource, (unsigned long long) operation.operation.original_index, tensor->name, ggml_op_name(tensor->op)); }
+            return false;
+        };
+        if (operation.source_kind == 4 && !weighted_binding_matches(operation, parent->device)) { return rejected("weighted"); }
         if (operation.source_kind == 3) {
             ggml_cuda_source_staged_input_view current;
             if (!ggml_cuda_staged_input_prepare_source_view(parent->device, tensor, current) ||
                     current.identity != operation.staged.identity || current.host != operation.staged.host ||
                     current.device_alias != operation.staged.device_alias || current.host_flag != operation.staged.host_flag ||
                     current.device_flag != operation.staged.device_flag || current.bytes != operation.staged.bytes ||
-                    current.device != operation.staged.device) { return false; }
+                    current.device != operation.staged.device) { return rejected("staged"); }
         }
         if (!operation.source_kind && operation.matmul_estimated) {
             ggml_cuda_moe_fidelity_mul_mat_resources current;
             if (!ggml_cuda_moe_fidelity_mul_mat_requirements(parent->device, tensor, current) ||
                     current.pool_bytes != operation.matmul.pool_bytes || current.cublas_workspace_bytes != operation.matmul.cublas_workspace_bytes ||
-                    current.dispatch != operation.matmul.dispatch || current.compute_type != operation.matmul.compute_type) { return false; }
+                    current.dispatch != operation.matmul.dispatch || current.compute_type != operation.matmul.compute_type) { return rejected("matmul"); }
         }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
             ggml_cuda_fattn_resources current;
             if (!ggml_cuda_flash_attn_ext_prepare_resources(*compute, tensor, current) ||
-                    current.identity != operation.attention.identity || current.pool_bytes != operation.attention.pool_bytes) { return false; }
+                    current.identity != operation.attention.identity || current.pool_bytes != operation.attention.pool_bytes) { return rejected("attention"); }
         }
         if (tensor->op == GGML_OP_SOFT_MAX) {
             ggml_cuda_source_softmax_resources current;
             if (!ggml_cuda_softmax_prepare_resources(parent->device, tensor, current) ||
-                    current.identity != operation.softmax.identity || current.pool_bytes != operation.softmax.pool_bytes) { return false; }
+                    current.identity != operation.softmax.identity || current.pool_bytes != operation.softmax.pool_bytes) { return rejected("softmax"); }
         }
         if (operation.source_kind || (tensor->op != GGML_OP_TOP_K && tensor->op != GGML_OP_ARGSORT)) { continue; }
         ggml_cuda_source_sort_resources current;
         const bool valid = tensor->op == GGML_OP_TOP_K ? ggml_cuda_top_k_prepare_resources(parent->device, tensor, current) :
             ggml_cuda_argsort_prepare_resources(parent->device, tensor, current);
-        if (!valid || current.identity != operation.sorter.identity || current.pool_bytes != operation.sorter.pool_bytes) { return false; }
+        if (!valid || current.identity != operation.sorter.identity || current.pool_bytes != operation.sorter.pool_bytes) { return rejected("sort"); }
     }
     return true;
 }
@@ -1327,7 +1338,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
         graph->execution_certificate.n_rows > 1;
     if (prefill && std::any_of(experts.begin(), experts.end(), [](const ggml_moe_source_expert * expert) { return !expert->routed_operation; })) { return false; }
-    if ((config.device_bytes && program->storage_bytes() > config.device_bytes) || !program->allocate()) { return false; }
+    shared_prefill_bytes = prefill ? owner().prefill_staging_capacity_bytes() : 0;
+    if (!fits_device_budget(program->storage_bytes()) || !program->allocate()) { return false; }
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=private_storage prefill=%d bytes=%zu\n", int(prefill), program->storage_bytes()); }
     if (fusion_enabled && graph->use_counts && graph->visited_hash_set.size &&
             graph->visited_hash_set.used && graph->visited_hash_set.keys) {
@@ -1348,7 +1360,10 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     for (const auto * original : program->public_outputs()) {
         const auto * output = program->find(original);
         if (!output || !ggml_cuda_moe_tensor_storage(original, parent->device, unsupported) ||
-                !ggml_cuda_moe_tensor_storage(output, parent->device, unsupported)) { return false; }
+                !ggml_cuda_moe_tensor_storage(output, parent->device, unsupported)) {
+            if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation-rejected: stage=public_output_storage name=%s private=%d\n", original->name, int(output != nullptr)); }
+            return false;
+        }
         if (output->data != original->data && (!ggml_is_contiguous(original) || !ggml_is_contiguous(output))) { unsupported = true; return false; }
     }
     compute = std::make_unique<ggml_backend_cuda_context>(parent->device);
@@ -1397,7 +1412,12 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             layer.routed_output.src[2] = layer.descriptor->ids;
             layer.routed_output.data = layer.descriptor->output->data;
             layer.routed_output.buffer = layer.descriptor->output->buffer;
-            if (!cpu_api->execute_routed || !ggml_cuda_mmid_requirements(parent->device, &layer.routed_output, layer.routed_resources)) { return false; }
+            if (!cpu_api->execute_routed || !ggml_cuda_mmid_requirements(parent->device, &layer.routed_output, layer.routed_resources,
+                    prefill ? GGML_CUDA_MMID_MAPPING_SOURCE_MAP : GGML_CUDA_MMID_MAPPING_DIRECT)) {
+                if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation-rejected: stage=routed_resources layer=%u name=%s type=%s rows=%u routes=%u\n",
+                    i, expert.region.output->name, ggml_type_name(layer.routed_output.src[0]->type), geometry.row_capacity, geometry.route_capacity); }
+                return false;
+            }
             input_bytes = ggml_nbytes(layer.descriptor->activation);
             if (!product(geometry.route_capacity, layer.descriptor->output->nb[1], output_bytes)) { return false; }
             size_t routed_pool_bytes = layer.routed_resources.pool_bytes;
@@ -1519,7 +1539,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             !reserve(device_bytes, pool_bytes, pool_offset) ||
             !reserve(device_bytes, cublas_bytes, cublas_offset) ||
             program->storage_bytes() > SIZE_MAX - device_bytes ||
-            (config.device_bytes && device_bytes + program->storage_bytes() > config.device_bytes) ||
+            !fits_device_budget(device_bytes + program->storage_bytes()) ||
             (config.pinned_bytes && pinned_bytes > config.pinned_bytes)) { return false; }
     arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(config.backend), device_bytes);
     if (!arena || cudaHostAlloc(&host, pinned_bytes, cudaHostAllocMapped) != cudaSuccess) { return false; }
@@ -1556,6 +1576,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         }
     }
     if (!prepare_profiles() || !apply_profiles(true)) { return false; }
+    if (prefill && !profile_groups.empty() && (!wait_stream(stream, now_ns() + 5'000'000'000ull) ||
+            !finish_owner() || !acquire_owner(graph, false) || !wait_stream(stream, now_ns() + 5'000'000'000ull))) { return false; }
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=profiles_ready\n"); }
     if (!prepare_capture_resources() ||
             !wait_stream(stream, now_ns() + 5'000'000'000ull) || !finish_owner()) { return false; }
@@ -1604,11 +1626,17 @@ bool core_session::build_plan(uint32_t i) {
         layer.weights[route] = weight;
         ++layer.counts[weight];
     }
-    uint32_t misses = 0;
-    for (auto kind : layer.classes) { misses += kind == 2; }
-    uint32_t selected = uint64_t(misses) * ggml_moe_fidelity_selection().pcie_num / 256;
-    for (uint32_t w = uint32_t(layer.distinct.size()); w > 0 && selected; --w) {
-        if (layer.classes[w - 1] == 2) { layer.classes[w - 1] = 1; --selected; }
+    if (prefill) {
+        for (auto & kind : layer.classes) { if (kind == 2) { kind = 1; } }
+        const std::vector<uint32_t> counts(layer.counts.begin(), layer.counts.begin() + layer.distinct.size());
+        if (!ggml_moe_source_prefill_partition(counts, layer.classes, prefill_cpu_enabled ? config.n_threads : 0)) { return false; }
+    } else {
+        uint32_t misses = 0;
+        for (auto kind : layer.classes) { misses += kind == 2; }
+        uint32_t selected = uint64_t(misses) * ggml_moe_fidelity_selection().pcie_num / 256;
+        for (uint32_t w = uint32_t(layer.distinct.size()); w > 0 && selected; --w) {
+            if (layer.classes[w - 1] == 2) { layer.classes[w - 1] = 1; --selected; }
+        }
     }
     if (prefill) {
         std::fill(layer.prefill_expert_rows.begin(), layer.prefill_expert_rows.end(), 0);
@@ -1927,7 +1955,10 @@ bool core_session::prepare_capture_resources() {
         const auto & pool = static_cast<const ggml_cuda_pool_buffer &>(*compute->pools[parent->device][0]);
         const size_t required = pool.required;
         const bool grow = required > pool.capacity;
-        if (unsupported || (!grow && !request) || pool.used || !wait_stream(stream, now_ns() + 5'000'000'000ull)) { return false; }
+        if (unsupported || (!grow && !request) || pool.used || !wait_stream(stream, now_ns() + 5'000'000'000ull)) {
+            if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=resource_rejection unsupported=%d capacity=%zu required=%zu used=%zu library_request=%d\n", int(unsupported), pool.capacity, required, pool.used, int(bool(request))); }
+            return false;
+        }
         for (auto & executable : executables) {
             if (executable && cudaGraphExecDestroy(executable) != cudaSuccess) { return false; }
             executable = nullptr;
@@ -1943,7 +1974,7 @@ bool core_session::prepare_capture_resources() {
         if (grow) {
             const size_t retained = device_bytes - pool_arena_bytes;
             if (required > SIZE_MAX - retained || program->storage_bytes() > SIZE_MAX - retained - required ||
-                    (config.device_bytes && retained + required + program->storage_bytes() > config.device_bytes)) { return false; }
+                    !fits_device_budget(retained + required + program->storage_bytes())) { return false; }
             compute->pools[parent->device][0].reset();
             if (pool_arena) { ggml_backend_buffer_free(pool_arena); pool_arena = nullptr; }
             pool_arena_bytes = 0; device_bytes = retained;
@@ -1952,7 +1983,7 @@ bool core_session::prepare_capture_resources() {
             if (!buffer) { return false; }
             const size_t allocated = ggml_backend_buffer_get_size(buffer.get());
             if (allocated < required || allocated > SIZE_MAX - retained || program->storage_bytes() > SIZE_MAX - retained - allocated ||
-                    (config.device_bytes && retained + allocated + program->storage_bytes() > config.device_bytes)) { return false; }
+                    !fits_device_budget(retained + allocated + program->storage_bytes())) { return false; }
             compute->pools[parent->device][0] = std::make_unique<ggml_cuda_pool_buffer>(
                 static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer.get())), allocated);
             pool_arena = buffer.release(); pool_arena_bytes = allocated; device_bytes = retained + allocated;
@@ -1962,12 +1993,12 @@ bool core_session::prepare_capture_resources() {
             if (device < 0 || device >= ggml_cuda_info().device_count || stream_no < 0 || stream_no >= GGML_CUDA_MAX_STREAMS) { return false; }
             const size_t bytes = ggml_cuda_cublas_workspace_size(ggml_cuda_info().devices[device].cc);
             if (bytes > SIZE_MAX - device_bytes || program->storage_bytes() > SIZE_MAX - device_bytes - bytes ||
-                    (config.device_bytes && device_bytes + bytes + program->storage_bytes() > config.device_bytes)) { return false; }
+                    !fits_device_budget(device_bytes + bytes + program->storage_bytes())) { return false; }
             ggml_backend_buffer_ptr buffer(bytes ? ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), bytes) : nullptr);
             if (bytes && !buffer) { return false; }
             const size_t allocated = buffer ? ggml_backend_buffer_get_size(buffer.get()) : 0;
             if (allocated < bytes || allocated > SIZE_MAX - device_bytes || program->storage_bytes() > SIZE_MAX - device_bytes - allocated ||
-                    (config.device_bytes && device_bytes + allocated + program->storage_bytes() > config.device_bytes)) { return false; }
+                    !fits_device_budget(device_bytes + allocated + program->storage_bytes())) { return false; }
             auto * workspace = buffer ? ggml_backend_buffer_get_base(buffer.get()) : nullptr;
             if (buffer) { library_workspaces.push_back(std::move(buffer)); }
             device_bytes += allocated; library_bytes += allocated;
@@ -1978,9 +2009,9 @@ bool core_session::prepare_capture_resources() {
         (void) cudaGetLastError();
     }
     const auto & pool = static_cast<const ggml_cuda_pool_buffer &>(*compute->pools[parent->device][0]);
-    fprintf(stderr, "moe-source-core-resources: program_instance=%llu pool_estimate=%zu pool_capacity=%zu pool_peak=%zu recaptures=%llu extra_bytes=%zu library_preparations=%llu library_bytes=%zu cpu_control=%s\n",
+    fprintf(stderr, "moe-source-core-resources: program_instance=%llu pool_estimate=%zu pool_capacity=%zu pool_peak=%zu recaptures=%llu extra_bytes=%zu library_preparations=%llu library_bytes=%zu canonical_staging_budget=%zu cpu_control=%s\n",
         (unsigned long long) program_instance, pool_bytes, pool.capacity, pool.peak,
-        (unsigned long long) resource_recaptures, pool_arena_bytes, (unsigned long long) library_preparations, library_bytes,
+        (unsigned long long) resource_recaptures, pool_arena_bytes, (unsigned long long) library_preparations, library_bytes, shared_prefill_bytes,
         cpu_controlled_execute ? "scoped" : "legacy");
     return true;
 #endif
@@ -1990,6 +2021,10 @@ bool core_session::capture_prefill_resources() {
 #ifndef GGML_MOE_SOURCE_GRAPH
     return false;
 #else
+    for (const auto & layer : layers) {
+        if (!layer.descriptor->expert->routed_operation || !validate_operations(layer.prelude)) { return false; }
+    }
+    if (!validate_operations(epilogue)) { return false; }
     struct capture_scope {
         ggml_backend_cuda_context & context;
         bool active = ggml_cuda_moe_fidelity_capture_enter(), previous;
@@ -2009,7 +2044,10 @@ bool core_session::capture_prefill_resources() {
         for (auto & layer : layers) {
             const auto & expert = *layer.descriptor->expert;
             const auto & geometry = expert.region.geometry;
-            if (!expert.routed_operation || !validate_operations(layer.prelude) || !emit_operations(layer.prelude)) { return false; }
+            if (!emit_operations(layer.prelude)) {
+                if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=prefill_emit node=%llu\n", (unsigned long long) expert.region.first_node); }
+                return false;
+            }
             const auto * original = expert.region.output;
             ggml_cuda_moe_graph_binding binding;
             if (owner_execution.find_group(original, &binding) != layer.owner_group) { return false; }
@@ -2031,7 +2069,7 @@ bool core_session::capture_prefill_resources() {
                 return false;
             }
         }
-        return validate_operations(epilogue) && emit_operations(epilogue);
+        return emit_operations(epilogue);
     });
 #endif
 }
@@ -2424,13 +2462,17 @@ ggml_status core_session::replay_prefill(ggml_cgraph * graph) {
         control(i)->status = 0; control(i)->epoch = epoch; layer.epoch = epoch;
         control(i)->stop.store(canceled.load(std::memory_order_acquire) ? 1 : 0);
         ok = !canceled.load(std::memory_order_acquire) && emit_operations(layer.prelude) &&
-            cudaMemcpyAsync(host + layer.input_offset, layer.descriptor->activation->data,
-                layer.input_bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
             cudaMemcpy2DAsync(host + layer.ids_offset, layer.ids_stride, layer.descriptor->ids->data,
                 layer.descriptor->ids->nb[1], size_t(geometry.routes_per_row) * sizeof(int32_t), geometry.row_capacity,
                 cudaMemcpyDeviceToHost, stream) == cudaSuccess && wait_stream(stream, deadline) &&
             !canceled.load(std::memory_order_acquire) && build_plan(i);
         if (!ok) { break; }
+        if (layer.cpu_count) {
+            ok = cudaMemcpyAsync(host + layer.input_offset, layer.descriptor->activation->data,
+                layer.input_bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess && wait_stream(stream, deadline) &&
+                !canceled.load(std::memory_order_acquire);
+            if (!ok) { break; }
+        }
         ggml_cuda_moe_graph_binding binding;
         auto * original = graph->nodes[expert.region.first_node];
         ggml_cuda_moe_hybrid_reference_view view;
@@ -2442,7 +2484,29 @@ ggml_status core_session::replay_prefill(ggml_cgraph * graph) {
         source.slot_for_expert = reinterpret_cast<int32_t *>(host + layer.map_offset);
         source.expert_for_slot = reinterpret_cast<int32_t *>(host + layer.owners_offset);
         source.expert_capacity = geometry.expert_count; source.slot_capacity = geometry.expert_count;
-        struct cpu_job { core_session * session; uint32_t layer; bool gpu_notified = false; } job{this, i};
+        struct cpu_job {
+            core_session * session;
+            uint32_t layer;
+            bool gpu_notified = false, joined = false, success = true;
+            std::future<bool> pending;
+            bool join() {
+                if (!joined) {
+                    joined = true;
+                    try { if (pending.valid()) { success = pending.get(); } }
+                    catch (...) { session->stop(); success = false; }
+                }
+                return success;
+            }
+            ~cpu_job() { if (!joined && pending.valid()) { session->stop(); join(); } }
+        } job{this, i, false, false, true, {}};
+        if (layer.cpu_count) {
+            try {
+                job.pending = std::async(std::launch::async, [this, i] {
+                    if (hook) { ggml_cuda_set_device(parent->device); }
+                    return execute_cpu(i);
+                });
+            } catch (...) { ok = false; break; }
+        }
         ggml_cuda_moe_prefill_cpu_partition cpu;
         cpu.experts = layer.prefill_cpu_experts.data(); cpu.n_experts = geometry.expert_count; cpu.context = &job;
         cpu.output = host + layer.cpu_offset; cpu.output_bytes = layer.output_bytes; cpu.output_route_stride = layer.descriptor->output->nb[1];
@@ -2452,12 +2516,14 @@ ggml_status core_session::replay_prefill(ggml_cgraph * graph) {
             auto & session = *job.session;
             job.gpu_notified = true;
             return (!session.hook || session.hook(session.hook_data, GGML_BACKEND_MOE_HYBRID_TEST_GPU_ENQUEUED, session.epoch, session.stream)) &&
-                session.execute_cpu(job.layer);
+                job.join();
         };
         ok = owner().execute_bounded_prefill(*compute, layer.owner_group, binding, &layer.routed_output, stream,
                 layer.distinct.data(), layer.distinct.size(), reinterpret_cast<const char *>(host + layer.ids_offset),
                 size_t(geometry.row_capacity) * layer.ids_stride, layer.ids_stride, layer.prefill_expert_rows.data(),
                 nullptr, nullptr, nullptr, &cpu, &source) == GGML_CUDA_MOE_GROUPED_DECODE_READY;
+        if (!ok) { stop(); }
+        ok = job.join() && ok;
         if (ok && hook && !job.gpu_notified) { ok = hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_GPU_ENQUEUED, epoch, stream); }
         if (ok && hook) { ok = hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_CPU_JOINED, epoch, nullptr); }
         if (ok) { ok = wait_stream(stream, deadline) && !canceled.load(std::memory_order_acquire); }
@@ -2532,15 +2598,22 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
     compute_regions.clear();
     for (uint32_t i = 0; i < count; ++i) { compute_regions.push_back(static_cast<core_region *>(regions[i])); }
     ggml_cuda_set_device(parent->device);
+    const bool required_prompt = graph->execution_certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        graph->execution_certificate.n_rows > 1 &&
+        (graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL ||
+         graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT);
+    if (required_prompt && normal_fallback) { return reject_before_effects(); }
     if (normal_fallback) { resources_live = true; return ggml_backend_graph_compute_async(config.backend, graph); }
     if (!prepared && !allocate(graph, compute_regions)) {
-        if (unsupported && drain(true) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
+        if (unsupported && !required_prompt && drain(true) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
             normal_fallback = true;
             resources_live = true;
             fprintf(stderr, "moe-source-core-admission: provider=normal reason=unsupported-capability split_uid=%llu effects_started=0\n",
                 (unsigned long long) graph->uid);
             return ggml_backend_graph_compute_async(config.backend, graph);
         }
+        if (required_prompt) { fprintf(stderr, "moe-source-core-admission: required prefill preparation failed unsupported=%d split_uid=%llu\n",
+            int(unsupported), (unsigned long long) graph->uid); }
         {
             std::lock_guard<std::mutex> lock(mutex);
             closed = true; effect_failure = true; stop();
@@ -2835,6 +2908,10 @@ static int32_t source_create(const ggml_backend_moe_hybrid_config_v1 * config, v
     return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
 #else
     auto session = std::make_unique<core_session>();
+    if (const char * value = getenv("GGML_MOE_SOURCE_CPU_PREFILL")) {
+        if (strcmp(value, "0") && strcmp(value, "1")) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+        session->prefill_cpu_enabled = !strcmp(value, "1");
+    }
     if (const char * text = getenv("GGML_MOE_SOURCE_PREFILL_TIMEOUT_MS")) {
         uint64_t milliseconds = 0;
         if (!*text) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }

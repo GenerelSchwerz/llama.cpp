@@ -11,7 +11,7 @@ Support must follow llama.cpp graphs, tensor/source descriptors and shared GGML/
 
 Model statistics, hardware capacity/split tuning and online adaptation remain separate. Profiles cover the full model independently of runtime capacity. Completion requires numerical/state checks, held-out profile quality at least Strata's at equal actual byte budgets, and no accepted matched performance regressions. Preserve MTP, parallel/staggered requests, multiple devices and Windows partial pinning. Unavailable required physical platform gates remain incomplete.
 
-Kernel fusion, elastic cache resizing, RAM-complement exchange and complete-expert wave reorganization are deferred. Historical TODO entries do not expand the active scope.
+Owner clarification: hybrid mode must use the generalized CPU/multi-token prefill pipeline, including graph-derived complete-expert wave scheduling. CPU share zero remains inside hybrid; unavailable expert admission fails explicitly instead of selecting ordinary prefill. Kernel fusion, elastic cache resizing and RAM-complement exchange remain deferred. Historical TODO entries do not expand the active scope.
 
 Use the established own worktree /home/gencoolpc/llama-moe-generic-prefill-20261007 and own builds. Preserve checkpoint a69f285ddca71c9446354b687a6d8c44b0c5c9cd and incoming release 28d73c87cb90a9b78d4357ff1b456f456bfa1164. The pending combined tree passes current CPU-tool/CUDA-backend/test linkage and scoped synchronous owner tests; full serving qualification remains open. Preserve parent, specialized/frozen and other sessions' source and edit ownership. No extra agents, additional commit/push/PR or default promotion without explicit owner authorization.
 

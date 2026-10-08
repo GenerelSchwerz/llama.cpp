@@ -37,7 +37,7 @@ bool ggml_cuda_mmid_pool_reserve(size_t & bytes, size_t count, size_t element_by
     return true;
 }
 
-bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources) {
+bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources, ggml_cuda_mmid_mapping mapping) {
     if (device < 0 || device >= ggml_cuda_info().device_count || !ggml_cuda_mmid_shape_valid(dst)) { return false; }
     auto * registry = ggml_backend_cuda_reg();
     if (size_t(device) >= ggml_backend_reg_dev_count(registry) ||
@@ -71,16 +71,24 @@ bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_
     query.n_tokens = input->ne[2];
     query.n_experts = weight->ne[2];
     query.phase = input->ne[2] == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
-    query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    query.mapping = mapping;
+    if (mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP) {
+        query.phase = GGML_CUDA_MMID_PHASE_PREFILL;
+        query.preferred_consumer = GGML_CUDA_MMID_CONSUMER_MMQ;
+    }
     query.cc = info.cc;
     query.warp_size = info.warp_size;
     query.smpbo = info.smpbo;
     query.use_mmq = true;
-    const auto capability = ggml_cuda_mmid_get_capability(query);
+    auto capability = ggml_cuda_mmid_get_capability(query);
+    if (mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP && capability.reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER) {
+        query.preferred_consumer = GGML_CUDA_MMID_CONSUMER_GENERIC;
+        capability = ggml_cuda_mmid_get_capability(query);
+    }
     if (capability.reason != GGML_CUDA_MMID_CAPABILITY_OK) { return false; }
     ggml_cuda_mmid_resources measured;
     measured.consumer = capability.selection;
-    if (measured.consumer == GGML_CUDA_MMID_CONSUMER_GENERIC) {
+    if (measured.consumer == GGML_CUDA_MMID_CONSUMER_GENERIC && mapping == GGML_CUDA_MMID_MAPPING_DIRECT) {
         if (!(capability.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) || weight->ne[0] % 2 ||
                 weight->nb[1] % (2*ggml_type_size(weight->type)) || input->nb[2] % (2*sizeof(float))) { return false; }
         measured.consumer = GGML_CUDA_MMID_CONSUMER_MMVF;
@@ -102,8 +110,17 @@ bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_
                 !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, packed.quantized_bytes, 1) ||
                 (packed.scale_count && !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, packed.scale_count, sizeof(float))) ||
                 (packed.fixup_elements && !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, packed.fixup_elements, sizeof(float)))) { return false; }
-    } else if (measured.consumer != GGML_CUDA_MMID_CONSUMER_MMVF) {
+    } else if (measured.consumer != GGML_CUDA_MMID_CONSUMER_MMVF && measured.consumer != GGML_CUDA_MMID_CONSUMER_GENERIC) {
         return false;
+    }
+    if (mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP) {
+        const ggml_type input_type = ggml_is_quantized(weight->type) ||
+            (weight->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(info.cc)) ? GGML_TYPE_F32 : weight->type;
+        if (routes > SIZE_MAX / size_t(input->ne[0]) || routes > SIZE_MAX / size_t(dst->ne[0]) ||
+                !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, routes, 3 * sizeof(int32_t)) ||
+                !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, size_t(weight->ne[2]) + 1, sizeof(int32_t)) ||
+                !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, routes * size_t(input->ne[0]), ggml_type_size(input_type)) ||
+                !ggml_cuda_mmid_pool_reserve(measured.pool_bytes, routes * size_t(dst->ne[0]), sizeof(float))) { return false; }
     }
     resources = measured;
     return true;
@@ -174,8 +191,7 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
         result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
         return result;
     }
-    if ((query.phase == GGML_CUDA_MMID_PHASE_DECODE && query.n_tokens != 1 && !query.independent_rows) ||
-            (query.phase == GGML_CUDA_MMID_PHASE_PREFILL && query.n_tokens <= 1)) {
+    if (query.phase == GGML_CUDA_MMID_PHASE_DECODE && query.n_tokens != 1 && !query.independent_rows) {
         result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
         return result;
     }

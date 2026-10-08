@@ -128,7 +128,8 @@ struct ggml_cuda_mmid_resources {
 };
 
 bool ggml_cuda_mmid_pool_reserve(size_t & bytes, size_t count, size_t element_bytes);
-bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources);
+bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources,
+    ggml_cuda_mmid_mapping mapping = GGML_CUDA_MMID_MAPPING_DIRECT);
 bool ggml_cuda_mmid_execution_compute(ggml_backend_cuda_context & context, ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
 
 bool ggml_cuda_mmid_execution_valid(const ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);

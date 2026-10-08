@@ -1,8 +1,21 @@
+- Close mandatory prompt admission across context/backend/cut/trait errors; qualify missing grouped-owner rejection and CPU-zero execution without ordinary fallback.
+- Qualify mapped-prefill scratch planning and deterministic early CPU/GPU progress; then implement measured whole-body benefit gating and complete graph-derived expert waves.
+- Reconcile focused capacity commit23bb969f1812cdf06635ad3645b90d4f1a6921e0 after a source-stable checkpoint; direct patch check finds context drift in common/speculative.cpp, ggml-moe-source-program.h, llama-context.cpp and test-llama-archs.cpp. Do not import its donor checkout or duplicate its policy.
+- Qualify demand-bounded generic prefill admission and run corrected frozen generic decode controls with actual --decode-overlap, backend sampling and graph capacity recorded. Follow CATCHUP-0.1.41.md; do not substitute optional Strata features or unmapped GPU API sums for causal evidence.
+
 # Work remaining
 
 ## Active checklist, 2026-10-08: features 1-4
 
 Acceptance contract: [GOAL-1-4.md](GOAL-1-4.md). No feature below is currently qualified complete.
+
+Current execution comparison: [STATUS.md](STATUS.md), external `strata-specialized-update-20261008/REPORT.md`.
+
+- [x] Build/freeze current server-linked CPU-slab candidate; pass96 CPU/GPU owner cases and fresh Tiny Mixtral exact context/profile reload with continued adaptation.
+- [x] Complete bounded Flash CPU-prefill and GPU-prefill own controls after fresh fatal teardown proof; preserve matching IDs and the87.64 versus1096.54 tok/s performance counterexample.
+- [x] Update the actual specialized port to0.1.41 and capture both-engine no-MTP/MTP/long-prefill node traces separately from serving timings.
+- [ ] Replace experimental reuse of the decode miss fraction during prefill with a distinct measured descriptor/cohort-demand CPU benefit policy. Retain GPU-prefill performance as the acceptance baseline; do not promote the current CPU feature.
+- [ ] Qualify new-candidate Flash learned-file cold reload and broader queued/concurrent workspace lifetimes; completed generation alone does not close these gates.
 
 - [x] Implement additive request-scoped CPU abort/diagnostic control and integrate the actual source consumer while retaining shared workers, execution serialization and legacy v1 semantics.
 - [x] Qualify seven invalid controls, three paired cancellation/commit cases, four routed ownership cases, mixed scoped/legacy close and 14 tiny source programs with retained owner/prefill checks; preserve exact identities and whole-tree teardown.

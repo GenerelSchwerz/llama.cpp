@@ -3,6 +3,10 @@
 #include "test-moe-cache.h"
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--prefill-policy-only") == 0) {
+        test_moe_prefill_partition_policy();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--routed-bank-only") == 0) {
         test_candidate_routed_matrix();
         return 0;
@@ -195,6 +199,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     test_speculative_grouped_intent_splits();
+    test_moe_prefill_partition_policy();
     test_candidate_graph_coverage_ledger();
     test_candidate_graph_inventory_reuse();
     test_mmid_capabilities();

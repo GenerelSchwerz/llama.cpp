@@ -1294,6 +1294,7 @@ public:
             ggml_cuda_moe_stream_t stream,
             const int32_t * unique_experts,
             uint32_t n_unique_experts);
+    size_t prefill_staging_capacity_bytes() const;
     ggml_cuda_moe_grouped_decode_result execute_bounded_prefill(
             ggml_backend_cuda_context & context,
             ggml_cuda_moe_graph_group_dispatch * group,

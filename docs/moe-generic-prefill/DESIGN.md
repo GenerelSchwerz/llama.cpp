@@ -1,3 +1,7 @@
+# Mandatory hybrid prompt execution, 2026-10-08
+
+The owner requires the full generalized hybrid CPU/multi-token pipeline for prompts. This supersedes historical optional-prefill and provider=normal admission below: no ordinary-prefill decline is accepted in hybrid mode. Keep graph-defined expert execution in the canonical owner, including when measured CPU share is zero; fail unsupported preparation explicitly. Ordinary non-expert operations retain their graph semantics. See CATCHUP-0.1.41.md and GOAL-1-4.md for current contracts and qualification.
+
 # Shared pipeline design and qualification
 
 ## CPU-prefill canonical boundary, 2026-10-08

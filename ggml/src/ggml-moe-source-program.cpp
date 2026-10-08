@@ -14,6 +14,25 @@
 #include <type_traits>
 #include <unordered_map>
 
+bool ggml_moe_source_prefill_partition(const std::vector<uint32_t> & counts, std::vector<int32_t> & classes, uint32_t cpu_row_budget) try {
+    if (counts.size() != classes.size() || counts.size() > UINT32_MAX) { return false; }
+    std::vector<uint32_t> candidates;
+    for (uint32_t i = 0; i < counts.size(); ++i) {
+        if (!counts[i] || classes[i] < 0 || classes[i] > 1) { return false; }
+        if (classes[i] == 1 && counts[i] <= cpu_row_budget) { candidates.push_back(i); }
+    }
+    std::sort(candidates.begin(), candidates.end(), [&](uint32_t a, uint32_t b) {
+        return counts[a] != counts[b] ? counts[a] < counts[b] : a < b;
+    });
+    // Admit small cohorts within the worker budget; stream the rest on the GPU.
+    for (const auto i : candidates) {
+        if (counts[i] > cpu_row_budget) { break; }
+        cpu_row_budget -= counts[i];
+        classes[i] = 2;
+    }
+    return true;
+} catch (...) { return false; }
+
 static bool source_statistics_sum(const uint64_t * counts, uint32_t n_experts, uint64_t observations) {
     if (!counts || !n_experts || n_experts > (1u << 22)) { return false; }
     uint64_t sum = 0;

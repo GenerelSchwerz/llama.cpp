@@ -54,7 +54,7 @@ static bool filter_body_route(const ggml_tensor * node, int64_t row, int64_t col
     return body_route_selected(partition, row, column, expert) != partition.complement;
 }
 
-static void complete_body_projection_gpu(ggml_backend_t backend, ggml_tensor * node, const body_route_partition & partition) {
+static void complete_body_projection_gpu(ggml_backend_t backend, ggml_tensor * node, const body_route_partition & partition, bool per_expert = false, bool mapped_quant = false) {
     const auto * input = node->src[1];
     const auto * ids = node->src[2];
     const auto * weight = node->src[0];
@@ -80,6 +80,50 @@ static void complete_body_projection_gpu(ggml_backend_t backend, ggml_tensor * n
         }
     }
     if (experts.empty()) { return; }
+    if (per_expert) {
+        std::vector<std::vector<size_t>> cohorts(weight->ne[2]);
+        for (size_t route = 0; route < experts.size(); ++route) { cohorts[experts[route]].push_back(route); }
+        const size_t tensors = 1 + 3 * cohorts.size();
+        ggml_context_ptr context(ggml_init({tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(tensors, false), nullptr, true}));
+        auto * bank = ggml_new_tensor_3d(context.get(), weight->type, weight->ne[0], weight->ne[1], weight->ne[2]);
+        auto * graph = ggml_new_graph_custom(context.get(), tensors, false);
+        std::vector<ggml_tensor *> inputs(cohorts.size()), outputs(cohorts.size());
+        for (size_t expert = 0; expert < cohorts.size(); ++expert) {
+            if (cohorts[expert].empty()) { continue; }
+            auto * slice = ggml_view_2d(context.get(), bank, bank->ne[0], bank->ne[1], bank->nb[1], expert * bank->nb[2]);
+            inputs[expert] = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, input->ne[0], cohorts[expert].size());
+            outputs[expert] = ggml_mul_mat(context.get(), slice, inputs[expert]);
+            ggml_set_op_params_i32(outputs[expert], 0, ggml_get_op_params_i32(node, 3));
+            ggml_set_output(outputs[expert]); ggml_build_forward_expand(graph, outputs[expert]);
+        }
+        auto * allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        CHECK(allocator && ggml_gallocr_alloc_graph(allocator, graph));
+        ggml_backend_tensor_set(bank, weight->data, 0, ggml_nbytes(weight));
+        for (size_t expert = 0; expert < cohorts.size(); ++expert) {
+            if (cohorts[expert].empty()) { continue; }
+            std::vector<float> values;
+            for (const auto route : cohorts[expert]) {
+                values.insert(values.end(), activation.begin() + route * input->ne[0], activation.begin() + (route + 1) * input->ne[0]);
+            }
+            ggml_backend_tensor_set(inputs[expert], values.data(), 0, ggml_nbytes(inputs[expert]));
+        }
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        for (size_t expert = 0; expert < cohorts.size(); ++expert) {
+            if (cohorts[expert].empty()) { continue; }
+            std::vector<float> values(ggml_nelements(outputs[expert]));
+            ggml_backend_tensor_get(outputs[expert], values.data(), 0, ggml_nbytes(outputs[expert]));
+            for (size_t row = 0; row < cohorts[expert].size(); ++row) {
+                std::copy_n(values.data() + row * node->ne[0], node->ne[0], reinterpret_cast<float *>(destinations[cohorts[expert][row]]));
+            }
+        }
+        ggml_gallocr_free(allocator);
+        return;
+    }
+    // Pad the independent matrix reference; discard the extra output rows.
+    const size_t minimum_rows = mapped_quant && input->ne[2] < 16 ? 16 : 0;
+    const size_t complement_rows = std::max(experts.size(), minimum_rows);
+    experts.resize(complement_rows, 0);
+    activation.resize(complement_rows * input->ne[0], 0.0f);
     ggml_context_ptr context(ggml_init({7 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true}));
     CHECK(context);
     auto * bank = ggml_new_tensor_3d(context.get(), weight->type, weight->ne[0], weight->ne[1], weight->ne[2]);
@@ -88,8 +132,9 @@ static void complete_body_projection_gpu(ggml_backend_t backend, ggml_tensor * n
     auto * rows = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, input->ne[0], 1, experts.size());
     auto * result = ggml_mul_mat_id(context.get(), bank, rows, routes);
     memcpy(result->op_params, node->op_params, sizeof(node->op_params));
-    auto * original_rows = ggml_new_tensor_3d(context.get(), input->type, input->ne[0], input->ne[1], input->ne[2]);
-    auto * original_ids = ggml_new_tensor_2d(context.get(), ids->type, ids->ne[0], ids->ne[1]);
+    const int64_t reference_rows = std::max(size_t(input->ne[2]), minimum_rows);
+    auto * original_rows = ggml_new_tensor_3d(context.get(), input->type, input->ne[0], input->ne[1], reference_rows);
+    auto * original_ids = ggml_new_tensor_2d(context.get(), ids->type, ids->ne[0], reference_rows);
     auto * original_result = ggml_mul_mat_id(context.get(), bank, original_rows, original_ids);
     memcpy(original_result->op_params, node->op_params, sizeof(node->op_params));
     ggml_set_output(result); ggml_set_output(original_result);
@@ -112,7 +157,9 @@ static void complete_body_projection_gpu(ggml_backend_t backend, ggml_tensor * n
             }
         }
     }
-    CHECK(original_activation.size() == size_t(ggml_nelements(original_rows)) && original_experts.size() == size_t(ggml_nelements(original_ids)));
+    CHECK(original_activation.size() == size_t(ggml_nelements(input)) && original_experts.size() == size_t(ggml_nelements(ids)));
+    original_activation.resize(ggml_nelements(original_rows), 0.0f);
+    original_experts.resize(ggml_nelements(original_ids), 0);
     ggml_backend_tensor_set(original_rows, original_activation.data(), 0, ggml_nbytes(original_rows));
     ggml_backend_tensor_set(original_ids, original_experts.data(), 0, ggml_nbytes(original_ids));
     CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
@@ -260,7 +307,9 @@ static std::vector<float> evaluate_body(const std::vector<const ggml_tensor *> &
             }
             const std::vector<float> first(static_cast<float *>(node->data), static_cast<float *>(node->data) + ggml_nelements(node));
             if (complement_backend) {
-                complete_body_projection_gpu(complement_backend, node, partition);
+                complete_body_projection_gpu(complement_backend, node, partition,
+                    projection_masks != nullptr && !ggml_is_quantized(node->src[0]->type),
+                    projection_masks != nullptr && ggml_is_quantized(node->src[0]->type));
                 CHECK(partition.calls == routes);
             } else {
                 partition.complement = true;
@@ -6485,7 +6534,11 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             bool prefill;
             std::vector<std::vector<uint8_t>> masks;
             std::vector<std::vector<int32_t>> ids;
+            std::mutex overlap_mutex{};
+            std::condition_variable overlap_condition{};
+            bool check_overlap = false, cpu_started = false, gpu_issued = false, overlap_timeout = false;
         } observed_body{&hook_calls, {}, generic_body, main_prefill, {}, {}};
+        observed_body.check_overlap = main_prefill && capacity == 2;
         uint32_t previous_hook_calls = 0;
         std::vector<int32_t> learned_residency;
         struct device_barrier {
@@ -6545,6 +6598,20 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 CHECK(ggml_backend_sched_moe_hybrid_set_test_hook_v1(owner->sched.get(),
                     +[](void * opaque, uint32_t event, uint64_t, void * view) {
                         auto & observed = *static_cast<body_observation *>(opaque);
+                        if (observed.check_overlap && (event == GGML_BACKEND_MOE_HYBRID_TEST_CPU_ADMITTED ||
+                                event == GGML_BACKEND_MOE_HYBRID_TEST_GPU_ENQUEUED)) {
+                            std::unique_lock<std::mutex> lock(observed.overlap_mutex);
+                            if (event == GGML_BACKEND_MOE_HYBRID_TEST_CPU_ADMITTED && !observed.cpu_started) {
+                                observed.cpu_started = true; observed.overlap_condition.notify_all();
+                                if (!observed.overlap_condition.wait_for(lock, std::chrono::seconds(5), [&] { return observed.gpu_issued; })) {
+                                    observed.overlap_timeout = true; return false;
+                                }
+                            } else if (event == GGML_BACKEND_MOE_HYBRID_TEST_GPU_ENQUEUED && !observed.gpu_issued) {
+                                const bool started = observed.overlap_condition.wait_for(lock, std::chrono::seconds(5), [&] { return observed.cpu_started; });
+                                observed.gpu_issued = true; observed.overlap_condition.notify_all();
+                                if (!started) { observed.overlap_timeout = true; return false; }
+                            }
+                        }
                         if (event == GGML_BACKEND_MOE_HYBRID_TEST_CPU_ADMITTED || event == GGML_BACKEND_MOE_HYBRID_TEST_CPU_BEFORE_COMMIT ||
                                 event == GGML_BACKEND_MOE_HYBRID_TEST_CPU_AFTER_COMMIT) {
                             observed.calls->fetch_add(1, std::memory_order_relaxed);
@@ -6807,7 +6874,9 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                         gpu_energy += double(expected[i]) * expected[i];
                     }
                     fprintf(stderr, "test-moe-cache: main prefill all-GPU comparison relative_mse=%.9g\n", gpu_error / std::max(gpu_energy, 1e-30));
-                    CHECK(gpu_error / std::max(gpu_energy, 1e-30) <= 5e-3);
+                    const bool mixed_cpu = std::any_of(observed_body.masks.begin(), observed_body.masks.end(),
+                        [](const std::vector<uint8_t> & mask) { return std::any_of(mask.begin(), mask.end(), [](uint8_t cpu) { return cpu != 0; }); });
+                    if (!mixed_cpu) { CHECK(gpu_error / std::max(gpu_energy, 1e-30) <= 5e-3); }
                     const auto * graph = reference.result.get_gf();
                     std::vector<const ggml_tensor *> nodes(graph->nodes, graph->nodes + graph->n_nodes);
                     std::vector<const ggml_tensor *> dynamic(graph->leafs, graph->leafs + graph->n_leafs);
@@ -6871,7 +6940,14 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 if (main_prefill) {
                     CHECK(captures == 0 && state.window_launches == uint64_t(step + 1) * config.max_regions &&
                         state.window_waits == state.window_launches && state.window_fallbacks == 0 && state.errors == 0 &&
-                        state.resident_routes > 0 && state.transfer_routes > 0 && state.cpu_routes > 0 && state.cpu_execute_calls > 0);
+                        state.resident_routes > 0 && state.transfer_routes > 0);
+                    CHECK(state.cpu_routes <= uint64_t(step + 1) * config.max_regions * config.n_threads);
+                    // Fixed routing repeats each cohort for the whole prompt; stream heavy cohorts.
+                    if (capacity > config.n_threads) { CHECK(state.cpu_routes == 0 && state.cpu_execute_calls == 0); }
+                    else { CHECK(state.cpu_routes > 0 && state.cpu_execute_calls > 0); }
+                    if (observed_body.check_overlap) {
+                        CHECK(observed_body.cpu_started && observed_body.gpu_issued && !observed_body.overlap_timeout);
+                    }
                     CHECK(state.cpu_active_jobs == 0 && state.dispatch_active == 0 && state.producer_events == state.producer_fences);
                     fprintf(stderr, "test-moe-cache: main source prefill type=%s rows=%u step=%u cpu_routes=%llu gpu_miss_routes=%llu relative_mse=%.9g OK\n",
                         ggml_type_name(signature.gate_up_type), capacity, step, (unsigned long long) state.cpu_routes,
@@ -6897,7 +6973,8 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 if (retained_hook_test) {
                     if (phase == 0) {
                         const auto calls = hook_calls.load(std::memory_order_relaxed);
-                        if (capacity != 1) { CHECK(calls > previous_hook_calls); }
+                        if (main_prefill && !state.cpu_execute_calls) { CHECK(calls == 0); }
+                        else if (capacity != 1) { CHECK(calls > previous_hook_calls); }
                         previous_hook_calls = calls;
                     } else { CHECK(hook_calls.load(std::memory_order_relaxed) == previous_hook_calls); }
                 }
@@ -8190,7 +8267,9 @@ static void test_cpu_prefill_owner(int device) {
     const auto * api = get();
     uint32_t cases = 0;
     for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, GGML_TYPE_F32}) {
-        for (bool pageable : {false, true}) {
+        for (uint32_t variant = 0; variant < 4; ++variant) {
+            const bool pageable = (variant & 1) != 0;
+            const bool sparse = (variant & 2) != 0;
             ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device)), backend(ggml_backend_cuda_init(device));
             CHECK(reference_backend && backend);
             auto reference = build_active_grouped_dispatch_graph_types(reference_backend.get(), ggml_backend_cuda_buffer_type(device),
@@ -8200,7 +8279,13 @@ static void test_cpu_prefill_owner(int device) {
                 {type, type, type}, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, false, 128, 16, 4, 256, nullptr, false, false, 256);
             ggml_set_output(reference.up_output); ggml_set_output(reference.gate_output);
             initialize_active_grouped_dispatch_graphs({&reference, &fixture});
-            set_active_grouped_dispatch_logits({&reference, &fixture}, 0);
+            if (sparse) {
+                const int32_t active[] = {2, 3, 4, 15};
+                CHECK(fixture.n_used == 4 && fixture.n_experts == 16);
+                std::vector<int32_t> routes(size_t(fixture.n_rows) * fixture.n_used);
+                for (size_t route = 0; route < routes.size(); ++route) { routes[route] = active[route % fixture.n_used]; }
+                set_active_grouped_dispatch_routes({&reference, &fixture}, routes);
+            } else { set_active_grouped_dispatch_logits({&reference, &fixture}, 0); }
             CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
             CHECK(ggml_backend_graph_compute(backend.get(), fixture.graph) == GGML_STATUS_SUCCESS);
             ggml_backend_synchronize(reference_backend.get()); ggml_backend_synchronize(backend.get());
@@ -8444,8 +8529,8 @@ static void test_cpu_prefill_owner(int device) {
                 double final_error = 0, final_norm = 0;
                 for (size_t index = 0; index < final_actual.size(); ++index) { CHECK(std::isfinite(final_actual[index])); const double delta = final_actual[index] - final_expected[index]; final_error += delta * delta; final_norm += double(final_expected[index]) * final_expected[index]; }
                 CHECK(final_norm > 0 && final_error / final_norm < 2e-5);
-                fprintf(stderr, "test-moe-cache: canonical CPU prefill type=%s pageable=%u source_frame=%u pattern=%u cpu_routes=%u relative_mse=%.9g down_relative_mse=%.9g retained through down OK\n",
-                    ggml_type_name(type), pageable, source_frame, pattern, cpu_count, error / norm, final_error / final_norm);
+                fprintf(stderr, "test-moe-cache: canonical CPU prefill type=%s pageable=%u source_frame=%u sparse=%u pattern=%u cpu_routes=%u relative_mse=%.9g down_relative_mse=%.9g retained through down OK\n",
+                    ggml_type_name(type), pageable, source_frame, sparse, pattern, cpu_count, error / norm, final_error / final_norm);
                 ++cases;
             }
             CHECK(api->destroy_region(service, &region) == 0 && api->close(service) == 0 && api->destroy(&service) == 0);
@@ -8717,7 +8802,7 @@ void test_hybrid_metadata() {
             CHECK(ggml_moe_fidelity_selection().valid && ggml_moe_fidelity_selection().source_pool && ggml_moe_fidelity_selection().reference);
             for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
                 const hybrid_layer_signature signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, type, type, LLM_FFN_SILU, 256, 256};
-                for (uint32_t rows : {9u, 65u, 2048u}) {
+                for (uint32_t rows : {2u, 9u, 65u, 2048u}) {
                     test_fidelity_real_window(device, rows, GGML_CUDA_MOE_FIDELITY_POLL, false, true, signature, 4, 1, 16,
                         false, 0, false, false, true);
                 }

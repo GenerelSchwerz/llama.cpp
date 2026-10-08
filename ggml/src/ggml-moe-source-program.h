@@ -23,6 +23,7 @@ GGML_API bool ggml_moe_source_statistics_valid(const ggml_backend_moe_source_sta
 GGML_API bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores, uint32_t count);
 GGML_API bool ggml_moe_source_learning_valid(const ggml_backend_moe_source_learning_v1 * records, uint32_t count);
 GGML_API bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks);
+GGML_API bool ggml_moe_source_prefill_partition(const std::vector<uint32_t> & counts, std::vector<int32_t> & classes, uint32_t cpu_row_budget);
 
 class ggml_moe_source_profile_learning;
 

@@ -1,5 +1,7 @@
 #pragma once
 
+void test_moe_prefill_partition_policy();
+
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/mmid.cuh"
 #include "ggml-backend-impl.h"

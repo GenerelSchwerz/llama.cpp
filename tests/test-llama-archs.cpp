@@ -1345,7 +1345,7 @@ static int test_source_profile_statistics() {
     return 0;
 }
 
-static int test_model_source_learning(const char * path, const char * output_path, uint32_t slots, uint32_t context_size, uint32_t batch_size) {
+static int test_model_source_learning(const char * path, const char * output_path, uint32_t slots, uint32_t context_size, uint32_t batch_size, const char * adaptation) {
     if (!output_path || !*output_path) { return 1; }
     auto model_params = llama_model_default_params();
     model_params.n_gpu_layers = 99;
@@ -1364,7 +1364,7 @@ static int test_model_source_learning(const char * path, const char * output_pat
     params.n_ctx = context_size; params.n_batch = params.n_ubatch = batch_size;
     params.n_threads = params.n_threads_batch = 4; params.phase_aware_workspace = true;
     const auto filename = fs_path_to_utf8(seed_path);
-    llama_context_ptr context(llama_init_from_model_with_moe_profile(model.get(), params, filename.c_str(), "occurrence-sync"));
+    llama_context_ptr context(llama_init_from_model_with_moe_profile(model.get(), params, filename.c_str(), adaptation));
     if (!context || !context->source_core_enabled()) { return 1; }
     const auto * vocab = llama_model_get_vocab(model.get());
     auto tokens = common_tokenize(vocab, "Hello there.", true, true);
@@ -1393,7 +1393,7 @@ static int test_model_source_learning(const char * path, const char * output_pat
         model_params.moe_expert_cache_slots = restored_slots;
         llama_model_ptr fresh_model(llama_model_load_from_file(path, model_params));
         if (!fresh_model) { return 1; }
-        llama_context_ptr restored(llama_init_from_model_with_moe_profile(fresh_model.get(), params, output_path, "occurrence-sync"));
+        llama_context_ptr restored(llama_init_from_model_with_moe_profile(fresh_model.get(), params, output_path, adaptation));
         std::vector<uint8_t> after;
         if (!restored || !restored->snapshot_moe_learning(after, 5000) || before != after) { return 1; }
         batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
@@ -7064,6 +7064,7 @@ int main(int argc, char ** argv) {
     const char * source_profile_path = nullptr;
     const char * source_learning_path = nullptr;
     const char * source_learning_output = nullptr;
+    const char * source_learning_adaptation = "occurrence-sync";
     uint32_t source_learning_slots = 1;
     uint32_t source_learning_context = 512;
     uint32_t source_learning_batch = 128;
@@ -7140,6 +7141,9 @@ int main(int argc, char ** argv) {
             source_learning_path = argv[++i];
         } else if (strcmp(argv[i], "--source-learning-output") == 0 && i + 1 < argc) {
             source_learning_output = argv[++i];
+        } else if (strcmp(argv[i], "--source-learning-adaptation") == 0 && i + 1 < argc) {
+            source_learning_adaptation = argv[++i];
+            if (strcmp(source_learning_adaptation, "occurrence") && strcmp(source_learning_adaptation, "occurrence-sync")) { return 1; }
         } else if ((strcmp(argv[i], "--source-learning-cache-slots") == 0 || strcmp(argv[i], "--source-learning-context") == 0 ||
                 strcmp(argv[i], "--source-learning-batch") == 0) && i + 1 < argc) {
             const char * option = argv[i];
@@ -7335,7 +7339,7 @@ int main(int argc, char ** argv) {
         if (source_profile_path) { return test_model_source_profile(source_profile_path, source_statistics_file); }
         if (source_learning_path) {
             if (source_learning_context < source_learning_batch + 16) { return 1; }
-            return test_model_source_learning(source_learning_path, source_learning_output, source_learning_slots, source_learning_context, source_learning_batch);
+            return test_model_source_learning(source_learning_path, source_learning_output, source_learning_slots, source_learning_context, source_learning_batch, source_learning_adaptation);
         }
         if (source_statistics) { return test_source_profile_statistics(); }
         if (moe_replay_path) { return test_model_moe_replay(moe_replay_path, replay_reference_path, replay_read, replay_independent_sources, replay_cache_slots, replay_cpu_oracle, replay_gpu_oracle, replay_load_mode, replay_prompt_path, replay_rows, replay_split); }

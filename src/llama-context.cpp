@@ -1219,6 +1219,10 @@ llama_context::llama_context(
                 throw std::runtime_error("fidelity hybrid execution requires GGML_MOE_FIDELITY_LIVE_EXPERIMENT=1");
             }
         }
+        if (const char * prefill = getenv("GGML_MOE_SOURCE_CPU_PREFILL")) {
+            if (strcmp(prefill, "0") && strcmp(prefill, "1")) { throw std::runtime_error("GGML_MOE_SOURCE_CPU_PREFILL must be 0 or 1"); }
+            if (!strcmp(prefill, "1") && !source_core_enabled()) { throw std::runtime_error("CPU-assisted prefill requires source hybrid execution"); }
+        }
         moe_hybrid_allow_runtime_allocations = source_core_enabled();
         if (const char * allocations = getenv("GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS")) {
             if (strcmp(allocations, "0") && strcmp(allocations, "1")) {
@@ -2808,6 +2812,10 @@ void llama_context::place_moe_regions(llm_graph_result * res) {
 
 bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_decode,
         const ggml_graph_execution_certificate * certificate) {
+    const bool required_prefill = moe_hybrid_required && certificate &&
+        certificate->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        (certificate->row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL ||
+         certificate->row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT) && certificate->n_rows > 1;
     std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
     if (source_core_enabled()) {
         publication_lock.lock();
@@ -2820,6 +2828,10 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             cparams.pipeline_parallel || cparams.cb_eval != nullptr || (!source_core_enabled() && sched_buffer_owner != nullptr) ||
             res->get_moe_regions().empty())) {
         if (source_core_enabled()) {
+            if (required_prefill) {
+                LLAMA_LOG_ERROR("moe-hybrid: required prefill context or region is unsupported\n");
+                return false;
+            }
             if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
             if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
             LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=context-capability effects_started=0\n");
@@ -2835,6 +2847,10 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
         for (const auto & region : res->get_moe_regions()) {
             auto * reg = region.backend ? ggml_backend_dev_backend_reg(ggml_backend_get_device(region.backend)) : nullptr;
             if (!reg || !ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_SOURCE_CORE_V1_PROC_NAME)) {
+                if (required_prefill) {
+                    LLAMA_LOG_ERROR("moe-hybrid: required prefill backend is unsupported layer=%d\n", region.layer);
+                    return false;
+                }
                 if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
                 if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
                 LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=backend-capability effects_started=0\n");
@@ -2894,6 +2910,10 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             region.finalized_metadata.reset();
             if (hybrid_decode) {
                 if (source_core_enabled()) {
+                    if (required_prefill) {
+                        LLAMA_LOG_ERROR("moe-hybrid: required prefill expert cut is unsupported layer=%d\n", region.layer);
+                        return false;
+                    }
                     if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
                     if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
                     LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=expert-cut-capability layer=%d effects_started=0\n", region.layer);
@@ -2967,6 +2987,10 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             if (prepared != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
                 if (source_core_enabled() && (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION ||
                         prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) {
+                    if (required_prefill) {
+                        LLAMA_LOG_ERROR("moe-hybrid: required prefill operation is unsupported layer=%d status=%d\n", region.layer, prepared);
+                        return false;
+                    }
                     if (!moe_profiles.empty() || !moe_statistics.empty()) { LLAMA_LOG_ERROR("moe-profile: required static placement is unsupported by this source context or region\n"); return false; }
                     if (ggml_backend_sched_moe_source_fallback_v1(sched.get())) { moe_source_poisoned.store(true); return false; }
                     LLAMA_LOG_INFO("moe-source-core-admission: provider=normal reason=expert-trait-capability layer=%d status=%d effects_started=0\n",
@@ -4120,14 +4144,22 @@ llm_graph_result * llama_context::process_ubatch(
         !hybrid_speculative && ubatch_has_independent_rows(ubatch);
     const bool hybrid_auxiliary = moe_hybrid_required && source_core_enabled() && execution_intent != nullptr &&
         execution_intent->domain != GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
-    const uint32_t hybrid_rows = moe_hybrid_required && (ubatch.n_tokens == 1 || hybrid_speculative || hybrid_independent || hybrid_auxiliary) ? ubatch.n_tokens : 0;
+    const bool hybrid_prefill = moe_hybrid_required && source_core_enabled() &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && execution_intent == nullptr && ubatch.n_tokens > 1 && ubatch_has_sequential_spans(ubatch);
+    if (moe_hybrid_required && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ubatch.n_tokens > 1 &&
+            !hybrid_speculative && !hybrid_independent && !hybrid_auxiliary && !hybrid_prefill) {
+        LLAMA_LOG_ERROR("%s: hybrid prompt must use the source prefill pipeline\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    const uint32_t hybrid_rows = moe_hybrid_required && (ubatch.n_tokens == 1 || hybrid_speculative || hybrid_independent || hybrid_auxiliary || hybrid_prefill) ? ubatch.n_tokens : 0;
     ggml_graph_execution_certificate requested_certificate = {};
     if (moe_hybrid_required && !make_graph_execution_certificate(
             &ubatch, execution_intent, moe_required_grouped_execution_supported, requested_certificate)) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    const bool source_capacity = moe_source_graph_capacity && source_core_enabled() && hybrid_rows != 0 &&
+    const bool source_capacity = moe_source_graph_capacity && source_core_enabled() && hybrid_rows != 0 && !hybrid_prefill &&
         std::any_of(model.moe_sources().begin(), model.moe_sources().end(), [](const llama_moe_source_group & source) {
             return std::any_of(source.banks.begin(), source.banks.end(), [](const llama_moe_source_bank & bank) {
                 return bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && is_moe_cached_tensor(bank.tensor);
@@ -5890,6 +5922,11 @@ bool llama_context::make_graph_execution_certificate(
     certificate = {};
     const bool auxiliary = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
     const uint32_t flags = required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
+    if (moe_hybrid_required && source_core_enabled() && ubatch && ubatch->n_tokens > 1 && !execution_intent && !auxiliary &&
+            flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
+        LLAMA_LOG_ERROR("%s: required hybrid prefill has no supported grouped owner\n", __func__);
+        return false;
+    }
     uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
     uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
     uint32_t certificate_flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
@@ -5909,6 +5946,7 @@ bool llama_context::make_graph_execution_certificate(
     } else if (ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ubatch_has_sequential_spans(*ubatch)) {
         domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
         row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+        if (moe_hybrid_required && source_core_enabled()) { certificate_flags = flags; }
     } else {
         if (auxiliary && flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
             LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE execution shape\n", __func__);

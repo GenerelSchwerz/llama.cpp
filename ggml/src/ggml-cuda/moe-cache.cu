@@ -10809,6 +10809,11 @@ ggml_cuda_moe_stream_t ggml_cuda_moe_grouped_context::prefill_copy_stream_for_te
     return impl_->prefill_staging ? impl_->prefill_staging->copy_stream : nullptr;
 }
 
+size_t ggml_cuda_moe_grouped_context::prefill_staging_capacity_bytes() const {
+    std::lock_guard<std::mutex> lock(impl_->prefill_staging_mutex);
+    return impl_->prefill_staging_lane_bytes > SIZE_MAX / 2 ? SIZE_MAX : 2 * impl_->prefill_staging_lane_bytes;
+}
+
 bool ggml_cuda_moe_grouped_context::set_prefill_staging_lane_bytes_for_test(size_t byte_budget) {
     std::lock_guard<std::mutex> lock(impl_->prefill_staging_mutex);
     if (impl_->prefill_staging != nullptr || byte_budget == 0 || byte_budget > MOE_PREFILL_STAGING_LANE_BYTES) {
@@ -18000,6 +18005,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bound
                 source_map_host[expert] = slot;
             }
         }
+        if (!max_rows) { range_begin = range_end; continue; }
         for (uint32_t miss = 0; miss < misses.size(); ++miss) {
             source_map_host[misses[miss]] = static_cast<int32_t>(group->n_slots + miss);
         }

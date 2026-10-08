@@ -1400,6 +1400,10 @@ struct ggml_backend_moe_cpu_prepared_lane_v1 {
     ggml_moe_cpu_fidelity * fidelity = nullptr;
     std::unique_ptr<uint8_t[]> metadata;
     std::unique_ptr<uint8_t[]> execution_storage;
+    std::unique_ptr<uint64_t[]> execution_offsets;
+    uint64_t work_offset = 0;
+    uint64_t binding_offset = 0;
+    uint64_t staging_offset = 0;
     uint8_t * execution = nullptr;
     uint8_t * binding_metadata = nullptr;
     uint8_t * output_staging = nullptr;
@@ -1428,6 +1432,7 @@ struct ggml_backend_moe_cpu_service_impl_v1;
 struct ggml_backend_moe_cpu_prepared_region_impl_v1 {
     ggml_backend_moe_cpu_prepared_region_v1_t id = 0;
     ggml_backend_moe_cpu_prepared_requirements_v1 requirements = {};
+    uint64_t charged_payload_bytes = 0;
     std::unique_ptr<ggml_backend_moe_source_span_v1[]> sources;
     std::unique_ptr<std::unique_ptr<ggml_backend_moe_cpu_prepared_lane_v1>[]> lanes;
     uint32_t n_sources = 0;
@@ -1460,6 +1465,9 @@ struct ggml_backend_moe_cpu_service_impl_v1 {
     std::mutex execute_mutex;
     std::condition_variable drain_condition;
     std::unique_ptr<ggml_backend_moe_cpu_prepared_region_impl_v1 *[]> regions;
+    std::unique_ptr<uint8_t[]> routed_storage;
+    uint64_t routed_storage_bytes = 0;
+    uint32_t routed_regions = 0;
     std::atomic<uint64_t> cancel_through_epoch = 0;
     std::atomic<bool> closing = false;
     uint64_t prepared_payload_limit = 0;
@@ -1681,26 +1689,32 @@ static int32_t ggml_backend_moe_cpu_region_build_lane_v1(
         const struct ggml_backend_moe_cpu_region_requirements_v1 * execution,
         uint64_t metadata_bytes,
         uint64_t allocation_bytes,
+        uint8_t * shared_storage,
         std::unique_ptr<ggml_backend_moe_cpu_prepared_lane_v1> & lane_out) {
     try {
         auto lane = std::make_unique<ggml_backend_moe_cpu_prepared_lane_v1>();
         lane->metadata.reset(new (std::nothrow) uint8_t[metadata_bytes]);
-        lane->execution_storage.reset(new (std::nothrow) uint8_t[allocation_bytes]);
-        if (!lane->metadata || !lane->execution_storage) {
+        if (shared_storage == nullptr) {
+            lane->execution_storage.reset(new (std::nothrow) uint8_t[allocation_bytes]);
+        } else {
+            lane->execution_offsets.reset(new (std::nothrow) uint64_t[query->n_dynamic_inputs + query->n_body_nodes]());
+        }
+        if (!lane->metadata || (shared_storage ? !lane->execution_offsets : !lane->execution_storage)) {
             return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
         }
         lane->dynamic_inputs.reset(new (std::nothrow) struct ggml_tensor *[query->n_dynamic_inputs]());
         if (!lane->dynamic_inputs) {
             return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
         }
-        const uintptr_t raw = reinterpret_cast<uintptr_t>(lane->execution_storage.get());
+        uint8_t * storage = shared_storage ? shared_storage : lane->execution_storage.get();
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(storage);
         const uintptr_t padding = (GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 -
                                    raw % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1) %
                                   GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1;
         if (padding > allocation_bytes || execution->lane_execution_bytes > allocation_bytes - padding) {
             return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
         }
-        lane->execution = lane->execution_storage.get() + padding;
+        lane->execution = storage + padding;
         GGML_ASSERT(reinterpret_cast<uintptr_t>(lane->execution) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 == 0);
         lane->context = ggml_init({(size_t) metadata_bytes, lane->metadata.get(), true});
         if (lane->context == nullptr) {
@@ -1742,6 +1756,7 @@ static int32_t ggml_backend_moe_cpu_region_build_lane_v1(
                 return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
             }
             clones[i]->data = lane->execution + offset;
+            if (lane->execution_offsets) { lane->execution_offsets[i] = offset; }
             lane->dynamic_inputs[i] = clones[i];
             GGML_ASSERT(reinterpret_cast<uintptr_t>(clones[i]->data) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 == 0);
         }
@@ -1768,6 +1783,7 @@ static int32_t ggml_backend_moe_cpu_region_build_lane_v1(
                 return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
             }
             clones[clone_index]->data = lane->execution + offset;
+            if (lane->execution_offsets) { lane->execution_offsets[query->n_dynamic_inputs + i] = offset; }
             GGML_ASSERT(reinterpret_cast<uintptr_t>(clones[clone_index]->data) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 == 0);
         }
         uint64_t binding_offset;
@@ -1779,6 +1795,9 @@ static int32_t ggml_backend_moe_cpu_region_build_lane_v1(
         }
         lane->binding_metadata = lane->execution + binding_offset;
         lane->output_staging   = lane->execution + staging_offset;
+        lane->work_offset = work_offset;
+        lane->binding_offset = binding_offset;
+        lane->staging_offset = staging_offset;
         GGML_ASSERT(reinterpret_cast<uintptr_t>(lane->binding_metadata) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 == 0);
         GGML_ASSERT(reinterpret_cast<uintptr_t>(lane->output_staging) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 == 0);
 
@@ -1933,6 +1952,12 @@ static int32_t ggml_backend_moe_cpu_prepared_requirements_impl_v1(
     uint64_t lane_control_bytes;
     uint64_t dynamic_input_pointer_bytes;
     uint64_t lane_context_total;
+    uint64_t execution_offset_bytes = 0;
+    if ((query->flags & GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION) != 0 &&
+            (!ggml_backend_moe_cpu_region_mul_v1(tensor_count - query->n_sources, sizeof(uint64_t), &execution_offset_bytes) ||
+             !ggml_backend_moe_cpu_region_mul_v1(execution_offset_bytes, query->n_lanes, &execution_offset_bytes))) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+    }
     if (!ggml_backend_moe_cpu_region_add_v1(result.execution.lane_execution_bytes,
                                             GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 - 1,
                                             &result.lane_allocation_bytes) ||
@@ -1950,6 +1975,7 @@ static int32_t ggml_backend_moe_cpu_prepared_requirements_impl_v1(
                                                 &dynamic_input_pointer_bytes) ||
             !ggml_backend_moe_cpu_region_add_v1(lane_control_bytes, dynamic_input_pointer_bytes,
                                                 &lane_control_bytes) ||
+            !ggml_backend_moe_cpu_region_add_v1(lane_control_bytes, execution_offset_bytes, &lane_control_bytes) ||
             !ggml_backend_moe_cpu_region_mul_v1(result.lane_context_bytes, query->n_lanes,
                                                 &lane_context_total) ||
             !ggml_backend_moe_cpu_region_add_v1(lane_control_bytes, lane_context_total,
@@ -2030,6 +2056,7 @@ static int32_t ggml_backend_moe_cpu_region_service_prepare_impl_v1(
     const int32_t source_status = ggml_backend_moe_cpu_validate_sources_v1(&service->owner, query);
     if (source_status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { return source_status; }
 
+    std::lock_guard<std::mutex> execute_lock(service->execute_mutex);
     std::lock_guard<std::mutex> lock(service->mutex);
     uint64_t total;
     const uint64_t graph_pool_bytes = !fidelity && !service->threadpool ?
@@ -2037,12 +2064,33 @@ static int32_t ggml_backend_moe_cpu_region_service_prepare_impl_v1(
     if (service->closed) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CLOSED;
     }
+    const bool shared = (query->flags & GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION) != 0;
+    uint64_t charged_payload = result.prepared_payload_bytes;
+    if (shared) {
+        uint64_t lane_allocation_total;
+        if (!ggml_backend_moe_cpu_region_mul_v1(result.lane_allocation_bytes, query->n_lanes, &lane_allocation_total) ||
+                lane_allocation_total > charged_payload) {
+            return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+        }
+        charged_payload -= lane_allocation_total;
+    }
+    const bool grow = shared && result.lane_allocation_bytes > service->routed_storage_bytes;
+    const uint64_t growth = grow ? result.lane_allocation_bytes - service->routed_storage_bytes : 0;
+    uint64_t peak;
     if (service->n_regions >= service->max_regions ||
             !ggml_backend_moe_cpu_region_add_v1(service->prepared_payload_bytes,
-                                                result.prepared_payload_bytes, &total) ||
+                                                charged_payload, &total) ||
             !ggml_backend_moe_cpu_region_add_v1(total, graph_pool_bytes, &total) ||
-            (service->prepared_payload_limit != 0 && total > service->prepared_payload_limit)) {
+            !ggml_backend_moe_cpu_region_add_v1(total, growth, &total) ||
+            !ggml_backend_moe_cpu_region_add_v1(total, grow ? service->routed_storage_bytes : 0, &peak) ||
+            (service->prepared_payload_limit != 0 && peak > service->prepared_payload_limit)) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
+    }
+    std::unique_ptr<uint8_t[]> next_storage;
+    if (grow) {
+        next_storage.reset(new (std::nothrow) uint8_t[result.lane_allocation_bytes]);
+        if (!next_storage) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+        service->prepared_payload_peak = std::max(service->prepared_payload_peak, peak);
     }
     if (graph_pool_bytes) {
         auto params = ggml_threadpool_params_default(service->n_threads);
@@ -2060,6 +2108,7 @@ static int32_t ggml_backend_moe_cpu_region_service_prepare_impl_v1(
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
     }
     region->requirements      = result;
+    region->charged_payload_bytes = charged_payload;
     region->graph_uid         = query->graph_uid;
     region->graph_generation  = query->graph_generation;
     region->source_generation = query->source_generation;
@@ -2102,7 +2151,8 @@ static int32_t ggml_backend_moe_cpu_region_service_prepare_impl_v1(
         std::unique_ptr<ggml_backend_moe_cpu_prepared_lane_v1> lane;
         const int32_t status = fidelity ? ggml_backend_moe_cpu_fidelity_build_lane_v1(
             query, result, fidelity_offset, fidelity_bytes, lane) : ggml_backend_moe_cpu_region_build_lane_v1(
-                service, query, &result.execution, result.lane_metadata_bytes, result.lane_allocation_bytes, lane);
+                service, query, &result.execution, result.lane_metadata_bytes, result.lane_allocation_bytes,
+                shared ? (grow ? next_storage.get() : service->routed_storage.get()) : nullptr, lane);
         if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
             return status;
         }
@@ -2112,6 +2162,11 @@ static int32_t ggml_backend_moe_cpu_region_service_prepare_impl_v1(
     if (region->id == 0) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
     }
+    if (grow) {
+        service->routed_storage = std::move(next_storage);
+        service->routed_storage_bytes = result.lane_allocation_bytes;
+    }
+    if (shared) { ++service->routed_regions; }
     *region_out = region->id;
     service->regions[service->n_regions++] = region.release();
     service->prepared_payload_bytes = total;
@@ -2220,6 +2275,9 @@ static int32_t ggml_backend_moe_cpu_region_validate_execute_v1(
             binding->source_rows == nullptr || binding->scatter_destinations == nullptr) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
     }
+    auto * sorted_rows = reinterpret_cast<uint32_t *>(lane->binding_metadata);
+    auto * sorted_destinations = sorted_rows + binding->n_routes;
+    uint32_t n_source_rows = 0;
     for (uint32_t route = 0; route < binding->n_routes; ++route) {
         if (binding->expert_ids[route] < 0 || (uint32_t) binding->expert_ids[route] >= requirements.expert_count ||
                 binding->source_rows[route] >= region->source_row_capacity ||
@@ -2230,19 +2288,16 @@ static int32_t ggml_backend_moe_cpu_region_validate_execute_v1(
         if (binding->source_rows[route] != binding->source_rows[row_start]) {
             return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
         }
-        if (route == row_start &&
-                (region->flags & GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_COMPACT_ROUTES) == 0) {
-            for (uint32_t previous = 0; previous < row_start; previous += requirements.routes_per_row) {
-                if (binding->source_rows[previous] == binding->source_rows[route]) {
-                    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
-                }
-            }
+        if (route == row_start && !compact) {
+            sorted_rows[n_source_rows++] = binding->source_rows[route];
         }
-        for (uint32_t previous = 0; previous < route; ++previous) {
-            if (binding->scatter_destinations[previous] == binding->scatter_destinations[route]) {
-                return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
-            }
-        }
+        sorted_destinations[route] = binding->scatter_destinations[route];
+    }
+    std::sort(sorted_rows, sorted_rows + n_source_rows);
+    std::sort(sorted_destinations, sorted_destinations + binding->n_routes);
+    if (std::adjacent_find(sorted_rows, sorted_rows + n_source_rows) != sorted_rows + n_source_rows ||
+            std::adjacent_find(sorted_destinations, sorted_destinations + binding->n_routes) != sorted_destinations + binding->n_routes) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_BINDING;
     }
 
     for (uint32_t i = 0; i < region->n_dynamic_inputs; ++i) {
@@ -2388,6 +2443,26 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
     }
     std::lock_guard<std::mutex> execute_lock(service->execute_mutex);
     auto * lane = region->lanes[lane_index].get();
+    if (lane->execution_offsets) {
+        // Prepared graphs keep offsets; the service slab can grow between executions.
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(service->routed_storage.get());
+        const uintptr_t padding = (GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1 -
+            raw % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1) % GGML_BACKEND_MOE_CPU_REGION_ALIGNMENT_V1;
+        GGML_ASSERT(service->routed_storage && padding <= service->routed_storage_bytes &&
+            region->requirements.execution.lane_execution_bytes <= service->routed_storage_bytes - padding);
+        lane->execution = service->routed_storage.get() + padding;
+        for (uint32_t i = 0; i < region->n_dynamic_inputs; ++i) {
+            lane->dynamic_inputs[i]->data = lane->execution + lane->execution_offsets[i];
+        }
+        for (int i = 0; i < lane->graph->n_nodes; ++i) {
+            lane->graph->nodes[i]->data = lane->execution + lane->execution_offsets[region->n_dynamic_inputs + i];
+        }
+        lane->binding_metadata = lane->execution + lane->binding_offset;
+        lane->output_staging = lane->execution + lane->staging_offset;
+        lane->plan.work_data = lane->plan.work_size ? lane->execution + lane->work_offset : nullptr;
+        lane->plan.mmid_route_filter_data = lane->binding_metadata +
+            size_t(region->requirements.execution.route_capacity) * 2 * sizeof(uint32_t);
+    }
     const int32_t validation = ggml_backend_moe_cpu_region_validate_execute_v1(region, execution, lane, result);
     if (validation != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
         return validation;
@@ -2752,7 +2827,15 @@ static int32_t ggml_backend_moe_cpu_region_service_destroy_region_impl_v1(
             service->regions[i - 1] = service->regions[i];
         }
         service->regions[--service->n_regions] = nullptr;
-        service->prepared_payload_bytes -= region->requirements.prepared_payload_bytes;
+        service->prepared_payload_bytes -= region->charged_payload_bytes;
+        if ((region->flags & GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION) != 0) {
+            GGML_ASSERT(service->routed_regions > 0);
+            if (--service->routed_regions == 0) {
+                service->prepared_payload_bytes -= service->routed_storage_bytes;
+                service->routed_storage_bytes = 0;
+                service->routed_storage.reset();
+            }
+        }
         delete region;
     }
     *region_handle = 0;

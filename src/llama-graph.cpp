@@ -2491,7 +2491,10 @@ int32_t llm_graph_moe_region::prepare_hybrid(
         return ggml_backend_sched_moe_hybrid_prepare_v1(sched, &descriptor);
     };
     std::unique_ptr<llm_graph_moe_hybrid_prepared> prepared;
-    int32_t status = prepare_hybrid_metadata(owner, n_threads, prepared);
+    const bool prefill = allow_routed && certificate && certificate->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        certificate->row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL && certificate->n_rows > 1;
+    int32_t status = prefill ? GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION :
+        prepare_hybrid_metadata(owner, n_threads, prepared);
     if (status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { status = prepare(*prepared); }
     if (!allow_routed || (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION &&
             status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) { return status; }
