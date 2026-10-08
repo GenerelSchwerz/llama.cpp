@@ -1154,7 +1154,7 @@ public:
     bool initialize_profile(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
             ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
     bool initialize_statistics(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
-            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
+            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0, const double * const * scores = nullptr);
     ggml_cuda_moe_candidate_registry_state state() const;
     bool find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const;
     bool find_down_group_key(const ggml_tensor * tensor, ggml_cuda_moe_candidate_group_key * key) const;
@@ -1395,7 +1395,7 @@ public:
 private:
     bool initialize_placement(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
             const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
-            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags);
+            ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags, const double * const * scores = nullptr);
     friend struct ggml_cuda_moe_grouped_context_test_access;
     friend class ggml_cuda_moe_group_call_lease;
     friend class ggml_cuda_moe_legacy_operation_lease;
@@ -1750,6 +1750,9 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
 }
 #endif
 
+extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v2(ggml_backend_t backend,
+    const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores,
+    uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v1(ggml_backend_t backend,
     const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 extern "C" bool ggml_backend_cuda_moe_profile_initialize_v1(ggml_backend_t backend,

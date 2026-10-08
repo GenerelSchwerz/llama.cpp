@@ -109,7 +109,9 @@ llama_moe_profile_statistics llama_moe_profile_statistics_parse(
         if (gguf_get_arr_type(metadata.get(), index) != type || gguf_get_arr_n(metadata.get(), index) != count) { reject("array type or length mismatch"); }
         return gguf_get_arr_data(metadata.get(), index);
     };
-    if (gguf_get_val_u32(metadata.get(), key("moe.profile.version", GGUF_TYPE_UINT32)) != 1) { reject("unsupported statistics version"); }
+    const auto version = gguf_get_val_u32(metadata.get(), key("moe.profile.version", GGUF_TYPE_UINT32));
+    if (version != 1 && version != 2) { reject("unsupported statistics version"); }
+    if (version == 1 && gguf_find_key(metadata.get(), "moe.profile.ranking_scores") >= 0) { reject("scores require statistics version2"); }
     const auto domain_key = key("moe.profile.source_domains", GGUF_TYPE_ARRAY);
     const size_t n_sources = gguf_get_arr_n(metadata.get(), domain_key);
     if (!n_sources || n_sources > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || n_sources > SIZE_MAX / 4) {
@@ -131,6 +133,7 @@ llama_moe_profile_statistics llama_moe_profile_statistics_parse(
     const auto * names = static_cast<const uint8_t *>(array("moe.profile.source_name_bytes", GGUF_TYPE_UINT8, n_names));
     const auto * counts = static_cast<const uint64_t *>(array("moe.profile.expert_counts", GGUF_TYPE_UINT64, n_counts));
     const auto * provenance = static_cast<const uint8_t *>(array("moe.profile.provenance", GGUF_TYPE_UINT8, n_provenance));
+    const auto * scores = version == 2 ? static_cast<const double *>(array("moe.profile.ranking_scores", GGUF_TYPE_FLOAT64, n_counts)) : nullptr;
     if (name_offsets[0] || name_offsets[n_sources] != n_names || offsets[0] || offsets[n_sources] != n_counts ||
             memchr(provenance, 0, n_provenance)) { reject("invalid offsets or provenance"); }
 
@@ -181,13 +184,21 @@ llama_moe_profile_statistics llama_moe_profile_statistics_parse(
             total += counts[index];
         }
         if (total != observations[i]) { reject("observation total mismatch"); }
+        double score_sum = 0;
+        for (uint64_t index = offsets[i]; scores && index < offsets[i + 1]; ++index) {
+            if (!std::isfinite(scores[index]) || scores[index] < 0 || (!total && scores[index] != 0)) { reject("invalid ranking score"); }
+            score_sum += scores[index];
+            if (!std::isfinite(score_sum)) { reject("ranking score overflow"); }
+        }
         const auto * first = counts + size_t(offsets[i]);
         const auto * last = counts + size_t(offsets[i + 1]);
         if (!bound.counts.empty()) {
-            if (bound.observations != total || !std::equal(bound.counts.begin(), bound.counts.end(), first)) { reject("contradictory source aliases"); }
+            if (bound.observations != total || !std::equal(bound.counts.begin(), bound.counts.end(), first) ||
+                    (scores && !std::equal(bound.scores.begin(), bound.scores.end(), scores + size_t(offsets[i])))) { reject("contradictory source aliases"); }
         } else {
             bound.observations = total;
             bound.counts.assign(first, last);
+            if (scores) { bound.scores.assign(scores + size_t(offsets[i]), scores + size_t(offsets[i + 1])); }
         }
     }
     for (const auto & source : result.sources) {
@@ -1013,6 +1024,7 @@ llama_context::llama_context(
             moe_profile_statistics = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), model.moe_sources());
             for (const auto & source : moe_profile_statistics.sources) {
                 moe_statistics.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                if (!source.scores.empty()) { moe_statistics_scores.push_back(source.scores.data()); }
             }
             LLAMA_LOG_INFO("moe-profile: file=%s sources=%zu identity=source-name/domain/type/shape policy=canonical byte-weighted statistics use runtime capacities\n", path, moe_statistics.size());
         } else {
@@ -1485,11 +1497,13 @@ llama_context::llama_context(
         }
         if (!statistics.sources.empty()) {
             std::vector<ggml_backend_moe_source_statistics_v1> views;
+            std::vector<const double *> scores;
             views.reserve(statistics.sources.size());
             for (const auto & source : statistics.sources) {
                 views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
+                if (!source.scores.empty()) { scores.push_back(source.scores.data()); }
             }
-            if (!initialize_moe_statistics(views)) { throw std::runtime_error("cannot install inherited source statistics"); }
+            if (!initialize_moe_statistics(views, scores.empty() ? nullptr : scores.data())) { throw std::runtime_error("cannot install inherited source statistics"); }
             moe_hybrid_profile_adapt = adaptation;
             LLAMA_LOG_INFO("moe-profile: inherited sources=%zu identity=same-model-object adaptation=%u storage=context-owned\n",
                 moe_statistics.size(), moe_hybrid_profile_adapt);
@@ -2087,23 +2101,23 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
 
 bool llama_context::initialize_moe_profile() {
     if (source_core_enabled()) { return !moe_profile_failed; }
-    return initialize_moe_placement(moe_profiles, moe_statistics);
+    return initialize_moe_placement(moe_profiles, moe_statistics, moe_statistics_scores.empty() ? nullptr : moe_statistics_scores.data());
 }
 
 bool llama_context::initialize_moe_profile(const std::vector<ggml_backend_moe_static_profile_v1> & profiles) {
     return initialize_moe_placement(profiles, {});
 }
 
-bool llama_context::initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics) {
-    return initialize_moe_placement({}, statistics);
+bool llama_context::initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores) {
+    return initialize_moe_placement({}, statistics, scores);
 }
 
 bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
-        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics) {
-    if (profiles.empty() && statistics.empty()) { return true; }
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores) {
+    if (profiles.empty() && statistics.empty()) { return scores == nullptr; }
     if (profiles.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || (!profiles.empty() && !statistics.empty()) ||
             statistics.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS ||
-            !ggml_moe_source_statistics_valid(statistics.data(), uint32_t(statistics.size()))) { return false; }
+            !ggml_moe_source_scores_valid(statistics.data(), scores, uint32_t(statistics.size()))) { return false; }
     if (source_core_enabled()) {
         std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::try_to_lock);
         if (!publication_lock.owns_lock()) { return false; }
@@ -2143,6 +2157,7 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
             }
             llama_moe_profile_statistics owned;
             std::vector<ggml_backend_moe_source_statistics_v1> statistic_views;
+            std::vector<const double *> score_views;
             owned.sources.reserve(statistics.size()); statistic_views.reserve(statistics.size());
             if (!statistics.empty() && statistics.size() != expected) { return false; }
             for (const auto & source : statistics) {
@@ -2150,6 +2165,12 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
                 if (domain == known.end() || !domain->second.count(source.tensor)) { return false; }
                 owned.sources.push_back({source.tensor, source.domain, source.observations,
                     std::vector<uint64_t>(source.counts, source.counts + source.n_experts)});
+                if (scores) {
+                    auto & bound = owned.sources.back();
+                    const auto * first = scores[owned.sources.size() - 1];
+                    bound.scores.assign(first, first + source.n_experts);
+                    score_views.push_back(bound.scores.data());
+                }
                 statistic_views.push_back({source.tensor, owned.sources.back().counts.data(), source.observations, source.n_experts, source.domain});
             }
             owned.provenance = "Caller-supplied statistics validated against the canonical source catalog";
@@ -2157,6 +2178,7 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
             moe_profiles = std::move(profile_views);
             moe_profile_statistics = std::move(owned);
             moe_statistics = std::move(statistic_views);
+            moe_statistics_scores = std::move(score_views);
             LLAMA_LOG_INFO("moe-profile: stored source configuration ranks=%zu statistics=%zu application=next-graph-prepare\n",
                 moe_profiles.size(), moe_statistics.size());
             return true;
@@ -2171,6 +2193,8 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
     std::vector<std::vector<ggml_backend_moe_static_profile_v1>> per_owner(backends.size());
     std::vector<ggml_backend_moe_profile_initialize_v1_t> endpoints(backends.size(), nullptr);
     std::vector<std::vector<ggml_backend_moe_source_statistics_v1>> per_owner_statistics(backends.size());
+    std::vector<std::vector<const double *>> per_owner_scores(backends.size());
+    std::vector<ggml_backend_moe_statistics_initialize_v2_t> scored_endpoints(backends.size(), nullptr);
     std::vector<ggml_backend_moe_statistics_initialize_v1_t> statistics_endpoints(backends.size(), nullptr);
     for (const auto & source : statistics) {
         if (!source.tensor || !source.tensor->buffer || !source.counts || !source.n_experts) { return false; }
@@ -2183,7 +2207,13 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
             statistics_endpoints[i] = reinterpret_cast<ggml_backend_moe_statistics_initialize_v1_t>(
                 ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V1_PROC_NAME));
             if (!statistics_endpoints[i]) { return false; }
-            per_owner_statistics[i].push_back(source); found = true; break;
+            per_owner_statistics[i].push_back(source);
+            if (scores) {
+                scored_endpoints[i] = reinterpret_cast<ggml_backend_moe_statistics_initialize_v2_t>(
+                    ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V2_PROC_NAME));
+                if (!scored_endpoints[i]) { return false; }
+                per_owner_scores[i].push_back(scores[size_t(&source - statistics.data())]);
+            } found = true; break;
         }
         if (!found) { return false; }
     }
@@ -2220,6 +2250,7 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
         uint64_t bytes = 0;
         const bool applied = per_owner_statistics[i].empty() ?
             endpoints[i](backends[i].get(), per_owner[i].data(), per_owner[i].size(), 0, &bytes) :
+            scores ? scored_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_scores[i].data(), per_owner_statistics[i].size(), 0, &bytes) :
             statistics_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_statistics[i].size(), 0, &bytes);
         if (!applied) { ok = false; break; }
         total += bytes;
@@ -2513,6 +2544,7 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             config.n_profiles = moe_profiles.size();
             config.statistics = moe_statistics.empty() ? nullptr : moe_statistics.data();
             config.n_statistics = moe_statistics.size();
+            config.statistics_scores = moe_statistics_scores.empty() ? nullptr : moe_statistics_scores.data();
             config.profile_adaptation = moe_hybrid_profile_adapt;
             config.cpu_module_acquire = ggml_backend_moe_cpu_module_acquire_v1;
             config.module_retain = ggml_backend_moe_module_retain_v1;

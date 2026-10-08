@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -40,20 +41,39 @@ bool ggml_moe_source_statistics_valid(const ggml_backend_moe_source_statistics_v
     return true;
 } catch (...) { return false; }
 
+static bool source_scores_valid(const double * scores, uint32_t count, uint64_t observations) {
+    if (!scores) { return true; }
+    double sum = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!std::isfinite(scores[i]) || scores[i] < 0 || (!observations && scores[i] != 0)) { return false; }
+        sum += scores[i];
+        if (!std::isfinite(sum)) { return false; }
+    }
+    return true;
+}
+
+bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores, uint32_t count) {
+    if (!ggml_moe_source_statistics_valid(statistics, count) || (scores && !count)) { return false; }
+    for (uint32_t i = 0; scores && i < count; ++i) {
+        if (!scores[i] || !source_scores_valid(scores[i], statistics[i].n_experts, statistics[i].observations)) { return false; }
+    }
+    return true;
+}
+
 bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks) try {
     if (banks.empty() || banks.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { return false; }
     const auto experts = banks.front().n_experts;
     uint64_t payload = 0;
     for (const auto & bank : banks) {
         if (bank.n_experts != experts || !bank.payload_bytes || bank.payload_bytes > UINT64_MAX - payload ||
-                !source_statistics_sum(bank.counts, experts, bank.observations)) { return false; }
+                !source_statistics_sum(bank.counts, experts, bank.observations) || !source_scores_valid(bank.scores, experts, bank.observations)) { return false; }
         payload += bank.payload_bytes;
     }
     std::vector<long double> scores(experts, 0);
     for (const auto & bank : banks) {
         if (!bank.observations) { continue; }
         const auto weight = static_cast<long double>(bank.payload_bytes) / payload;
-        for (uint32_t i = 0; i < experts; ++i) { scores[i] += weight * (static_cast<long double>(bank.counts[i]) / bank.observations); }
+        for (uint32_t i = 0; i < experts; ++i) { scores[i] += weight * (bank.scores ? static_cast<long double>(bank.scores[i]) : static_cast<long double>(bank.counts[i]) / bank.observations); }
     }
     std::vector<int32_t> result;
     result.reserve(experts);

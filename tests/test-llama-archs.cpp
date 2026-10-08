@@ -40,6 +40,7 @@
 #include <filesystem>
 #include <fstream>
 #include <locale>
+#include <limits>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -143,6 +144,10 @@ static void usage(char ** argv) {
     LOG("  --test-source-uses <model> Check loader source discovery with and without allocation\n");
     LOG("  --test-source-profile <model> Check GPU profile initialization of original routed sources\n");
     LOG("  --test-source-statistics Check source statistics identity, coverage and malformed inputs\n");
+    LOG("  --collect-moe-profile <model> Collect a weighted native corpus profile (natural EOG)\n");
+    LOG("  --profile-corpus <json>  Workload weights and calibration requests\n");
+    LOG("  --profile-output <gguf>  New profile path; evidence goes in <gguf>.calibration\n");
+    LOG("  --profile-threads <N>    Calibration CPU threads (default 4)\n");
     LOG("  --source-statistics-file <file> Write synthetic source statistics for the profile loading fixture\n");
     LOG("  --test-moe-replay <model> Record or replay identical-token full-logit rows\n");
     LOG("  --test-source-variants Check sequence-aware source captures against --replay-reference\n");
@@ -690,6 +695,8 @@ static gguf_context_ptr make_source_profile_statistics(const std::vector<llama_m
     gguf_context_ptr metadata(gguf_init_empty());
     std::vector<uint8_t> names;
     std::vector<uint64_t> name_offsets{0}, offsets{0}, observations, counts;
+    std::vector<double> scores;
+    const bool scored = measured && !measured->sources.empty() && !measured->sources.front().scores.empty();
     std::vector<uint32_t> domains, types;
     std::vector<int64_t> shapes;
     std::map<uint32_t, std::unordered_set<const ggml_tensor *>> seen;
@@ -710,6 +717,8 @@ static gguf_context_ptr make_source_profile_statistics(const std::vector<llama_m
                 const auto found = std::find_if(measured->sources.begin(), measured->sources.end(), [&](const auto & value) { return value.tensor == bank.tensor && value.domain == source.domain; });
                 if (found == measured->sources.end() || found->counts.size() != size_t(bank.tensor->ne[2])) { throw std::runtime_error("missing measured source statistics"); }
                 actual = &*found;
+                if (scored ? actual->scores.size() != actual->counts.size() : !actual->scores.empty()) { throw std::runtime_error("incomplete ranking scores"); }
+                if (scored) { scores.insert(scores.end(), actual->scores.begin(), actual->scores.end()); }
             }
             for (int64_t i = 0; i < bank.tensor->ne[2]; ++i) {
                 const uint64_t value = actual ? actual->counts[i] : uint64_t(reverse ? bank.tensor->ne[2] - i : i + 1);
@@ -723,7 +732,8 @@ static gguf_context_ptr make_source_profile_statistics(const std::vector<llama_m
     }
     const std::string provenance = measured ? measured->provenance : "Synthetic fixture occurrences; no calibrated quality or content identity claim";
     if (provenance.empty() || provenance.size() > 4096 || provenance.find('\0') != std::string::npos) { throw std::runtime_error("invalid statistics provenance"); }
-    gguf_set_val_u32(metadata.get(), "moe.profile.version", 1);
+    gguf_set_val_u32(metadata.get(), "moe.profile.version", scored ? 2 : 1);
+    if (scored) { gguf_set_arr_data(metadata.get(), "moe.profile.ranking_scores", GGUF_TYPE_FLOAT64, scores.data(), scores.size()); }
     gguf_set_arr_data(metadata.get(), "moe.profile.source_name_bytes", GGUF_TYPE_UINT8, names.data(), names.size());
     gguf_set_arr_data(metadata.get(), "moe.profile.source_name_offsets", GGUF_TYPE_UINT64, name_offsets.data(), name_offsets.size());
     gguf_set_arr_data(metadata.get(), "moe.profile.source_domains", GGUF_TYPE_UINT32, domains.data(), domains.size());
@@ -795,6 +805,83 @@ struct routed_profile_collector {
         if (!projections) { first_epoch = epoch; }
         last_epoch = epoch; ++projections;
         return true;
+    }
+};
+
+// Reduce rounding error when adding requests with different lengths.
+struct profile_rate_sum {
+    double sum = 0, correction = 0;
+    void add(double value) {
+        const double next = sum + value;
+        correction += std::fabs(sum) >= std::fabs(value) ? (sum - next) + value : (value - next) + sum;
+        sum = next;
+    }
+    double value() const { return sum + correction; }
+};
+
+struct profile_corpus_family {
+    double weight = 0;
+    uint32_t requests = 0;
+    std::vector<std::vector<profile_rate_sum>> rates;
+};
+
+struct profile_corpus_average {
+    llama_moe_profile_statistics statistics;
+    std::map<std::string, profile_corpus_family> families;
+
+    void initialize(const llama_moe_profile_statistics & sources, const std::map<std::string, double> & weights) {
+        size_t entries = 0;
+        for (const auto & source : sources.sources) { entries += source.counts.size(); }
+        if (weights.empty() || entries > (64 * 1024 * 1024 / sizeof(profile_rate_sum)) / weights.size()) {
+            throw std::runtime_error("corpus rate storage exceeds 64 MiB");
+        }
+        statistics = sources;
+        families.clear();
+        profile_rate_sum total;
+        for (const auto & weight : weights) {
+            if (!std::isfinite(weight.second) || weight.second < 0) { throw std::runtime_error("invalid workload weight"); }
+            total.add(weight.second);
+        }
+        if (!std::isfinite(total.value()) || total.value() <= 0) { throw std::runtime_error("empty workload weight"); }
+        for (const auto & weight : weights) {
+            auto & family = families[weight.first];
+            family.weight = weight.second / total.value();
+            for (const auto & source : sources.sources) { family.rates.emplace_back(source.counts.size()); }
+        }
+    }
+
+    void add(const std::string & name, const llama_moe_profile_statistics & request, uint32_t rows) {
+        const auto found = families.find(name);
+        if (found == families.end() || !rows || request.sources.size() != statistics.sources.size()) { throw std::runtime_error("invalid corpus request"); }
+        auto & family = found->second;
+        for (size_t i = 0; i < request.sources.size(); ++i) {
+            const auto & source = request.sources[i];
+            auto & raw = statistics.sources[i];
+            if (source.tensor != raw.tensor || source.domain != raw.domain || source.counts.size() != raw.counts.size() ||
+                    source.observations > UINT64_MAX - raw.observations) { throw std::runtime_error("corpus source mismatch or overflow"); }
+            for (size_t j = 0; j < source.counts.size(); ++j) {
+                if (source.counts[j] > UINT64_MAX - raw.counts[j]) { throw std::runtime_error("corpus occurrence overflow"); }
+                raw.counts[j] += source.counts[j];
+                family.rates[i][j].add(double(source.counts[j]) / rows);
+            }
+            raw.observations += source.observations;
+        }
+        ++family.requests;
+    }
+
+    void finish() {
+        for (const auto & family : families) { if (!family.second.requests) { throw std::runtime_error("workload has no measured requests"); } }
+        for (size_t i = 0; i < statistics.sources.size(); ++i) {
+            auto & source = statistics.sources[i];
+            source.scores.resize(source.counts.size());
+            for (size_t j = 0; j < source.counts.size(); ++j) {
+                profile_rate_sum score;
+                for (const auto & family : families) {
+                    score.add((family.second.rates[i][j].value() / family.second.requests) * family.second.weight);
+                }
+                source.scores[j] = score.value();
+            }
+        }
     }
 };
 
@@ -943,6 +1030,65 @@ static int test_source_profile_statistics() {
     const auto collected = llama_moe_profile_statistics_parse(collected_bytes.data(), collected_bytes.size(), collected_catalog);
     if (collected.sources.size() != 2 || collected.sources[0].counts != counts_before || collected.sources[1].counts != std::vector<uint64_t>(5, 0) ||
             collected.sources[1].observations != 0) { return 1; }
+    routed_profile_collector empty;
+    if (!empty.initialize(sources)) { return 1; }
+    profile_corpus_average mixture;
+    mixture.initialize(empty.statistics, {{"general", 1}, {"code", 3}});
+    auto request = empty.statistics;
+    request.sources[0].counts = {1, 1, 0}; request.sources[0].observations = 2;
+    mixture.add("general", request, 2);
+    request.sources[0].counts = {0, 10, 0}; request.sources[0].observations = 10;
+    mixture.add("general", request, 10);
+    request.sources[0].counts = {8, 0, 2}; request.sources[0].observations = 10;
+    mixture.add("code", request, 10);
+    mixture.finish();
+    mixture.statistics.provenance = "Synthetic unequal-length weighted corpus fixture";
+    const auto & scored = mixture.statistics.sources[0];
+    const std::vector<double> expected_scores{0.6625, 0.1875, 0.15};
+    for (size_t i = 0; i < 3; ++i) { if (std::fabs(scored.scores[i] - expected_scores[i]) > 1e-15) { return 1; } }
+    if (scored.counts != std::vector<uint64_t>{9, 11, 2} || scored.observations != 22) { return 1; }
+    auto scored_metadata = make_source_profile_statistics(sources, false, &mixture.statistics);
+    const auto scored_bytes = source_profile_metadata_bytes(scored_metadata.get());
+    const auto score_roundtrip = llama_moe_profile_statistics_parse(scored_bytes.data(), scored_bytes.size(), sources);
+    if (score_roundtrip.sources[0].scores != scored.scores || score_roundtrip.sources[1].scores != std::vector<double>(5, 0)) { return 1; }
+    if (!ggml_moe_source_rank_statistics({{scored.counts.data(), scored.observations, 16, 3, scored.scores.data()}}, ranks) ||
+            ranks != std::vector<int32_t>{0, 1, 2}) { return 1; }
+    std::vector<double> flat_scores = scored.scores;
+    flat_scores.resize(8, 0);
+    for (uint32_t variant = 0; variant < 7; ++variant) {
+        auto malformed = make_source_profile_statistics(sources, false, &mixture.statistics);
+        auto changed = flat_scores;
+        if (variant == 0) { changed[0] = -1; }
+        if (variant == 1) { changed[0] = INFINITY; }
+        if (variant == 2) { changed[0] = NAN; }
+        if (variant == 3) { changed[3] = 1; }
+        if (variant == 4) { changed[0] = changed[1] = std::numeric_limits<double>::max(); }
+        gguf_set_arr_data(malformed.get(), "moe.profile.ranking_scores", GGUF_TYPE_FLOAT64, changed.data(), variant == 5 ? 7 : 8);
+        if (variant == 6) { gguf_set_val_u32(malformed.get(), "moe.profile.version", 1); }
+        invalid(source_profile_metadata_bytes(malformed.get()), sources);
+    }
+    auto mistyped = make_source_profile_statistics(sources, false, &mixture.statistics);
+    gguf_set_arr_data(mistyped.get(), "moe.profile.ranking_scores", GGUF_TYPE_UINT64, flat_scores.data(), 8);
+    invalid(source_profile_metadata_bytes(mistyped.get()), sources);
+    auto missing_scores = make_source_profile_statistics(sources);
+    gguf_set_val_u32(missing_scores.get(), "moe.profile.version", 2);
+    invalid(source_profile_metadata_bytes(missing_scores.get()), sources);
+    gguf_context_ptr score_aliases(gguf_init_from_buffer(shared_bytes.data(), shared_bytes.size(), {true, nullptr}));
+    std::vector<double> alias_scores{0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0, 0, 0, 0, 0};
+    gguf_set_val_u32(score_aliases.get(), "moe.profile.version", 2);
+    gguf_set_arr_data(score_aliases.get(), "moe.profile.ranking_scores", GGUF_TYPE_FLOAT64, alias_scores.data(), alias_scores.size());
+    const auto valid_alias_scores = source_profile_metadata_bytes(score_aliases.get());
+    if (llama_moe_profile_statistics_parse(valid_alias_scores.data(), valid_alias_scores.size(), sources).sources[0].scores != std::vector<double>{0.1, 0.2, 0.3}) { return 1; }
+    alias_scores[3] = 0.2;
+    gguf_set_arr_data(score_aliases.get(), "moe.profile.ranking_scores", GGUF_TYPE_FLOAT64, alias_scores.data(), alias_scores.size());
+    invalid(source_profile_metadata_bytes(score_aliases.get()), sources);
+    ggml_backend_moe_source_statistics_v1 scored_view{scored.tensor, scored.counts.data(), scored.observations, 3, scored.domain};
+    const double * score_views[] = {scored.scores.data()};
+    if (!ggml_moe_source_scores_valid(&scored_view, score_views, 1)) { return 1; }
+    score_views[0] = nullptr;
+    if (ggml_moe_source_scores_valid(&scored_view, score_views, 1)) { return 1; }
+    printf("test-source-corpus-mixture: %s\n", common_json({{"scores", scored.scores}, {"counts", scored.counts},
+        {"ranks", ranks}, {"rows", common_json::array({2, 10, 10})}, {"weights", {{"general", 1}, {"code", 3}}}}).dump().c_str());
     auto ambiguous_domains = sources; ambiguous_domains.back().banks.front().tensor = a;
     if (!collector.initialize(ambiguous_domains) || collector.statistics.sources.size() != 2) { return 1; }
     probe.source_domain = ambiguous_domains.back().domain;
@@ -1575,6 +1721,200 @@ static int test_model_moe_concurrent_replay(llama_model * model, llama_context_p
         {"completed", common_json::array({completed[0], completed[1]})}, {"n_vocab", n_vocab}, {"rows", rows}, {"state", state}, {"routing", trace.records}}).dump().c_str());
     fflush(stdout);
     return status;
+}
+
+static std::string profile_read_text(const std::filesystem::path & path, size_t limit) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { throw std::runtime_error("cannot read corpus input: " + path.string()); }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || !size || size > limit) { throw std::runtime_error("corpus input exceeds extent: " + path.string()); }
+    std::string text(size_t(size), '\0');
+    file.read(text.data(), text.size());
+    if (!file || file.peek() != EOF) { throw std::runtime_error("corpus input changed while reading: " + path.string()); }
+    if (text.find('\0') != std::string::npos) { throw std::runtime_error("corpus input contains NUL"); }
+    return text;
+}
+
+static void profile_write_bytes(const std::filesystem::path & path, const void * data, size_t size) {
+    std::ofstream file(path, std::ios::binary);
+    file.write(static_cast<const char *>(data), size);
+    file.close();
+    if (!file) { throw std::runtime_error("cannot write profile artifact: " + path.string()); }
+}
+
+static int collect_model_moe_corpus(const char * model_path, const char * corpus_path, const char * output_path,
+        int32_t cache_slots, uint32_t threads, llama_load_mode load_mode) {
+    if (!corpus_path || !output_path || cache_slots <= 0) { throw std::runtime_error("corpus, output and positive cache slots are required"); }
+    if (getenv("GGML_MOE_EXPERT_PROFILE")) { throw std::runtime_error("unset GGML_MOE_EXPERT_PROFILE while collecting a fresh profile"); }
+    const auto text = profile_read_text(corpus_path, 8 * 1024 * 1024);
+    const auto corpus = common_json::parse(text);
+    if (!corpus.is_object() || corpus.size() != 3 || !corpus.contains("version") || corpus.at("version") != 1 ||
+            !corpus.contains("weights") || !corpus.at("weights").is_object() || corpus.at("weights").empty() || corpus.at("weights").size() > 32 ||
+            !corpus.contains("requests") || !corpus.at("requests").is_array() || corpus.at("requests").empty() || corpus.at("requests").size() > 128) {
+        throw std::runtime_error("invalid corpus schema; expected version1, weights and requests");
+    }
+    std::map<std::string, double> weights;
+    std::map<std::string, size_t> family_requests;
+    for (auto it = corpus.at("weights").begin(); it != corpus.at("weights").end(); ++it) {
+        const auto & name = it.key();
+        if (name.empty() || name.size() > 64 || name.find('\0') != std::string::npos || !it.value().is_number()) { throw std::runtime_error("invalid workload label or weight"); }
+        const double weight = it.value().get<double>();
+        if (!std::isfinite(weight) || weight < 0) { throw std::runtime_error("invalid workload weight"); }
+        weights.emplace(name, weight);
+    }
+    struct request { std::string family, prompt; uint32_t max_tokens; };
+    std::vector<request> requests;
+    for (const auto & item : corpus.at("requests")) {
+        if (!item.is_object() || item.size() != 3 || !item.contains("family") || !item.at("family").is_string() ||
+                !item.contains("max_tokens") || !item.at("max_tokens").is_number_integer() ||
+                item.contains("prompt") == item.contains("prompt_file")) { throw std::runtime_error("invalid corpus request schema"); }
+        const auto family = item.at("family").get<std::string>();
+        const int64_t tokens = item.at("max_tokens").get<int64_t>();
+        if (!weights.count(family) || tokens < 2 || tokens > 4096) { throw std::runtime_error("unknown workload or continuation outside 2..4096"); }
+        const auto & prompt_value = item.at(item.contains("prompt") ? "prompt" : "prompt_file");
+        if (!prompt_value.is_string()) { throw std::runtime_error("invalid corpus prompt"); }
+        auto prompt = prompt_value.get<std::string>();
+        if (item.contains("prompt_file")) {
+            if (prompt.empty() || prompt.find('\0') != std::string::npos) { throw std::runtime_error("invalid prompt file path"); }
+            prompt = profile_read_text(std::filesystem::path(corpus_path).parent_path() / prompt, 64 * 1024);
+        }
+        if (prompt.empty() || prompt.size() > 64 * 1024 || prompt.find('\0') != std::string::npos) { throw std::runtime_error("prompt outside 1..65536 bytes"); }
+        requests.push_back({family, prompt, uint32_t(tokens)});
+        ++family_requests[family];
+    }
+    if (family_requests.size() != weights.size()) { throw std::runtime_error("a workload has no requests"); }
+    profile_rate_sum weight_total;
+    for (const auto & weight : weights) { weight_total.add(weight.second); }
+    if (!std::isfinite(weight_total.value()) || weight_total.value() <= 0) { throw std::runtime_error("workload weights must have a positive finite sum"); }
+    const std::filesystem::path output(output_path), evidence(std::string(output_path) + ".calibration"), partial(std::string(output_path) + ".partial");
+    if (std::filesystem::exists(output) || std::filesystem::exists(partial) || !std::filesystem::create_directory(evidence)) {
+        throw std::runtime_error("use fresh profile and evidence paths");
+    }
+    profile_write_bytes(evidence / "corpus.json", text.data(), text.size());
+    const auto corpus_hash = hash_sha256_hex(text.data(), text.size());
+    auto model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 99;
+    model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    model_params.load_mode = load_mode;
+    model_params.moe_expert_cache_slots = cache_slots;
+    model_params.moe_expert_cache_host_pinned_size = 0;
+    model_params.progress_callback = silent_model_load_progress;
+    llama_model_ptr model(llama_model_load_from_file(model_path, model_params));
+    if (!model) { throw std::runtime_error("cannot load corpus model"); }
+    routed_profile_collector catalog;
+    if (!catalog.initialize(model->moe_sources())) { throw std::runtime_error("no eligible expert source catalog"); }
+    profile_corpus_average average;
+    average.initialize(catalog.statistics, weights);
+    const auto * vocab = llama_model_get_vocab(model.get());
+    const auto n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0 || n_vocab > 1024 * 1024) { throw std::runtime_error("invalid model vocabulary extent"); }
+    common_json weight_json = common_json::object();
+    for (const auto & weight : weights) { weight_json[weight.first] = weight.second; }
+    common_json report = {{"version", 1}, {"status", "incomplete"}, {"corpus_sha256", corpus_hash}, {"weights", weight_json},
+        {"formula", "sum(normalized workload weight * mean(request expert counts / actual target decode rows))"},
+        {"model", model_path}, {"cache_slots", cache_slots}, {"threads", threads}, {"load_mode", llama_load_mode_name(load_mode)},
+        {"sampling", "greedy; natural EOG; serial fresh contexts; no draft or MTP calibration"}, {"requests", common_json::array()}};
+    uint64_t total_rows = 0;
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        const auto prompt = common_tokenize(vocab, request.prompt, true, true);
+        if (prompt.empty() || prompt.size() > 4096) { throw std::runtime_error("prompt outside 1..4096 tokens"); }
+        const auto prefix = evidence / std::to_string(index);
+        routed_cpu_oracle observer;
+        if (!observer.profile_collector.initialize(model->moe_sources())) { throw std::runtime_error("invalid request source catalog"); }
+        observer.profile_export_path = prefix.string() + ".gguf";
+        observer.profile_trace_path = prefix.string() + ".routes.jsonl";
+        observer.profile_trace.open(observer.profile_trace_path, std::ios::binary);
+        if (!observer.profile_trace) { throw std::runtime_error("cannot open routing evidence"); }
+        auto params = llama_context_default_params();
+        params.n_ctx = std::max<uint32_t>(512, uint32_t(prompt.size()) + request.max_tokens);
+        params.n_batch = params.n_ubatch = std::max<uint32_t>(128, uint32_t(prompt.size()));
+        params.n_threads = params.n_threads_batch = threads;
+        params.phase_aware_workspace = true;
+        params.no_perf = false;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) { throw std::runtime_error("cannot create calibration context"); }
+        auto prefill = llama_batch_get_one(const_cast<llama_token *>(prompt.data()), int32_t(prompt.size()));
+        if (llama_decode(ctx.get(), prefill)) { throw std::runtime_error("calibration prefill failed"); }
+        observer.profile_context = ctx.get();
+        if (!ctx->set_moe_test_hook(routed_cpu_oracle::observe, &observer)) { throw std::runtime_error("corpus collection requires the generic source executor"); }
+        std::vector<llama_token> emitted;
+        uint32_t rows = 0;
+        bool eog = false;
+        for (uint32_t step = 0; step < request.max_tokens; ++step) {
+            const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+            if (!logits) { throw std::runtime_error("missing calibration logits"); }
+            llama_token token = 0;
+            for (int32_t id = 0; id < n_vocab; ++id) {
+                if (!std::isfinite(logits[id])) { throw std::runtime_error("nonfinite calibration logits"); }
+                if (logits[id] > logits[token]) { token = id; }
+            }
+            if (llama_vocab_is_eog(vocab, token)) { eog = true; break; }
+            emitted.push_back(token);
+            if (step + 1 == request.max_tokens) { break; }
+            auto decode = llama_batch_get_one(&token, 1);
+            if (llama_decode(ctx.get(), decode) || ctx->get_moe_test_frame()) { throw std::runtime_error("calibration decode failed or caller frame retained"); }
+            ++rows;
+        }
+        ctx->synchronize();
+        if (!ctx->set_moe_test_hook(nullptr, nullptr) || !rows || observer.profile_frames != rows || !observer.profile_collector.projections) {
+            throw std::runtime_error("request has no complete target decode observations");
+        }
+        observer.profile_trace.close();
+        if (!observer.profile_trace) { throw std::runtime_error("cannot finish routing evidence"); }
+        const auto trace = profile_read_text(observer.profile_trace_path, 256 * 1024 * 1024);
+        auto & statistics = observer.profile_collector.statistics;
+        statistics.provenance = common_json({{"producer", "native corpus source observer"}, {"corpus_sha256", corpus_hash},
+            {"request", index}, {"workload", request.family}, {"actual_decode_rows", rows}, {"generated_tokens", emitted.size()},
+            {"stop", eog ? "EOG" : "limit"}, {"routes_sha256", hash_sha256_hex(trace.data(), trace.size())}}).dump();
+        const auto metadata = make_source_profile_statistics(model->moe_sources(), false, &statistics);
+        const auto bytes = source_profile_metadata_bytes(metadata.get());
+        const auto decoded = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), model->moe_sources());
+        for (size_t i = 0; i < statistics.sources.size(); ++i) {
+            if (decoded.sources[i].counts != statistics.sources[i].counts) { throw std::runtime_error("request profile roundtrip failed"); }
+        }
+        profile_write_bytes(observer.profile_export_path, bytes.data(), bytes.size());
+        const auto perf = llama_perf_context(ctx.get());
+        average.add(request.family, statistics, rows);
+        total_rows += rows;
+        report["requests"].push_back({{"request", index}, {"family", request.family}, {"prompt_tokens", prompt.size()},
+            {"prompt_sha256", hash_sha256_hex(request.prompt.data(), request.prompt.size())},
+            {"prompt_tokens_sha256", hash_sha256_hex(prompt.data(), prompt.size() * sizeof(llama_token))},
+            {"max_tokens", request.max_tokens}, {"actual_decode_rows", rows}, {"generated_tokens", emitted}, {"stop", eog ? "EOG" : "limit"},
+            {"profile_sha256", hash_sha256_hex(bytes.data(), bytes.size())}, {"routes_sha256", hash_sha256_hex(trace.data(), trace.size())},
+            {"ownership_counts", std::vector<uint64_t>(observer.profile_collector.ownership_counts.begin(), observer.profile_collector.ownership_counts.end())}, {"projection_records", observer.profile_collector.projections},
+            {"prompt_ms", perf.t_p_eval_ms}, {"decode_ms", perf.t_eval_ms}});
+        ctx.reset();
+        const auto progress = report.dump(2) + '\n';
+        profile_write_bytes(evidence / "REPORT.json", progress.data(), progress.size());
+        fprintf(stderr, "moe-profile-corpus: request=%zu/%zu workload=%s decode_rows=%u emitted=%zu stop=%s\n",
+            index + 1, requests.size(), request.family.c_str(), rows, emitted.size(), eog ? "EOG" : "limit");
+    }
+    average.finish();
+    average.statistics.provenance = common_json({{"producer", "test-llama-archs native corpus collector"},
+        {"version", 1}, {"corpus_sha256", corpus_hash}, {"requests", requests.size()}, {"actual_decode_rows", total_rows},
+        {"weights", weight_json}, {"formula", report.at("formula")}, {"sampling", report.at("sampling")},
+        {"evidence", "Adjacent .calibration directory contains per-request raw GGUF statistics, routing JSONL and REPORT.json"}}).dump();
+    const auto metadata = make_source_profile_statistics(model->moe_sources(), false, &average.statistics);
+    const auto bytes = source_profile_metadata_bytes(metadata.get());
+    const auto decoded = llama_moe_profile_statistics_parse(bytes.data(), bytes.size(), model->moe_sources());
+    for (size_t i = 0; i < decoded.sources.size(); ++i) {
+        if (decoded.sources[i].counts != average.statistics.sources[i].counts || decoded.sources[i].scores != average.statistics.sources[i].scores) {
+            throw std::runtime_error("weighted profile roundtrip failed");
+        }
+    }
+    profile_write_bytes(partial, bytes.data(), bytes.size());
+    report["status"] = "complete";
+    report["profile_sha256"] = hash_sha256_hex(bytes.data(), bytes.size());
+    report["actual_decode_rows"] = total_rows;
+    const auto complete = report.dump(2) + '\n';
+    profile_write_bytes(evidence / "REPORT.json", complete.data(), complete.size());
+    model.reset();
+    std::filesystem::rename(partial, output);
+    printf("moe-profile-corpus: wrote %s requests=%zu rows=%llu sources=%zu bytes=%zu\n", output_path,
+        requests.size(), (unsigned long long) total_rows, decoded.sources.size(), bytes.size());
+    return 0;
 }
 
 static int test_model_moe_replay(const char * path, const char * reference_path, bool replay, bool independent_sources, int32_t cache_slots, bool cpu_oracle, bool gpu_oracle, llama_load_mode load_mode, const char * prompt_path, uint32_t replay_rows, const std::string & corpus_split) {
@@ -2609,11 +2949,17 @@ static int test_source_auxiliary_frontend(size_t seed, float stdev, const char *
                     const auto profile_bytes = source_profile_metadata_bytes(profile_metadata.get());
                     auto statistics = llama_moe_profile_statistics_parse(profile_bytes.data(), profile_bytes.size(), model->moe_sources());
                     std::vector<ggml_backend_moe_source_statistics_v1> views;
-                    for (const auto & source : statistics.sources) {
+                    std::vector<const double *> scores;
+                    for (auto & source : statistics.sources) {
+                        if (getenv("GGML_TEST_MOE_SCORED_STATISTICS")) {
+                            source.scores.resize(source.counts.size());
+                            for (size_t i = 0; i < source.counts.size(); ++i) { source.scores[i] = double(source.counts[i]) / source.observations; }
+                            scores.push_back(source.scores.data());
+                        }
                         views.push_back({source.tensor, source.counts.data(), source.observations, uint32_t(source.counts.size()), source.domain});
                     }
-                    if (!target->initialize_moe_statistics(views)) { throw std::runtime_error("parent supplied statistics installation failed"); }
-                    for (auto & source : statistics.sources) { std::fill(source.counts.begin(), source.counts.end(), 0); }
+                    if (!target->initialize_moe_statistics(views, scores.empty() ? nullptr : scores.data())) { throw std::runtime_error("parent supplied statistics installation failed"); }
+                    for (auto & source : statistics.sources) { std::fill(source.counts.begin(), source.counts.end(), 0); std::fill(source.scores.begin(), source.scores.end(), -1); }
                 }
                 params.ctx_type = type;
                 if (inherit_statistics) { params.ctx_other = target.get(); }
@@ -6391,6 +6737,10 @@ int main(int argc, char ** argv) {
     const char * source_profile_path = nullptr;
     const char * source_statistics_file = nullptr;
     bool source_statistics = false;
+    const char * profile_model_path = nullptr;
+    const char * profile_corpus_path = nullptr;
+    const char * profile_output_path = nullptr;
+    uint32_t profile_threads = 4;
     const char * moe_replay_path = nullptr;
     const char * replay_reference_path = nullptr;
     bool replay_read = false;
@@ -6457,6 +6807,18 @@ int main(int argc, char ** argv) {
             source_statistics_file = argv[++i];
         } else if (strcmp(argv[i], "--test-source-statistics") == 0) {
             source_statistics = true;
+        } else if (strcmp(argv[i], "--collect-moe-profile") == 0 && i + 1 < argc) {
+            profile_model_path = argv[++i];
+        } else if (strcmp(argv[i], "--profile-corpus") == 0 && i + 1 < argc) {
+            profile_corpus_path = argv[++i];
+        } else if (strcmp(argv[i], "--profile-output") == 0 && i + 1 < argc) {
+            profile_output_path = argv[++i];
+        } else if (strcmp(argv[i], "--profile-threads") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            const long threads = strtol(value, &end, 10);
+            if (!*value || *end || threads < 1 || threads > 1024) { return 1; }
+            profile_threads = uint32_t(threads);
         } else if (strcmp(argv[i], "--test-moe-replay") == 0 && i + 1 < argc) {
             moe_replay_path = argv[++i];
         } else if (strcmp(argv[i], "--replay-reference") == 0 && i + 1 < argc) {
@@ -6565,7 +6927,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_mtp_draft_vocab || run_moe_cache_selector ||
-        run_moe_placement || run_moe_joint_measurement || moe_replay_path || run_source_variants || run_source_auxiliary) {
+        run_moe_placement || run_moe_joint_measurement || profile_model_path || moe_replay_path || run_source_variants || run_source_auxiliary) {
         common_log_set_verbosity_thold(verbosity);
     }
     if (stdev <= 0.0f) {
@@ -6575,6 +6937,8 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (!profile_model_path && (profile_corpus_path || profile_output_path)) { throw std::runtime_error("profile inputs require --collect-moe-profile"); }
+        if (profile_model_path) { return collect_model_moe_corpus(profile_model_path, profile_corpus_path, profile_output_path, replay_cache_slots, profile_threads, replay_load_mode); }
         if (run_mtp_draft_vocab) {
             test_mtp_draft_vocab(seed, stdev);
             return 0;

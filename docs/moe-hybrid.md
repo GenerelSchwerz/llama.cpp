@@ -61,22 +61,68 @@ Keep three decisions separate:
 | Hardware budget and miss split | Cache budget/slots, CPU threads and GPU miss fraction |
 | Online residency adaptation | `--moe-profile-adapt off`, `occurrence` or `occurrence-sync` |
 
-The bounded diagnostic collector uses logical source accesses for raw and fused expert bodies. It does not need numerical projection outputs or a standalone executor. Example collection:
+### Generate a weighted corpus profile
 
-```sh
-GGML_MOE_HYBRID=required \
-GGML_MOE_HYBRID_EXECUTOR=source \
-GGML_MOE_SOURCE_GPU_MISS_FRACTION=0.17 \
-GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=1 \
-GGML_TEST_MOE_PROFILE_EXPORT=calibration.gguf \
-./build/bin/test-llama-archs --test-moe-replay model.gguf \
-  --replay-reference calibration.bin --replay-prompt-file calibration.txt \
-  --replay-rows 256 --replay-split calibration --replay-cache-slots 64 --replay-load-mode none
+Use the in-tree collector; no Python package or separate repository is required. Build `test-llama-archs` with the matching engine libraries. This example gives general and coding requests equal workload weight, independently of their output lengths:
+
+```json
+{
+  "version": 1,
+  "weights": {"general": 0.5, "code": 0.5},
+  "requests": [
+    {"family": "general", "prompt_file": "general.txt", "max_tokens": 256},
+    {"family": "code", "prompt_file": "code.txt", "max_tokens": 256}
+  ]
+}
 ```
 
-Use new output paths. The collector also writes a routing JSONL sidecar with caller/source identity. Prompt text is bounded to64KiB/4096 tokens and continuation to4096 rows. This diagnostic uses a fixed number of rows, including past EOG; production serving respects EOS normally. Collection covers post-prefill decode source accesses, not prefill, drafts, MTP acceptance or representative held-out quality. Its corpus split label records provenance, not a quality guarantee.
+Save this as `corpus.json`. Prompt file paths are relative to that file. Each request accepts either `prompt_file` or inline `prompt`. Use raw model input, including its chat template if required. Use representative calibration prompts and separate held-out prompts for evaluation.
 
-Load the model-bound statistics with `--moe-expert-profile calibration.gguf`. Default adaptation is off; add `--moe-profile-adapt occurrence` for the asynchronous occurrence policy or `occurrence-sync` for its synchronous control. Ranked STRP input remains supported when its geometry matches. Source identity, counts, types and complete bank coverage are checked before use. A separately loaded draft can use `--spec-draft-moe-expert-profile` and `--spec-draft-moe-profile-adapt`; target and draft configurations are independent.
+```sh
+CUDA_MODULE_LOADING=LAZY \
+GGML_MOE_HYBRID=required GGML_MOE_HYBRID_EXECUTOR=source \
+GGML_MOE_SOURCE_GPU_MISS_FRACTION=0.17 \
+GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=1 \
+./build/bin/test-llama-archs --collect-moe-profile model.gguf \
+  --profile-corpus corpus.json --profile-output calibration.gguf \
+  --profile-threads 16 --replay-cache-slots 64 --replay-load-mode none
+```
+
+Unset `GGML_MOE_EXPERT_PROFILE` for fresh collection. Choose slots, threads and miss fraction for your hardware; they are not properties learned into the profile. Collection loads one model and uses a fresh context for each serial request. Greedy generation stops at EOG or its requested limit. A request that ends before any observed decode row fails explicitly; the collector does not continue past EOG to invent observations.
+
+The score for each original source/expert is:
+
+```text
+request rate = measured expert count / actual target decode rows
+workload rate = mean(request rates in that workload)
+score = sum(normalized workload weight * workload rate)
+```
+
+This reproduces the normalized workload-mixture method. It does not give longer requests more weight. Raw counts remain separate from scores. Cache groups combine complete-bank scores using their existing expert payload-byte weights; equal scores prefer the lower expert ID. Profile generation does not encode a fixed cache size, PCIe split or model architecture.
+
+The profile is metadata-only GGUF version2 with optional source-indexed F64 `moe.profile.ranking_scores`. Raw version1 profiles remain readable. The adjacent `calibration.gguf.calibration/` directory records the corpus, per-request raw GGUF counts, routing JSONL, emitted token IDs, actual decode rows, stop reasons, hashes and `REPORT.json`. Prompt file contents are identified by hash; keep the original files to reproduce collection. The final profile appears only after all requests finish and the codec roundtrip succeeds. Use fresh output paths.
+
+Bounds: 128 requests, 32 workload labels, an 8 MiB corpus file, 64 KiB/4096 tokens per prompt, 2..4096 requested output tokens and 64 MiB of workload-rate storage. Routing evidence is capped at 256 MiB per request; exceeding a bound aborts collection without publishing a final profile. Collection covers target decode logical accesses for raw and fused expert bodies, including all CPU/GPU ownership classes. Prefill, draft/MTP accesses and acceptance are excluded. The first token sampled from prefill has no decode row; the denominator counts actual subsequent target decode calls. Different hardware/placement can change greedy continuations. This method alone establishes neither held-out quality nor a speed gain for every model.
+
+The older fixed-row diagnostic remains available through `--test-moe-replay` and `GGML_TEST_MOE_PROFILE_EXPORT`. It can continue past EOG and should not replace natural-EOG corpus calibration.
+
+### Load a profile and enable adaptation
+
+```sh
+CUDA_MODULE_LOADING=LAZY \
+GGML_MOE_HYBRID=required GGML_MOE_HYBRID_EXECUTOR=source \
+GGML_MOE_SOURCE_GPU_MISS_FRACTION=0.17 \
+GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=1 \
+GGML_MOE_SOURCE_SHARED_OVERLAP=1 \
+./build/bin/llama-server -m model.gguf \
+  -ngl all -fa on -c 16384 -b 2048 -ub 2048 -np 1 -t 16 \
+  --moe-expert-cache-size 64 --moe-expert-cache-host-pinned-mb 0 \
+  --moe-expert-profile calibration.gguf --moe-profile-adapt occurrence \
+  --load-mode none --lazy-mode on --fit off \
+  --decode-overlap --decode-boundary-overlap --ple-prefetch --phase-aware-workspace
+```
+
+Load the model-bound statistics with `--moe-expert-profile calibration.gguf`. Default adaptation is off; add `--moe-profile-adapt occurrence` for the asynchronous occurrence policy or `occurrence-sync` for its synchronous control. Ranked STRP input remains supported when its geometry matches. Source names/domains, counts, types, shapes and complete bank coverage are checked before use. Binding does not fingerprint weight contents; regenerate or reevaluate profiles when model weights or quantization change. A separately loaded draft can use `--spec-draft-moe-expert-profile` and `--spec-draft-moe-profile-adapt`; target and draft configurations are independent.
 
 Observers are private test hooks. Without an observer, the runtime skips source-access enumeration. Profile loading uses the canonical residency owner; it does not create a second expert cache.
 

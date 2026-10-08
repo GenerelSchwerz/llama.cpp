@@ -16,9 +16,11 @@ struct ggml_moe_profile_bank_statistics {
     uint64_t observations = 0;
     uint64_t payload_bytes = 0;
     uint32_t n_experts = 0;
+    const double * scores = nullptr;
 };
 
 GGML_API bool ggml_moe_source_statistics_valid(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t count);
+GGML_API bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores, uint32_t count);
 GGML_API bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks);
 
 constexpr bool ggml_moe_source_tensor_byte_comparable =

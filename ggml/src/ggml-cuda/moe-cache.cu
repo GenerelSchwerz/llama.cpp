@@ -12350,15 +12350,15 @@ bool ggml_cuda_moe_grouped_context::initialize_profile(
 }
 
 bool ggml_cuda_moe_grouped_context::initialize_statistics(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
-        cudaStream_t stream, uint64_t * copied_bytes, uint32_t flags) {
-    return initialize_placement(nullptr, 0, statistics, n_statistics, stream, copied_bytes, flags);
+        cudaStream_t stream, uint64_t * copied_bytes, uint32_t flags, const double * const * scores) {
+    return initialize_placement(nullptr, 0, statistics, n_statistics, stream, copied_bytes, flags, scores);
 }
 
 bool ggml_cuda_moe_grouped_context::initialize_placement(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
         const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
-        cudaStream_t stream, uint64_t * copied_bytes, uint32_t flags) {
+        cudaStream_t stream, uint64_t * copied_bytes, uint32_t flags, const double * const * scores) {
     if (flags || (!n_profiles && !n_statistics) || (n_profiles && n_statistics) || (n_profiles && !profiles) ||
-            n_profiles > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || !ggml_moe_source_statistics_valid(statistics, n_statistics) ||
+            n_profiles > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || !ggml_moe_source_scores_valid(statistics, scores, n_statistics) ||
             !stream || !copied_bytes || impl_->device < 0) { return false; }
     *copied_bytes = 0;
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -12415,7 +12415,7 @@ bool ggml_cuda_moe_grouped_context::initialize_placement(const ggml_backend_moe_
                 });
                 if (statistic == source->second.end()) { return false; }
                 const auto & value = **statistic;
-                banks.push_back({value.counts, value.observations, resource->info.expert_stride, value.n_experts});
+                banks.push_back({value.counts, value.observations, resource->info.expert_stride, value.n_experts, scores ? scores[size_t(*statistic - statistics)] : nullptr});
             }
             std::vector<int32_t> ranks;
             if (!ggml_moe_source_rank_statistics(banks, ranks) || !impl_->table.n_slots || ranks.size() < impl_->table.n_slots) { return false; }
@@ -20497,6 +20497,16 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::log_and_res
 extern "C"
 void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
+}
+
+extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v2(ggml_backend_t backend,
+        const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores,
+        uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes) {
+    if (!ggml_backend_is_cuda(backend) || !backend->context) { return false; }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!ctx->moe_grouped_context) { return false; }
+    try { return ctx->moe_grouped_context->initialize_statistics(statistics, n_statistics, ctx->stream(), copied_bytes, flags, scores); }
+    catch (...) { return false; }
 }
 
 extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v1(ggml_backend_t backend,

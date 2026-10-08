@@ -780,6 +780,11 @@ struct ggml_backend_moe_source_statistics_v1 {
 typedef bool (*ggml_backend_moe_statistics_initialize_v1_t)(ggml_backend_t backend,
     const struct ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 
+#define GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V2_PROC_NAME "ggml_backend_moe_statistics_initialize_v2"
+typedef bool (*ggml_backend_moe_statistics_initialize_v2_t)(ggml_backend_t backend,
+    const struct ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores,
+    uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
+
 struct ggml_backend_moe_hybrid_config_v1 {
     uint32_t struct_size;
     uint32_t n_threads;
@@ -806,6 +811,7 @@ struct ggml_backend_moe_hybrid_config_v1 {
     const struct ggml_backend_moe_source_statistics_v1 * statistics;
     uint32_t n_statistics;
     uint32_t profile_adaptation; // zero disables, one selects synchronous occurrence adaptation, two selects asynchronous occurrence adaptation
+    const double * const * statistics_scores; // optional derived scores; same source order as statistics
 };
 
 enum ggml_backend_moe_hybrid_executor_v1 {

@@ -424,6 +424,7 @@ struct core_source_statistics {
     uint32_t domain = 0;
     uint64_t observations = 0;
     std::vector<uint64_t> counts;
+    std::vector<double> scores;
 };
 
 struct core_profile_group {
@@ -1118,7 +1119,7 @@ bool core_session::prepare_profiles() {
                 if (statistic == source->second.end() || statistic->counts.size() != geometry.expert_count) { return false; }
                 auto & view = group.statistics[index];
                 if (view.counts && (view.counts != statistic->counts.data() || view.payload_bytes != layer.banks[bank].expert_stride)) { return false; }
-                view = {statistic->counts.data(), statistic->observations, layer.banks[bank].expert_stride, geometry.expert_count};
+                view = {statistic->counts.data(), statistic->observations, layer.banks[bank].expert_stride, geometry.expert_count, statistic->scores.empty() ? nullptr : statistic->scores.data()};
             }
             auto & binding = group.bindings[index];
             if (binding != UINT32_MAX && binding != layer.transport_indices[bank]) { return false; }
@@ -2605,7 +2606,7 @@ static int32_t source_create(const ggml_backend_moe_hybrid_config_v1 * config, v
     session->program_instance = next_instance.fetch_add(1, std::memory_order_relaxed);
     session->config = *config;
     if (config->n_profiles > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || (config->n_profiles && !config->profiles) ||
-            (config->n_profiles && config->n_statistics) || !ggml_moe_source_statistics_valid(config->statistics, config->n_statistics)) {
+            (config->n_profiles && config->n_statistics) || !ggml_moe_source_scores_valid(config->statistics, config->statistics_scores, config->n_statistics)) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
     }
     uint64_t profile_experts = 0;
@@ -2631,9 +2632,11 @@ static int32_t source_create(const ggml_backend_moe_hybrid_config_v1 * config, v
     for (uint32_t i = 0; i < config->n_statistics; ++i) {
         const auto & source = config->statistics[i];
         session->statistics[source.tensor].push_back({source.domain, source.observations,
-            std::vector<uint64_t>(source.counts, source.counts + source.n_experts)});
+            std::vector<uint64_t>(source.counts, source.counts + source.n_experts), config->statistics_scores ?
+                std::vector<double>(config->statistics_scores[i], config->statistics_scores[i] + source.n_experts) : std::vector<double>{}});
     }
     session->config.statistics = nullptr;
+    session->config.statistics_scores = nullptr;
     const auto * diagnostic = getenv("GGML_MOE_SOURCE_REPLAY_DIAGNOSTIC");
     session->replay_diagnostic = diagnostic && strcmp(diagnostic, "0");
     const auto * retain = getenv("GGML_TEST_MOE_RETAIN_ROUTED_OUTPUTS");
