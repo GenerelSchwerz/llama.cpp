@@ -47,7 +47,7 @@ bool ggml_cuda_should_fuse_hc_post_norm_scale(const ggml_tensor * post, const gg
 void ggml_cuda_op_hc_post_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm,
         ggml_tensor * scale, void * f16, void * bf16);
 
-void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, int layout);
+void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, int layout, bool banked = false);
 
 void ggml_cuda_op_hc_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul);
 
@@ -60,6 +60,7 @@ struct ggml_cuda_hc_affine_emit_data {
     int64_t padded = 0;
     int64_t rows = 0;
     int layout = 0;
+    bool banked = false;
 };
 
 void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr, ggml_tensor * scale = nullptr);

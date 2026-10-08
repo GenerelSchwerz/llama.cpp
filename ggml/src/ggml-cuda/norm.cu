@@ -1477,6 +1477,24 @@ struct ggml_cuda_hc_norm_emit_mmq_pair_store {
     }
 };
 
+template <typename Store>
+struct ggml_cuda_hc_norm_banked_pair_store {
+    static constexpr int width = Store::width;
+    Store write;
+    uint3 rows;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float2 value) const {
+        const uint2 rc = fast_div_modulo(uint32_t(dst - base + col), write.cols);
+        const uint2 bank_row = fast_div_modulo(rc.x, rows);
+        const int64_t offset = int64_t(bank_row.x)*write.cols.z*rows.z;
+        Store bank = write;
+        bank.image += int64_t(bank_row.x)*(write.padded/QK8_1_MMQ)*rows.z;
+        if (bank.f16) { bank.f16 += offset; }
+        if (bank.bf16) { bank.bf16 += offset; }
+        bank(dst, base + offset, col, value);
+    }
+};
+
 struct hc_post_norm_data {
     const float * x;
     const float * residual;
@@ -1619,11 +1637,25 @@ static __global__ __launch_bounds__(Block) void hc_post_norm_emit_mmq_f32(hc_pos
         ggml_cuda_hc_norm_emit_mmq_pair_store<Layout, Scale>{(block_q8_1_mmq *) image, cols, padded, rows, f16, bf16, scale});
 }
 
-template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale>
+template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale, int NormLayout>
+static __global__ __launch_bounds__(Block) void hc_post_norm_emit_banked_mmq_f32(hc_post_norm_data a,
+        half * f16, nv_bfloat16 * bf16, void * image, uint3 cols, int64_t padded, uint3 rows, float scale) {
+    hc_post_norm_f32_impl<Block, Comb, Multiply, NormLayout>(a,
+        ggml_cuda_hc_norm_banked_pair_store<ggml_cuda_hc_norm_emit_mmq_pair_store<Layout, Scale>>{
+            {(block_q8_1_mmq *) image, cols, padded, rows.z, f16, bf16, scale}, rows});
+}
+
+template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale, bool Banked = false>
 static auto hc_post_norm_emit_mmq_kernel(int layout) {
-    if (layout == 1) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
-    if (layout == 2) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
-    return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+    if constexpr (Banked) {
+        if (layout == 1) { return hc_post_norm_emit_banked_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
+        if (layout == 2) { return hc_post_norm_emit_banked_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
+        return hc_post_norm_emit_banked_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+    } else {
+        if (layout == 1) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
+        if (layout == 2) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
+        return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+    }
 }
 
 struct ggml_cuda_norm_scale_store {
@@ -2019,7 +2051,7 @@ void ggml_cuda_op_rms_norm_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * no
     }
 }
 
-template <mmq_q8_1_ds_layout Layout>
+template <mmq_q8_1_ds_layout Layout, bool Banked>
 static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * residual = post->src[1];
@@ -2056,24 +2088,37 @@ static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context &
     const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
     const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), 32*sizeof(float), ctx.stream());
     const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    const auto emit = [&](auto kernel, float factor) {
+        if constexpr (Banked) { ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, init_fastdiv_values(rows), factor); }
+        else { ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, factor); }
+    };
     if (scale) {
         auto kernel = block_size == 256
-            ? (comb ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, true>(layout))
-            : (comb ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, true>(layout));
-        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, ggml_get_op_params_f32(scale, 0));
+            ? (comb ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, true, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, true, Banked>(layout))
+            : (comb ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, true, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, true, Banked>(layout));
+        emit(kernel, ggml_get_op_params_f32(scale, 0));
     } else {
         auto kernel = block_size == 256
-            ? (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, false>(layout)))
-            : (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, false>(layout)));
-        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, 1.0f);
+            ? (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, true, false, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, false, Banked>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, false, true, false, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, false, Banked>(layout)))
+            : (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, true, false, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, false, Banked>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, false, true, false, Banked>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, false, Banked>(layout)));
+        emit(kernel, 1.0f);
     }
 }
 
-void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, int layout) {
+void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, int layout, bool banked) {
     switch (layout) {
-        case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
-        case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
-        case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            if (banked) { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4, true>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            else { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4, false>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            if (banked) { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_DS4, true>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            else { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_DS4, false>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            if (banked) { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6, true>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            else { ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6, false>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); }
+            break;
         default: GGML_ABORT("unsupported MMQ image layout");
     }
 }
@@ -2588,7 +2633,10 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         void * bf16 = emit ? emit->bf16 : nullptr;
         if (emit && emit->mmq) {
             const uint3 cols = init_fastdiv_values(emit->cols);
-            const auto launch = [&](auto write) { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write); };
+            const auto launch = [&](auto write) {
+                if (emit->banked) { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, ggml_cuda_hc_norm_banked_pair_store<decltype(write)>{write, init_fastdiv_values(emit->rows)}); }
+                else { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write); }
+            };
             switch (emit->layout) {
                 case MMQ_Q8_1_DS_LAYOUT_D4: launch(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D4, true>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor}); break;
                 case MMQ_Q8_1_DS_LAYOUT_DS4: launch(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_DS4, true>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor}); break;
@@ -2607,7 +2655,10 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         GGML_ASSERT(norm);
         const uint3 cols = init_fastdiv_values(emit->cols);
         if (emit->mmq) {
-            const auto launch_mmq = [&](auto write) { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write); };
+            const auto launch_mmq = [&](auto write) {
+                if (emit->banked) { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, ggml_cuda_hc_norm_banked_pair_store<decltype(write)>{write, init_fastdiv_values(emit->rows)}); }
+                else { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write); }
+            };
             switch (emit->layout) {
                 case MMQ_Q8_1_DS_LAYOUT_D4: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D4, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;
                 case MMQ_Q8_1_DS_LAYOUT_DS4: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_DS4, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;

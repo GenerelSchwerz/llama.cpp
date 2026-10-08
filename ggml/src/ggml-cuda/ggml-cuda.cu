@@ -4319,7 +4319,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if ((match.post && (input->ne[2] != 1 || input->ne[3] != 1)) || keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
+            if (keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
                     norm_group_invalid(node) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }
@@ -7037,10 +7037,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         void * f16 = typed ? image(typed->f16) : nullptr;
                         void * bf16 = typed ? image(typed->bf16) : nullptr;
                         if (affine_emit) {
-                            launch_affine_emit({f16, bf16, nullptr, mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]});
+                            launch_affine_emit({f16, bf16, nullptr, mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader], input->ne[2] != 1 || input->ne[3] != 1});
                         } else {
                             ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
-                                mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                                mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader], input->ne[2] != 1 || input->ne[3] != 1);
                         }
                         i = emit.last;
                         continue;
