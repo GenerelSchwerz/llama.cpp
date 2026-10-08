@@ -22,24 +22,33 @@ Use matching executables and llama/ggml/CUDA libraries from one build. The gener
 Example settings from the qualified single-GPU configuration; choose context, slots, threads and miss split for your model and hardware:
 
 ```sh
-CUDA_MODULE_LOADING=LAZY \
-GGML_MOE_HYBRID=required \
-GGML_MOE_HYBRID_EXECUTOR=source \
-GGML_MOE_SOURCE_GPU_MISS_FRACTION=0.17 \
-GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=1 \
-GGML_MOE_SOURCE_SHARED_OVERLAP=1 \
-./build/bin/llama-server -m model.gguf \
+./build/bin/llama-server -m model.gguf --moe-hybrid on \
   -ngl all -fa on -c 16384 -b 2048 -ub 2048 -np 1 -t 16 \
   --moe-expert-cache-size 64 --moe-expert-cache-host-pinned-mb 0 \
   --load-mode none --lazy-mode on --fit off \
   --decode-overlap --decode-boundary-overlap --ple-prefetch --phase-aware-workspace
 ```
 
-`GGML_MOE_SOURCE_GPU_MISS_FRACTION` is required in source mode and must be finite in [0,1]. It sets the transfer share of distinct cache misses, not a percentage of all model layers or resident experts. It uses the existing 1/256 split resolution. It is a hardware tuning choice, not a learned expert profile. The explicit runtime-allocation setting permits ordinary prepared CPU operators whose allocation freedom has not been proven; backing and completion checks still apply. Host pinning value0 requests automatic registration with the existing bounded staging fallback; it does not guarantee every source is pinned or fit on every machine.
+### Activation and tuning
 
-The old `fidelity` executor plus `reference-conversion` pipeline remains a compatibility activation. The canonical `source` alias selects that same generic provider without requiring research activation names. Do not combine source mode with a different legacy pipeline. Source mode does not change the ordinary executor default.
+| Control | Default and meaning |
+|---|---|
+| `--moe-hybrid on` | Opt into the generic source executor with checked failures. Ordinary execution remains the default; `off` overrides inherited hybrid activation. |
+| `--moe-gpu-miss-fraction F` | Optional hardware tuning, default 0.17, finite in [0,1]. Fraction of distinct cache misses transferred to GPU, at 1/256 resolution; resident hits already use GPU. |
+| Shared GPU overlap | Enabled for source execution. Move independent operations ahead of expert completion only when dependencies permit. |
+| CPU runtime allocation permission | Enabled for source execution, including OpenMP runtime behavior. It is not a RAM/VRAM limit; backing, capacity and completion checks still apply. |
+
+No hybrid environment variables are required. Host pinning value 0 requests automatic registration with bounded staging fallback; it does not guarantee every source is pinned or fits every machine. Choose cache capacity and loading mode for the available memory.
+
+Configuration is selected at process startup, before model/context preparation; the split is shared by contexts in that process. In a `models.ini` preset, use `moe-hybrid = on` and optionally `moe-gpu-miss-fraction = 0.17`. Target and auxiliary contexts retain their existing eligibility checks.
+
+Legacy environment activation remains supported. `GGML_MOE_HYBRID=required` defaults to the source executor; explicit older executor selection remains available. CLI activation and miss fraction override their legacy environment settings. The older `fidelity` plus `reference-conversion` activation remains compatible; do not combine source mode with a different legacy pipeline.
+
+Advanced `GGML_MOE_SOURCE_SHARED_OVERLAP=0` disables shared overlap. `GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=0` requests strict allocation-free CPU admission, which can reject OpenMP/NUMA builds. Both overrides accept only 0 or 1; these are optional diagnostic controls.
 
 Look for `provider=source-core`, complete copy/GPU/CPU/publication counts and zero failures in the server log. A flag alone does not prove effective execution.
+
+[CUDA 12.3+](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/lazy-loading.html) normally enables CUDA module lazy loading by default. On older compatible installations, `CUDA_MODULE_LOADING=LAZY` can request it explicitly. This is independent of the `--lazy-mode on` model-loading option.
 
 ## MTP and graph reuse
 
@@ -61,22 +70,59 @@ Keep three decisions separate:
 | Hardware budget and miss split | Cache budget/slots, CPU threads and GPU miss fraction |
 | Online residency adaptation | `--moe-profile-adapt off`, `occurrence` or `occurrence-sync` |
 
-The bounded diagnostic collector uses logical source accesses for raw and fused expert bodies. It does not need numerical projection outputs or a standalone executor. Example collection:
+### Generate a weighted corpus profile
 
-```sh
-GGML_MOE_HYBRID=required \
-GGML_MOE_HYBRID_EXECUTOR=source \
-GGML_MOE_SOURCE_GPU_MISS_FRACTION=0.17 \
-GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=1 \
-GGML_TEST_MOE_PROFILE_EXPORT=calibration.gguf \
-./build/bin/test-llama-archs --test-moe-replay model.gguf \
-  --replay-reference calibration.bin --replay-prompt-file calibration.txt \
-  --replay-rows 256 --replay-split calibration --replay-cache-slots 64 --replay-load-mode none
+Use the in-tree collector; no Python package or separate repository is required. Build `test-llama-archs` with the matching engine libraries. This example gives general and coding requests equal workload weight, independently of their output lengths:
+
+```json
+{
+  "version": 1,
+  "weights": {"general": 0.5, "code": 0.5},
+  "requests": [
+    {"family": "general", "prompt_file": "general.txt", "max_tokens": 256},
+    {"family": "code", "prompt_file": "code.txt", "max_tokens": 256}
+  ]
+}
 ```
 
-Use new output paths. The collector also writes a routing JSONL sidecar with caller/source identity. Prompt text is bounded to64KiB/4096 tokens and continuation to4096 rows. This diagnostic uses a fixed number of rows, including past EOG; production serving respects EOS normally. Collection covers post-prefill decode source accesses, not prefill, drafts, MTP acceptance or representative held-out quality. Its corpus split label records provenance, not a quality guarantee.
+Save this as `corpus.json`. Prompt file paths are relative to that file. Each request accepts either `prompt_file` or inline `prompt`. Use raw model input, including its chat template if required. Use representative calibration prompts and separate held-out prompts for evaluation.
 
-Load the model-bound statistics with `--moe-expert-profile calibration.gguf`. Default adaptation is off; add `--moe-profile-adapt occurrence` for the asynchronous occurrence policy or `occurrence-sync` for its synchronous control. Ranked STRP input remains supported when its geometry matches. Source identity, counts, types and complete bank coverage are checked before use. A separately loaded draft can use `--spec-draft-moe-expert-profile` and `--spec-draft-moe-profile-adapt`; target and draft configurations are independent.
+```sh
+./build/bin/test-llama-archs --collect-moe-profile model.gguf \
+  --profile-corpus corpus.json --profile-output calibration.gguf \
+  --profile-threads 16 --replay-cache-slots 64 --replay-load-mode none
+```
+
+The collector automatically enables generic hybrid execution; no activation environment or `--moe-hybrid` flag is needed. It accepts the same optional `--moe-gpu-miss-fraction F` tuning flag. Unset `GGML_MOE_EXPERT_PROFILE` for fresh collection. Choose slots, threads and miss fraction for your hardware; they are not properties learned into the profile. Collection loads one model and uses a fresh context for each serial request. Greedy generation stops at EOG or its requested limit. A request that ends before any observed decode row fails explicitly; the collector does not continue past EOG to invent observations.
+
+The score for each original source/expert is:
+
+```text
+request rate = measured expert count / actual target decode rows
+workload rate = mean(request rates in that workload)
+score = sum(normalized workload weight * workload rate)
+```
+
+This reproduces the normalized workload-mixture method. It does not give longer requests more weight. Raw counts remain separate from scores. Cache groups combine complete-bank scores using their existing expert payload-byte weights; equal scores prefer the lower expert ID. Profile generation does not encode a fixed cache size, PCIe split or model architecture.
+
+The profile is metadata-only GGUF version 2 with optional source-indexed F64 `moe.profile.ranking_scores`. Raw version 1 profiles remain readable. The adjacent `calibration.gguf.calibration/` directory records the corpus, per-request raw GGUF counts, routing JSONL, emitted token IDs, actual decode rows, stop reasons, hashes and `REPORT.json`. Prompt file contents are identified by hash; keep the original files to reproduce collection. The final profile appears only after all requests finish and the codec roundtrip succeeds. Use fresh output paths.
+
+Bounds: 128 requests, 32 workload labels, an 8 MiB corpus file, 64 KiB/4096 tokens per prompt, 2..4096 requested output tokens and 64 MiB of workload-rate storage. Routing evidence is capped at 256 MiB per request; exceeding a bound aborts collection without publishing a final profile. Collection covers target decode logical accesses for raw and fused expert bodies, including all CPU/GPU ownership classes. Prefill, draft/MTP accesses and acceptance are excluded. The first token sampled from prefill has no decode row; the denominator counts actual subsequent target decode calls. Different hardware/placement can change greedy continuations. This method alone establishes neither held-out quality nor a speed gain for every model.
+
+The older fixed-row diagnostic remains available through `--test-moe-replay` and `GGML_TEST_MOE_PROFILE_EXPORT`. It can continue past EOG and should not replace natural-EOG corpus calibration.
+
+### Load a profile and enable adaptation
+
+```sh
+./build/bin/llama-server -m model.gguf --moe-hybrid on \
+  -ngl all -fa on -c 16384 -b 2048 -ub 2048 -np 1 -t 16 \
+  --moe-expert-cache-size 64 --moe-expert-cache-host-pinned-mb 0 \
+  --moe-expert-profile calibration.gguf --moe-profile-adapt occurrence \
+  --load-mode none --lazy-mode on --fit off \
+  --decode-overlap --decode-boundary-overlap --ple-prefetch --phase-aware-workspace
+```
+
+Load the model-bound statistics with `--moe-expert-profile calibration.gguf`. Default adaptation is off; add `--moe-profile-adapt occurrence` for the asynchronous occurrence policy or `occurrence-sync` for its synchronous control. Ranked STRP input remains supported when its geometry matches. Source names/domains, counts, types, shapes and complete bank coverage are checked before use. Binding does not fingerprint weight contents; regenerate or reevaluate profiles when model weights or quantization change. A separately loaded draft can use `--spec-draft-moe-expert-profile` and `--spec-draft-moe-profile-adapt`; target and draft configurations are independent.
 
 Observers are private test hooks. Without an observer, the runtime skips source-access enumeration. Profile loading uses the canonical residency owner; it does not create a second expert cache.
 

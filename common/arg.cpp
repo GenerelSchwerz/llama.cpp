@@ -363,6 +363,9 @@ static std::vector<size_t> parse_moe_cache_byte_budgets(const std::string & valu
 }
 
 static void validate_moe_cache_arguments(const common_params & params) {
+    if (!params.moe_profile_save.empty() && (params.moe_hybrid != "on" || params.moe_profile_adaptation == "off")) {
+        throw std::invalid_argument("--moe-profile-save requires --moe-hybrid on and occurrence or occurrence-sync adaptation");
+    }
     if (params.moe_expert_profile.empty() && params.moe_profile_adaptation != "off") {
         throw std::invalid_argument("--moe-profile-adapt requires --moe-expert-profile");
     }
@@ -2995,6 +2998,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
     add_opt(common_arg(
+        {"--moe-hybrid"}, "on|off",
+        "generic CPU/GPU MoE execution with checked failures (default: off); on selects the source executor",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") { throw std::invalid_argument("--moe-hybrid must be on or off"); }
+            params.moe_hybrid = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID"));
+    add_opt(common_arg(
+        {"--moe-gpu-miss-fraction"}, "F",
+        "fraction of distinct hybrid expert cache misses transferred to GPU, in [0,1] (default: 0.17); resident hits use GPU",
+        [](common_params & params, const std::string & value) {
+            size_t parsed = 0;
+            double fraction;
+            try { fraction = std::stod(value, &parsed); }
+            catch (const std::exception &) { throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]"); }
+            if (parsed != value.size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1) {
+                throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
+            }
+            params.moe_gpu_miss_fraction = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION"));
+    add_opt(common_arg(
         {"--moe-profile-adapt"}, "MODE",
         "profile adaptation: off, occurrence or occurrence-sync (default: off)",
         [](common_params & params, const std::string & value) {
@@ -3002,6 +3027,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_profile_adaptation = value;
         }
     ).set_env("LLAMA_ARG_MOE_PROFILE_ADAPT"));
+    add_opt(common_arg(
+        {"--moe-profile-save"}, "FILE",
+        "save learned full-model profile at safe boundaries and normal shutdown (default: disabled); requires hybrid occurrence adaptation",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) { throw std::invalid_argument("profile save path cannot be empty"); }
+            params.moe_profile_save = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--moe-profile-save-interval"}, "SECONDS",
+        "minimum time between safe-boundary learned profile save attempts, 0 = normal shutdown only (default: 60); server saves only when all slots are idle",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 86400) { throw std::invalid_argument("profile save interval must be in [0,86400]"); }
+            params.moe_profile_save_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--moe-expert-cache-layers"}, "N[,N-M,...]",
         "select the MoE expert layers eligible for caching; absent means all matching expert tensors",

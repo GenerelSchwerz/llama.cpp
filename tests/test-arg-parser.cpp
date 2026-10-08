@@ -223,6 +223,68 @@ static void test(void) {
     assert(params.n_batch == 9090);
 
     params = common_params();
+    for (const char * value : {"on", "off"}) {
+        argv = {"binary_name", "--moe-hybrid", value};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(params.moe_hybrid == value);
+    }
+    argv = {"binary_name", "--moe-hybrid", "required"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    for (const char * value : {"0", "0.17", "0.5", "1"}) {
+        argv = {"binary_name", "--moe-gpu-miss-fraction", value};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(params.moe_gpu_miss_fraction == value);
+    }
+    for (const char * value : {"", "nan", "inf", "-inf", "-0.1", "1.1", "0.17junk", "1e9999"}) {
+        argv = {"binary_name", "--moe-gpu-miss-fraction", value};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+    {
+        const std::string saved_mode = common_get_env("LLAMA_ARG_MOE_HYBRID");
+        const std::string saved_fraction = common_get_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION");
+        set_test_env("LLAMA_ARG_MOE_HYBRID", "on");
+        set_test_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION", "0.25");
+        params = common_params();
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(params.moe_hybrid == "on" && params.moe_gpu_miss_fraction == "0.25");
+        argv = {"binary_name", "--moe-hybrid", "off", "--moe-gpu-miss-fraction", "0.75"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(params.moe_hybrid == "off" && params.moe_gpu_miss_fraction == "0.75");
+        common_set_env("LLAMA_ARG_MOE_HYBRID", saved_mode);
+        common_set_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION", saved_fraction);
+    }
+    {
+        const char * names[] = {"GGML_MOE_HYBRID", "GGML_MOE_HYBRID_EXECUTOR", "GGML_MOE_SOURCE_GPU_MISS_FRACTION"};
+        std::vector<std::string> saved;
+        std::vector<bool> present;
+        for (const auto * name : names) {
+            const auto * value = getenv(name);
+            present.push_back(value != nullptr);
+            saved.emplace_back(value ? value : "");
+        }
+        common_params hybrid;
+        set_test_env(names[0], "off");
+        set_test_env(names[1], "eager");
+        set_test_env(names[2], "0.75");
+        common_moe_hybrid_configure(hybrid);
+        assert(std::string(getenv(names[0])) == "off");
+        assert(std::string(getenv(names[1])) == "eager");
+        hybrid.moe_hybrid = "on";
+        hybrid.moe_gpu_miss_fraction = "0.5";
+        common_moe_hybrid_configure(hybrid);
+        assert(std::string(getenv(names[0])) == "required");
+        assert(std::string(getenv(names[1])) == "source");
+        assert(std::string(getenv(names[2])) == "0.5");
+        hybrid.moe_hybrid = "off";
+        common_moe_hybrid_configure(hybrid);
+        assert(std::string(getenv(names[0])) == "off");
+        for (size_t i = 0; i < saved.size(); ++i) {
+            if (present[i]) { set_test_env(names[i], saved[i].c_str()); }
+            else { unset_test_env(names[i]); }
+        }
+    }
+    params = common_params();
     argv = {"binary_name", "--moe-expert-profile", "target.gguf", "--moe-profile-adapt", "occurrence",
         "--spec-draft-moe-expert-profile", "draft.gguf", "--spec-draft-moe-profile-adapt", "occurrence-sync", "-md", "model.gguf"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
@@ -245,6 +307,33 @@ static void test(void) {
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
         argv = {"binary_name", option, "occurrence"};
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+    for (const auto example : {LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}) {
+        for (const char * adaptation : {"occurrence", "occurrence-sync"}) {
+            params = common_params();
+            argv = {"binary_name", "-m", "model_file.gguf", "--moe-hybrid", "on", "--moe-expert-profile", "calibration.gguf",
+                    "--moe-profile-adapt", adaptation, "--moe-profile-save", "learned.gguf", "--moe-profile-save-interval", "0"};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, example));
+            assert(params.moe_profile_save == "learned.gguf" && params.moe_profile_save_interval == 0);
+            assert(common_base_params_to_speculative(params).moe_profile_save.empty());
+        }
+        for (const char * hybrid : {"on", "off"}) {
+            params = common_params();
+            argv = {"binary_name", "-m", "model_file.gguf", "--moe-hybrid", hybrid, "--moe-profile-save", "learned.gguf"};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, example));
+        }
+        for (const char * interval : {"-1", "86401", "invalid"}) {
+            params = common_params();
+            argv = {"binary_name", "-m", "model_file.gguf", "--moe-profile-save-interval", interval};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, example));
+        }
+        params = common_params();
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-hybrid", "off", "--moe-expert-profile", "calibration.gguf",
+                "--moe-profile-adapt", "occurrence", "--moe-profile-save", "learned.gguf"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, example));
+        params = common_params();
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-profile-save", ""};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, example));
     }
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report"};

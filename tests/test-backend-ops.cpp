@@ -14033,6 +14033,9 @@ static int test_moe_cpu_region_proc() {
     GGML_ASSERT(service_api != nullptr && service_api->abi_version == 1 && service_api->struct_size == sizeof(*service_api));
     GGML_ASSERT(service_api->execute != nullptr && service_api->state != nullptr &&
                 service_api->cancel != nullptr && service_api->drain != nullptr);
+    const auto controlled_execute = reinterpret_cast<ggml_backend_moe_cpu_controlled_execute_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CPU_CONTROLLED_EXECUTE_V1_PROC_NAME));
+    GGML_ASSERT(controlled_execute != nullptr);
 
     test_moe_source_owner_state owner_state;
     ggml_backend_moe_source_owner_v1 owner = {};
@@ -14057,7 +14060,7 @@ static int test_moe_cpu_region_proc() {
                    GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNPROVEN_RUNTIME_ALLOCATIONS;
     config.max_regions = UINT32_MAX;
     GGML_ASSERT(service_api->create(&config, &service) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY);
-    config.max_regions = 1;
+    config.max_regions = 2;
     config.prepared_payload_limit = 32 * 1024 * 1024;
     config.flags = GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNKNOWN_THREAD_STACK_BYTES;
     const int32_t qualified_create = service_api->create(&config, &service);
@@ -14192,6 +14195,137 @@ static int test_moe_cpu_region_proc() {
         GGML_ASSERT(memcmp(output.data(), reference_output.data(), sizeof(output)) == 0);
     }
     GGML_ASSERT(ggml_allocation_count() == execute_allocations);
+    ggml_backend_moe_cpu_execute_control_v1 control = {};
+    control.struct_size = sizeof(control);
+    control.abi_version = 1;
+    for (uint32_t variant = 0; variant < 7; ++variant) {
+        auto invalid = control;
+        if (variant == 1) { --invalid.struct_size; }
+        if (variant == 2) { ++invalid.abi_version; }
+        if (variant == 3) { invalid.flags = 1; }
+        if (variant == 4) { invalid.reserved32 = 1; }
+        if (variant == 5) { invalid.reserved[0] = 1; }
+        if (variant == 6) { invalid.reserved[1] = 1; }
+        output.fill(NAN);
+        execute_result = {}; execute_result.struct_size = sizeof(execute_result);
+        GGML_ASSERT(controlled_execute(service, region, &execution, nullptr, 0, variant ? &invalid : nullptr, &execute_result) ==
+                    GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT);
+        GGML_ASSERT(execute_result.flags == 0);
+        for (const auto value : output) { GGML_ASSERT(std::isnan(value)); }
+    }
+    GGML_ASSERT(service_api->cancel(service, execution.epoch) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+    for (const uint32_t cancel_phase : {GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_ADMITTED,
+            GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_BEFORE_COMMIT, GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_AFTER_COMMIT}) {
+        struct request {
+            std::atomic<bool> canceled{false};
+            std::atomic<uint32_t> phases{0};
+            std::mutex mutex;
+            std::condition_variable changed;
+            uint32_t hold_phase;
+            bool entered = false, released = false;
+            int32_t status = GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_COMPUTE_FAILED;
+            std::array<float, n_embd> output;
+            ggml_backend_moe_cpu_execute_result_v1 result = {};
+        } requests[2];
+        std::array<std::thread, 2> callers;
+        requests[0].hold_phase = GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_ADMITTED;
+        requests[1].hold_phase = cancel_phase;
+        for (uint32_t i = 0; i < 2; ++i) {
+            requests[i].output.fill(NAN);
+            requests[i].result.struct_size = sizeof(requests[i].result);
+            callers[i] = std::thread([&, i] {
+                auto scoped = control;
+                scoped.abort = +[](void * data) { return static_cast<request *>(data)->canceled.load(std::memory_order_acquire); };
+                scoped.abort_data = &requests[i];
+                scoped.hook = +[](void * data, uint32_t phase) {
+                    auto & current = *static_cast<request *>(data);
+                    current.phases.fetch_or(1u << phase, std::memory_order_relaxed);
+                    if (phase != current.hold_phase) { return; }
+                    std::unique_lock<std::mutex> lock(current.mutex);
+                    current.entered = true; current.changed.notify_all();
+                    GGML_ASSERT(current.changed.wait_for(lock, std::chrono::seconds(20), [&] { return current.released; }));
+                };
+                scoped.hook_data = &requests[i];
+                auto call = execution;
+                call.epoch = i + 1;
+                auto destination = output_binding;
+                destination.data = requests[i].output.data();
+                call.outputs = &destination;
+                requests[i].status = controlled_execute(service, region, &call, nullptr, 0, &scoped, &requests[i].result);
+            });
+            std::unique_lock<std::mutex> lock(requests[i].mutex);
+            GGML_ASSERT(requests[i].changed.wait_for(lock, std::chrono::seconds(20), [&] { return requests[i].entered; }));
+        }
+        ggml_backend_moe_cpu_service_state_v1 busy = {}; busy.struct_size = sizeof(busy);
+        GGML_ASSERT(service_api->state(service, &busy) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && busy.active_jobs == 2);
+        GGML_ASSERT(service_api->destroy_region(service, &region) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_ACTIVE_JOBS);
+        execute_result = {}; execute_result.struct_size = sizeof(execute_result);
+        GGML_ASSERT(controlled_execute(service, region, &execution, nullptr, 0, &control, &execute_result) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY);
+        requests[1].canceled.store(true, std::memory_order_release);
+        for (auto & current : requests) {
+            std::lock_guard<std::mutex> lock(current.mutex);
+            current.released = true; current.changed.notify_all();
+        }
+        for (auto & caller : callers) { caller.join(); }
+        GGML_ASSERT(requests[0].status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+        GGML_ASSERT(memcmp(requests[0].output.data(), reference_output.data(), sizeof(reference_output)) == 0);
+        GGML_ASSERT(requests[0].result.epoch == 1 && requests[0].result.flags == GGML_BACKEND_MOE_CPU_EXECUTE_RESULT_FLAG_V1_PUBLISHED);
+        const bool published = cancel_phase == GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_AFTER_COMMIT;
+        GGML_ASSERT(requests[1].status == (published ? GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK : GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED));
+        if (published) { GGML_ASSERT(memcmp(requests[1].output.data(), reference_output.data(), sizeof(reference_output)) == 0); }
+        else { for (const auto value : requests[1].output) { GGML_ASSERT(std::isnan(value)); } }
+        GGML_ASSERT(requests[1].result.flags == (published ? GGML_BACKEND_MOE_CPU_EXECUTE_RESULT_FLAG_V1_PUBLISHED : 0));
+        GGML_ASSERT(requests[0].phases.load() == ((1u << GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_ADMITTED) |
+                    (1u << GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_BEFORE_COMMIT) | (1u << GGML_BACKEND_MOE_CPU_TEST_PHASE_V1_AFTER_COMMIT)));
+        GGML_ASSERT(requests[1].phases.load() & (1u << cancel_phase));
+    }
+    output.fill(NAN);
+    execute_result = {}; execute_result.struct_size = sizeof(execute_result);
+    GGML_ASSERT(service_api->execute(service, region, &execution, &execute_result) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED);
+    GGML_ASSERT(execute_result.flags == 0);
+    for (const auto value : output) { GGML_ASSERT(std::isnan(value)); }
+    auto * routed_graph = ggml_new_graph_custom(ctx.get(), 4, false);
+    ggml_graph_add_node(routed_graph, gate_up);
+    routed_graph->uid = ggml_graph_next_uid();
+    const ggml_tensor * routed_nodes[] = {gate_up};
+    const ggml_tensor * routed_outputs[] = {gate_up};
+    auto routed_query = query;
+    routed_query.flags = GGML_BACKEND_MOE_CPU_REGION_FLAG_V1_ROUTED_OPERATION;
+    routed_query.graph = routed_graph; routed_query.graph_uid = routed_graph->uid;
+    routed_query.body_nodes = routed_nodes; routed_query.n_body_nodes = 1;
+    routed_query.live_outputs = routed_outputs; routed_query.n_live_outputs = 1;
+    routed_query.n_sources = 1;
+    ggml_backend_moe_cpu_prepared_requirements_v1 routed_requirements = {};
+    routed_requirements.struct_size = sizeof(routed_requirements); routed_requirements.abi_version = 1;
+    ggml_backend_moe_cpu_prepared_region_v1_t routed_region = 0;
+    GGML_ASSERT(service_api->prepare(service, &routed_query, &routed_requirements, &routed_region) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+    std::array<float, 2 * n_ff> routed_reference, routed_output;
+    memcpy(routed_reference.data(), gate_up->data, sizeof(routed_reference));
+    auto routed_execution = execution;
+    routed_execution.graph_uid = routed_graph->uid;
+    ggml_backend_moe_cpu_output_v1 routed_destination = {routed_output.data(), sizeof(routed_output), sizeof(routed_output)};
+    routed_execution.outputs = &routed_destination;
+    std::atomic<bool> cancel_routed{false};
+    auto routed_control = control;
+    routed_control.abort = +[](void * data) { return static_cast<std::atomic<bool> *>(data)->load(std::memory_order_acquire); };
+    routed_control.abort_data = &cancel_routed;
+    for (uint32_t variant = 0; variant < 4; ++variant) {
+        const uint8_t ownership = variant ? 1 : 0;
+        cancel_routed.store(variant == 2, std::memory_order_release);
+        routed_output.fill(NAN);
+        execute_result = {}; execute_result.struct_size = sizeof(execute_result);
+        const auto status = controlled_execute(service, routed_region, &routed_execution, &ownership, 1, &routed_control, &execute_result);
+        GGML_ASSERT(status == (variant == 2 ? GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED : GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK));
+        if (variant == 1 || variant == 3) {
+            GGML_ASSERT(execute_result.published_routes == 1 && memcmp(routed_output.data(), routed_reference.data(), sizeof(routed_output)) == 0);
+        } else {
+            GGML_ASSERT(execute_result.published_routes == 0);
+            for (const auto value : routed_output) { GGML_ASSERT(std::isnan(value)); }
+        }
+    }
+    GGML_ASSERT(service_api->destroy_region(service, &routed_region) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+    fprintf(stderr, "MoE CPU controlled routed execution:4 ownership/cancellation/reuse cases, exact owned output and skipped sentinel OK\n");
+    fprintf(stderr, "MoE CPU controlled execution:7 invalid controls,3 paired admission/commit cancellation cases, exact unaffected output and legacy watermark OK\n");
     struct admission_barrier {
         std::mutex mutex;
         std::condition_variable changed;
@@ -14210,8 +14344,8 @@ static int test_moe_cpu_region_proc() {
     };
     GGML_ASSERT(service_api->set_test_hook(service, hold_admission, &barrier) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
     std::array<std::thread, 2> workers;
-    for (auto & worker : workers) {
-        worker = std::thread([&, worker_service = service, worker_region = region] {
+    for (size_t i = 0; i < workers.size(); ++i) {
+        workers[i] = std::thread([&, scoped = i == 0, worker_service = service, worker_region = region] {
             auto worker_execution = execution;
             std::array<float, n_embd> worker_output;
             worker_output.fill(NAN);
@@ -14220,8 +14354,11 @@ static int test_moe_cpu_region_proc() {
             worker_execution.outputs = &destination;
             ggml_backend_moe_cpu_execute_result_v1 result = {};
             result.struct_size = sizeof(result);
-            GGML_ASSERT(service_api->execute(worker_service, worker_region, &worker_execution, &result) ==
-                        GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED);
+            auto request_control = control;
+            request_control.hook = hold_admission; request_control.hook_data = &barrier;
+            const auto status = scoped ? controlled_execute(worker_service, worker_region, &worker_execution, nullptr, 0, &request_control, &result) :
+                service_api->execute(worker_service, worker_region, &worker_execution, &result);
+            GGML_ASSERT(status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED);
             GGML_ASSERT(result.flags == 0);
             for (float value : worker_output) {
                 GGML_ASSERT(std::isnan(value));
@@ -14260,6 +14397,7 @@ static int test_moe_cpu_region_proc() {
     GGML_ASSERT(service_api->drain(service) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
     GGML_ASSERT(service_api->state(service, &state) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
     GGML_ASSERT(state.closed == 1 && state.active_jobs == 0 && state.active_regions == 1);
+    fprintf(stderr, "MoE CPU controlled execution:mixed scoped/legacy close drains both calls without publication OK\n");
     GGML_ASSERT(service_api->set_test_hook(service, nullptr, nullptr) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
     GGML_ASSERT(service_api->destroy_region(service, &region) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
     GGML_ASSERT(service_api->close(service) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);

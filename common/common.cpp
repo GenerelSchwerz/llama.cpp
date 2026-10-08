@@ -48,6 +48,9 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -937,6 +940,78 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
     }
 }
 
+class common_moe_profile_file_lock {
+public:
+    explicit common_moe_profile_file_lock(const std::filesystem::path & path) {
+#if defined(_WIN32)
+        handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &position) != 0;
+        }
+#else
+        int flags = O_CREAT | O_RDWR | O_NONBLOCK;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        descriptor = open(path.c_str(), flags, 0600);
+        struct stat info = {};
+        if (descriptor >= 0 && fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode)) { locked = flock(descriptor, LOCK_EX | LOCK_NB) == 0; }
+#endif
+    }
+    ~common_moe_profile_file_lock() {
+#if defined(_WIN32)
+        if (locked) { (void) UnlockFileEx(handle, 0, 1, 0, &position); }
+        if (handle != INVALID_HANDLE_VALUE) { (void) CloseHandle(handle); }
+#else
+        if (descriptor >= 0) { (void) close(descriptor); }
+#endif
+    }
+    common_moe_profile_file_lock(const common_moe_profile_file_lock &) = delete;
+    common_moe_profile_file_lock & operator=(const common_moe_profile_file_lock &) = delete;
+    bool acquired() const { return locked; }
+private:
+    bool locked = false;
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    OVERLAPPED position = {};
+#else
+    int descriptor = -1;
+#endif
+};
+
+bool common_moe_profile_write(const std::filesystem::path & path, const uint8_t * data, size_t size) {
+    if (path.empty() || !data || size < 24 || size > 256 * 1024 * 1024 || std::memcmp(data, "GGUF", 4)) { return false; }
+    try {
+        std::error_code error;
+        if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path(), error); }
+        if (error) { return false; }
+        auto lock_path = path; lock_path += ".lock";
+        common_moe_profile_file_lock writer(lock_path);
+        if (!writer.acquired()) { return false; }
+        fs_write_atomic(path, std::string(reinterpret_cast<const char *>(data), size));
+        return true;
+    } catch (...) { return false; }
+}
+
+bool common_moe_profile_save(llama_context * ctx, const std::filesystem::path & path, uint32_t timeout_ms) {
+    try { return common_moe_profile_save(std::vector<llama_context *>{ctx}, path, timeout_ms); }
+    catch (...) { return false; }
+}
+
+bool common_moe_profile_save(const std::vector<llama_context *> & contexts, const std::filesystem::path & path, uint32_t timeout_ms) {
+    if (contexts.empty() || path.empty()) { return false; }
+    try {
+        auto destination = path;
+        return llama_moe_profile_snapshot_contexts(contexts.data(), contexts.size(), timeout_ms, [](const uint8_t * data, size_t size, void * user_data) {
+            return common_moe_profile_write(*static_cast<const std::filesystem::path *>(user_data), data, size);
+        }, &destination);
+    } catch (...) { return false; }
+}
+
 bool fs_is_directory(const std::string & path) {
     std::filesystem::path dir(path);
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
@@ -957,6 +1032,29 @@ void common_set_env(const std::string & name, const std::string & value) {
         setenv(name.c_str(), value.c_str(), 1);
     }
 #endif
+}
+
+void common_moe_hybrid_configure(const common_params & params) {
+    if (!params.moe_hybrid.empty() && params.moe_hybrid != "on" && params.moe_hybrid != "off") {
+        throw std::invalid_argument("--moe-hybrid must be on or off");
+    }
+    if (!params.moe_gpu_miss_fraction.empty()) {
+        size_t parsed = 0;
+        double fraction;
+        try { fraction = std::stod(params.moe_gpu_miss_fraction, &parsed); }
+        catch (const std::exception &) { throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]"); }
+        if (parsed != params.moe_gpu_miss_fraction.size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1) {
+            throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
+        }
+    }
+    // Configure the existing process selection before model/context preparation.
+    if (!params.moe_hybrid.empty()) {
+        common_set_env("GGML_MOE_HYBRID", params.moe_hybrid == "on" ? "required" : "off");
+        if (params.moe_hybrid == "on") { common_set_env("GGML_MOE_HYBRID_EXECUTOR", "source"); }
+    }
+    if (!params.moe_gpu_miss_fraction.empty()) {
+        common_set_env("GGML_MOE_SOURCE_GPU_MISS_FRACTION", params.moe_gpu_miss_fraction);
+    }
 }
 
 std::filesystem::path common_get_path_from_env(const std::string & name) {
@@ -1218,6 +1316,10 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    std::filesystem::path profile_save_path;
+    int64_t profile_save_interval_us = 0;
+    int64_t profile_save_attempt_us = 0;
 };
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1351,6 +1453,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+    if (!params.moe_profile_save.empty()) {
+        pimpl->profile_save_path = std::filesystem::u8path(params.moe_profile_save);
+        pimpl->profile_save_interval_us = int64_t(params.moe_profile_save_interval) * 1'000'000;
+        pimpl->profile_save_attempt_us = ggml_time_us();
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1374,11 +1481,33 @@ void common_init_result::reset_samplers() {
     }
 }
 
+bool common_init_result::save_moe_profile(bool force, llama_context * auxiliary) {
+    if (pimpl->profile_save_path.empty() || !pimpl->context) { return true; }
+    const int64_t now = ggml_time_us();
+    if (!force && (!pimpl->profile_save_interval_us || now - pimpl->profile_save_attempt_us < pimpl->profile_save_interval_us)) {
+        return true;
+    }
+    pimpl->profile_save_attempt_us = now;
+    bool saved = false;
+    try {
+        std::vector<llama_context *> contexts{pimpl->context.get()};
+        if (auxiliary && auxiliary != contexts.front() && llama_get_model(auxiliary) == llama_get_model(contexts.front())) { contexts.push_back(auxiliary); }
+        saved = common_moe_profile_save(contexts, pimpl->profile_save_path, force ? 5000 : 100);
+    } catch (...) { saved = false; }
+    if (!saved) {
+        COM_WRN("%s: learned profile save deferred or failed; previous file retained\n", __func__);
+        return false;
+    }
+    COM_INF("%s: learned full-model profile saved\n", __func__);
+    return true;
+}
+
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_moe_hybrid_configure(params);
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

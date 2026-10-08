@@ -117,6 +117,11 @@ struct llama_moe_profile_source_statistics {
     uint32_t domain = 0;
     uint64_t observations = 0;
     std::vector<uint64_t> counts;
+    std::vector<double> scores = {};
+    std::vector<double> heat = {};
+    std::vector<float> usage = {};
+    std::vector<int32_t> prior = {};
+    uint64_t windows = 0;
 };
 
 struct llama_moe_profile_statistics {
@@ -126,6 +131,14 @@ struct llama_moe_profile_statistics {
 
 llama_moe_profile_statistics llama_moe_profile_statistics_parse(
         const uint8_t * data, size_t bytes, const std::vector<llama_moe_source_group> & sources);
+
+std::vector<uint8_t> llama_moe_profile_statistics_serialize(
+        const llama_moe_profile_statistics & statistics, const std::vector<llama_moe_source_group> & sources);
+
+llama_moe_profile_statistics llama_moe_profile_learning_baseline(const std::vector<llama_moe_source_group> & sources,
+        const llama_moe_profile_statistics & initial, const std::vector<ggml_backend_moe_static_profile_v1> & profiles);
+bool llama_moe_profile_learning_overlay(llama_moe_profile_statistics & snapshot, std::vector<uint8_t> & covered,
+        const ggml_backend_moe_source_learning_v1 * records, uint32_t count);
 
 struct llama_context {
     struct sched_reserve_plan {
@@ -372,9 +385,12 @@ private:
 public:
     bool initialize_moe_profile();
     bool initialize_moe_profile(const std::vector<ggml_backend_moe_static_profile_v1> & profiles);
-    bool initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics);
+    bool initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr);
+    bool restore_moe_learning();
+    bool snapshot_moe_learning(std::vector<uint8_t> & bytes, uint32_t timeout_ms);
+    static bool snapshot_moe_learning_contexts(const std::vector<llama_context *> & contexts, std::vector<uint8_t> & bytes, uint32_t timeout_ms);
     bool initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
-        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics);
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr);
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -569,9 +585,11 @@ private:
     std::vector<ggml_backend_moe_static_profile_v1> moe_profiles;
     llama_moe_profile_statistics moe_profile_statistics;
     std::vector<ggml_backend_moe_source_statistics_v1> moe_statistics;
+    std::vector<const double *> moe_statistics_scores;
     bool moe_profile_failed = false;
     uint32_t moe_hybrid_profile_adapt = 0;
     bool moe_hybrid_required = false;
+    bool moe_hybrid_allow_runtime_allocations = false;
     bool moe_source_graph_capacity = false;
     std::atomic<bool> moe_source_poisoned{false};
     std::atomic<bool> moe_source_closed{false};

@@ -925,6 +925,7 @@ int llama_completion(int argc, char ** argv) {
         }
 
         // end of generation
+        llama_init->save_moe_profile();
         if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
             LOG(" [end of text]\n");
             break;
@@ -949,6 +950,7 @@ int llama_completion(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
+    llama_init->save_moe_profile(true);
     llama_backend_free();
 
     return 0;

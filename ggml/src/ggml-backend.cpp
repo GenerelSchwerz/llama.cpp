@@ -837,6 +837,8 @@ struct ggml_backend_sched_hybrid {
     std::vector<std::vector<int32_t>> profile_ranks;
     std::vector<ggml_backend_moe_static_profile_v1> profiles;
     std::vector<std::vector<uint64_t>> statistics_counts;
+    std::vector<std::vector<double>> statistics_score_storage;
+    std::vector<const double *> statistics_scores;
     std::vector<ggml_backend_moe_source_statistics_v1> statistics;
     ggml_backend_moe_source_owner_v1 source_owner = {};
     uint32_t max_regions = 0;
@@ -1080,6 +1082,11 @@ static int32_t ggml_backend_sched_moe_hybrid_create(
         state->profiles.push_back({profile.down, ranks.data(), profile.n_experts});
     }
     state->config.profiles = state->profiles.empty() ? nullptr : state->profiles.data();
+    if (!ggml_moe_source_scores_valid(config->statistics, config->statistics_scores, config->n_statistics)) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    state->statistics_score_storage.resize(config->statistics_scores ? config->n_statistics : 0);
+    state->statistics_scores.resize(state->statistics_score_storage.size());
     state->statistics_counts.resize(config->n_statistics);
     state->statistics.reserve(config->n_statistics);
     for (uint32_t i = 0; i < config->n_statistics; ++i) {
@@ -1088,9 +1095,15 @@ static int32_t ggml_backend_sched_moe_hybrid_create(
         counts.assign(source.counts, source.counts + source.n_experts);
         auto copy = source;
         copy.counts = counts.data();
+        if (config->statistics_scores) {
+            auto & scores = state->statistics_score_storage[i];
+            scores.assign(config->statistics_scores[i], config->statistics_scores[i] + source.n_experts);
+            state->statistics_scores[i] = scores.data();
+        }
         state->statistics.push_back(copy);
     }
     state->config.statistics = state->statistics.empty() ? nullptr : state->statistics.data();
+    state->config.statistics_scores = state->statistics_scores.empty() ? nullptr : state->statistics_scores.data();
     state->source_owner = *config->source_owner;
     state->config.source_owner = &state->source_owner;
     const auto cpu_module = config->cpu_module_acquire();
@@ -1187,7 +1200,7 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
             config->demand_admission > 1 || config->resident_batch > 1 ||
             config->executor > GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ||
             config->profile_adaptation > 2 || (config->profile_adaptation && !config->n_profiles && !config->n_statistics) ||
-            (config->n_profiles && config->n_statistics) || !ggml_moe_source_statistics_valid(config->statistics, config->n_statistics) ||
+            (config->n_profiles && config->n_statistics) || !ggml_moe_source_scores_valid(config->statistics, config->statistics_scores, config->n_statistics) ||
             config->n_profiles > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS ||
             (config->n_profiles && !config->profiles) ||
             ((config->n_profiles || config->n_statistics) && (config->executor != GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ||
@@ -1222,12 +1235,15 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
             profiles_match = a.down == b.down && a.n_experts == b.n_experts && b.experts &&
                 !memcmp(a.experts, b.experts, size_t(a.n_experts) * sizeof(int32_t));
         }
-        bool statistics_match = saved.n_statistics == config->n_statistics;
+        bool statistics_match = saved.n_statistics == config->n_statistics && bool(saved.statistics_scores) == bool(config->statistics_scores);
         for (uint32_t i = 0; statistics_match && i < config->n_statistics; ++i) {
             const auto & a = saved.statistics[i];
             const auto & b = config->statistics[i];
             statistics_match = a.tensor == b.tensor && a.domain == b.domain && a.observations == b.observations && a.n_experts == b.n_experts &&
                 !memcmp(a.counts, b.counts, size_t(a.n_experts) * sizeof(uint64_t));
+            if (statistics_match && saved.statistics_scores) {
+                statistics_match = config->statistics_scores[i] && !memcmp(saved.statistics_scores[i], config->statistics_scores[i], size_t(a.n_experts) * sizeof(double));
+            }
         }
         const bool matches = (!existing || saved.backend == config->backend) && saved.n_threads == config->n_threads &&
             (common->source_api ? config->max_regions <= saved.max_regions : config->max_regions == saved.max_regions) &&
@@ -4356,12 +4372,15 @@ const ggml_moe_fidelity_config & ggml_moe_fidelity_selection() {
         c.reference = mode && (!std::strcmp(mode, "reference") || !std::strcmp(mode, "reference-conversion"));
         c.source_pool = mode && (!std::strcmp(mode, "conversion") || !std::strcmp(mode, "reference-conversion"));
         const char * executor = std::getenv("GGML_MOE_HYBRID_EXECUTOR");
-        const bool source_executor = executor && !std::strcmp(executor, "source");
+        const char * hybrid = std::getenv("GGML_MOE_HYBRID");
+        const bool source_executor = executor ? !std::strcmp(executor, "source") :
+            hybrid && !std::strcmp(hybrid, "required");
         if (source_executor) {
             if (mode && std::strcmp(mode, "reference-conversion")) { c.valid = false; }
             c.reference = c.source_pool = true;
         }
         const char * value = std::getenv(source_executor ? "GGML_MOE_SOURCE_GPU_MISS_FRACTION" : "GGML_MOE_FIDELITY_PCIE_FRAC");
+        if (source_executor && !value) { value = "0.17"; }
         if (c.reference && !value) { c.valid = false; }
         if (value) {
             char * end = nullptr;

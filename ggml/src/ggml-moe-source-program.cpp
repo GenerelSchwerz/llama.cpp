@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -40,26 +41,150 @@ bool ggml_moe_source_statistics_valid(const ggml_backend_moe_source_statistics_v
     return true;
 } catch (...) { return false; }
 
+static bool source_scores_valid(const double * scores, uint32_t count) {
+    if (!scores) { return true; }
+    double sum = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!std::isfinite(scores[i]) || scores[i] < 0) { return false; }
+        sum += scores[i];
+        if (!std::isfinite(sum)) { return false; }
+    }
+    return true;
+}
+
+bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores, uint32_t count) {
+    if (!ggml_moe_source_statistics_valid(statistics, count) || (scores && !count)) { return false; }
+    for (uint32_t i = 0; scores && i < count; ++i) {
+        if (!scores[i] || !source_scores_valid(scores[i], statistics[i].n_experts)) { return false; }
+    }
+    return true;
+}
+
 bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks) try {
     if (banks.empty() || banks.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { return false; }
     const auto experts = banks.front().n_experts;
     uint64_t payload = 0;
     for (const auto & bank : banks) {
         if (bank.n_experts != experts || !bank.payload_bytes || bank.payload_bytes > UINT64_MAX - payload ||
-                !source_statistics_sum(bank.counts, experts, bank.observations)) { return false; }
+                !source_statistics_sum(bank.counts, experts, bank.observations) || !source_scores_valid(bank.scores, experts)) { return false; }
         payload += bank.payload_bytes;
     }
     std::vector<long double> scores(experts, 0);
     for (const auto & bank : banks) {
-        if (!bank.observations) { continue; }
+        if (!bank.observations && !bank.scores) { continue; }
         const auto weight = static_cast<long double>(bank.payload_bytes) / payload;
-        for (uint32_t i = 0; i < experts; ++i) { scores[i] += weight * (static_cast<long double>(bank.counts[i]) / bank.observations); }
+        for (uint32_t i = 0; i < experts; ++i) { scores[i] += weight * (bank.scores ? static_cast<long double>(bank.scores[i]) : static_cast<long double>(bank.counts[i]) / bank.observations); }
     }
     std::vector<int32_t> result;
     result.reserve(experts);
     for (uint32_t i = 0; i < experts; ++i) { result.push_back(int32_t(i)); }
     std::sort(result.begin(), result.end(), [&](int32_t a, int32_t b) { return scores[a] > scores[b] || (scores[a] == scores[b] && a < b); });
     ranks.swap(result);
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_source_profile_initialize(ggml_moe_source_profile_learning & state, const int32_t * prior, uint32_t count, uint32_t n_experts) try {
+    if (!prior || !count || count > n_experts || !n_experts || n_experts > (1u << 22)) { return false; }
+    std::vector<int32_t> order(n_experts, -1);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (prior[i] < 0 || uint32_t(prior[i]) >= n_experts || order[prior[i]] != -1) { return false; }
+        order[prior[i]] = int32_t(i);
+    }
+    for (uint32_t i = 0; i < n_experts; ++i) { if (order[i] == -1) { order[i] = int32_t(count++); } }
+    std::vector<uint64_t> counts(n_experts, 0);
+    std::vector<double> heat(n_experts, 0);
+    state.counts_.swap(counts);
+    state.heat_.swap(heat);
+    state.prior_.swap(order);
+    state.observations_ = 0;
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_source_profile_observe(ggml_moe_source_profile_learning & state, const int32_t * routes, uint32_t count) {
+    if (!routes || !count || state.counts_.empty() || count > UINT64_MAX - state.observations_) { return false; }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (routes[i] < 0 || size_t(routes[i]) >= state.counts_.size()) { return false; }
+    }
+    // The total bounds each expert count, including repeated IDs in this window.
+    for (uint32_t i = 0; i < count; ++i) { ++state.counts_[routes[i]]; }
+    state.observations_ += count;
+    return true;
+}
+
+bool ggml_moe_source_profile_accumulate(ggml_moe_source_profile_learning & state, const std::vector<float> & usage) {
+    if (state.heat_.empty() || !state.observations_ || usage.size() != state.heat_.size()) { return false; }
+    for (size_t i = 0; i < usage.size(); ++i) {
+        if (!std::isfinite(usage[i]) || usage[i] < 0 || (!state.counts_[i] && usage[i] != 0) ||
+                !std::isfinite(state.heat_[i] + double(usage[i]))) { return false; }
+    }
+    for (size_t i = 0; i < usage.size(); ++i) { state.heat_[i] += double(usage[i]); }
+    return true;
+}
+
+bool ggml_moe_source_profile_snapshot(const ggml_moe_source_profile_learning & state, std::vector<uint64_t> & counts, std::vector<double> & heat,
+        std::vector<int32_t> & ranks, uint64_t & observations, std::vector<int32_t> * prior) try {
+    if (state.counts_.empty() || prior == &ranks) { return false; }
+    auto new_counts = state.counts_;
+    auto new_heat = state.heat_;
+    std::vector<int32_t> new_prior;
+    if (prior) { new_prior = state.prior_; }
+    std::vector<int32_t> order;
+    order.reserve(state.counts_.size());
+    for (size_t i = 0; i < state.counts_.size(); ++i) { order.push_back(int32_t(i)); }
+    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+        return state.heat_[a] > state.heat_[b] || (state.heat_[a] == state.heat_[b] && state.prior_[a] < state.prior_[b]);
+    });
+    counts.swap(new_counts);
+    heat.swap(new_heat);
+    ranks.swap(order);
+    if (prior) { prior->swap(new_prior); }
+    observations = state.observations_;
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_source_profile_restore(ggml_moe_source_profile_learning & state, const std::vector<uint64_t> & counts,
+        const std::vector<double> & heat, const std::vector<int32_t> & prior, uint64_t observations) try {
+    if (counts.empty() || counts.size() > (1u << 22) || heat.size() != counts.size() || prior.size() != counts.size() ||
+            !source_statistics_sum(counts.data(), uint32_t(counts.size()), observations)) { return false; }
+    std::vector<uint8_t> seen(counts.size(), 0);
+    double sum = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (!std::isfinite(heat[i]) || heat[i] < 0 || (!counts[i] && heat[i] != 0) ||
+                prior[i] < 0 || size_t(prior[i]) >= counts.size() || seen[prior[i]]++) { return false; }
+        sum += heat[i];
+        if (!std::isfinite(sum)) { return false; }
+    }
+    auto new_counts = counts;
+    auto new_heat = heat;
+    auto new_prior = prior;
+    state.counts_.swap(new_counts);
+    state.heat_.swap(new_heat);
+    state.prior_.swap(new_prior);
+    state.observations_ = observations;
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_source_learning_valid(const ggml_backend_moe_source_learning_v1 * records, uint32_t count) try {
+    if (!records || !count || count > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { return false; }
+    std::vector<ggml_backend_moe_source_statistics_v1> statistics;
+    statistics.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto & record = records[i];
+        if (record.struct_size != sizeof(record) || record.abi_version != 1 || !record.heat || !record.usage || !record.prior ||
+                record.windows > record.source.observations || (record.windows == 0) != (record.source.observations == 0)) { return false; }
+        statistics.push_back(record.source);
+    }
+    if (!ggml_moe_source_statistics_valid(statistics.data(), count)) { return false; }
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto & record = records[i];
+        const uint32_t experts = record.source.n_experts;
+        ggml_moe_source_profile_learning state;
+        if (!ggml_moe_source_profile_restore(state, {record.source.counts, record.source.counts + experts},
+                {record.heat, record.heat + experts}, {record.prior, record.prior + experts}, record.source.observations)) { return false; }
+        for (uint32_t expert = 0; expert < experts; ++expert) {
+            if (!std::isfinite(record.usage[expert]) || record.usage[expert] < 0 || record.usage[expert] > float(record.source.counts[expert])) { return false; }
+        }
+    }
     return true;
 } catch (...) { return false; }
 

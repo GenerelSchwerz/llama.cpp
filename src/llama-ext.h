@@ -347,6 +347,15 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // Initialize opt-in GPU cache placement after synchronized prefill, before generation.
 LLAMA_API bool llama_moe_profile_initialize(struct llama_context * ctx);
 
+// Full-model GGUF learning bytes are borrowed through callback return, after owner locks are released.
+typedef bool (*llama_moe_profile_write_callback)(const uint8_t * data, size_t size, void * user_data);
+// Busy boundaries defer without changing output. timeout_ms must be in [1, 5000].
+extern "C" LLAMA_API bool llama_moe_profile_snapshot(struct llama_context * ctx, uint32_t timeout_ms,
+        llama_moe_profile_write_callback write, void * user_data);
+// Same-model contexts must stay alive through return. Overlapping conflicting histories reject.
+extern "C" LLAMA_API bool llama_moe_profile_snapshot_contexts(struct llama_context * const * contexts, size_t count, uint32_t timeout_ms,
+        llama_moe_profile_write_callback write, void * user_data);
+
 // Explicit profile selection overrides global profile settings and is copied during construction.
 extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_profile(
         struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation);

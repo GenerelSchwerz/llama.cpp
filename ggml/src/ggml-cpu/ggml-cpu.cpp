@@ -2159,12 +2159,14 @@ struct ggml_backend_moe_cpu_active_job_v1 {
 struct ggml_backend_moe_cpu_abort_state_v1 {
     ggml_backend_moe_cpu_service_impl_v1 * service;
     uint64_t epoch;
+    const ggml_backend_moe_cpu_execute_control_v1 * control;
 };
 
 static bool ggml_backend_moe_cpu_region_abort_v1(void * data) {
     const auto * state = static_cast<const ggml_backend_moe_cpu_abort_state_v1 *>(data);
-    return state->service->closing.load(std::memory_order_acquire) ||
-           state->service->cancel_through_epoch.load(std::memory_order_acquire) >= state->epoch;
+    if (state->service->closing.load(std::memory_order_acquire)) { return true; }
+    if (state->control) { return state->control->abort && state->control->abort(state->control->abort_data); }
+    return state->service->cancel_through_epoch.load(std::memory_order_acquire) >= state->epoch;
 }
 
 static ggml_backend_moe_cpu_prepared_region_impl_v1 * ggml_backend_moe_cpu_region_find_v1(
@@ -2350,7 +2352,8 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
         ggml_backend_moe_cpu_prepared_region_v1_t region_handle,
         const struct ggml_backend_moe_cpu_execute_v1 * execution,
         struct ggml_backend_moe_cpu_execute_result_v1 * result,
-        const uint8_t * ownership = nullptr, uint32_t n_ownership = 0) {
+        const uint8_t * ownership = nullptr, uint32_t n_ownership = 0,
+        const ggml_backend_moe_cpu_execute_control_v1 * control = nullptr) {
     if (service_handle == nullptr || region_handle == 0 || result == nullptr ||
             result->struct_size != sizeof(*result)) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
@@ -2373,8 +2376,8 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
         if (service->active_jobs >= service->n_lanes) {
             return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY;
         }
-        test_hook = service->test_hook;
-        test_hook_data = service->test_hook_data;
+        test_hook = control ? control->hook : service->test_hook;
+        test_hook_data = control ? control->hook_data : service->test_hook_data;
         lane_index = service->next_lane++ % region->n_lanes;
         ++service->active_jobs;
         ++region->active_jobs;
@@ -2409,7 +2412,7 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
             }
         }
     }
-    ggml_backend_moe_cpu_abort_state_v1 abort_state = { service, execution->epoch };
+    ggml_backend_moe_cpu_abort_state_v1 abort_state = { service, execution->epoch, control };
     if (ggml_backend_moe_cpu_region_abort_v1(&abort_state)) {
         return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CANCELED;
     }
@@ -2592,6 +2595,20 @@ static int32_t ggml_backend_moe_cpu_routed_execute_v1(
     try {
         return ggml_backend_moe_cpu_region_service_execute_impl_v1(service, region, execution, result, ownership, n_ownership);
     } catch (...) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+}
+
+static int32_t ggml_backend_moe_cpu_controlled_execute_v1(
+        ggml_backend_moe_cpu_service_v1_t service, ggml_backend_moe_cpu_prepared_region_v1_t region,
+        const ggml_backend_moe_cpu_execute_v1 * execution, const uint8_t * ownership, uint32_t n_ownership,
+        const ggml_backend_moe_cpu_execute_control_v1 * control, ggml_backend_moe_cpu_execute_result_v1 * result) {
+    if (!control || control->struct_size != sizeof(*control) || control->abi_version != 1 || control->flags ||
+            control->reserved32 || control->reserved[0] || control->reserved[1]) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    const auto borrowed = *control;
+    try {
+        return ggml_backend_moe_cpu_region_service_execute_impl_v1(service, region, execution, result, ownership, n_ownership, &borrowed);
+    } catch (...) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_COMPUTE_FAILED; }
 }
 
 static int32_t ggml_backend_moe_cpu_region_service_state_impl_v1(
@@ -2979,6 +2996,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, GGML_BACKEND_MOE_CPU_ROUTED_EXECUTE_V1_PROC_NAME) == 0) {
         return (void *) ggml_backend_moe_cpu_routed_execute_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CPU_CONTROLLED_EXECUTE_V1_PROC_NAME) == 0) {
+        return (void *) ggml_backend_moe_cpu_controlled_execute_v1;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CPU_FIDELITY_REQUIREMENTS_V1_PROC_NAME) == 0) {
         try {

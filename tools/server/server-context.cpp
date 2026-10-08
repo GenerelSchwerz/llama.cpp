@@ -1057,6 +1057,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (llama_init) { llama_init->save_moe_profile(true, ctx_dft); }
         spec.reset();
         spec_init.reset();
 
@@ -3111,6 +3112,7 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+                if (llama_init) { llama_init->save_moe_profile(false, ctx_dft); }
 
                 return; // skip further processing
 

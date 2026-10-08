@@ -1,5 +1,26 @@
 # Implementation and validation
 
+## Active plan, 2026-10-08: features 1-4
+
+Follow [GOAL-1-4.md](GOAL-1-4.md). The sections below this active plan are historical research/reconciliation evidence and do not expand the scope.
+
+1. Verify the pending combined source and saved recovery state. Inventory each feature's existing contracts and gaps against the specialized migration ledger; select concrete shared boundaries before code. No model replay while blocked.
+2. Implement learned full-model snapshot/save/reload through the existing profile owner. Qualify round-trip, validation, capacity independence and continued adaptation, then independent held-out quality.
+
+   Owner endpoints, cold-context hooks, complete snapshot composition and atomic publication are implemented with scoped component evidence. Unobserved-prior projection and Linux concurrent/error publication pass. Complete CPU-tool/CUDA-backend/test linkage and actual argument/metadata tests pass; optional application hooks are wired. Sixteen synchronous canonical owner cold-restore/continuation cases pass at3/10 slots with actual transport preparation and3->4/4->5 cadence. The source-backed target-only MTP gap has a generic context-group boundary with CPU overlay/ABI qualification. Full context/file reload, async pending adaptation and live MTP/context-group histories remain open; diagnose overlapping histories rather than overwriting them. Combined model/platform/performance/quality validation remains open. Continue shared CPU prerequisites for features2-4 while these gates remain tracked.
+
+3. Implement CPU-assisted prefill through shared graph/backend semantics and existing workers. Qualify actual CPU/GPU work, arithmetic, request-scoped lifetime/cancellation and original auxiliary readers.
+
+   The synchronous per-call CPU control prerequisite is implemented and qualified through the actual CPU service and 14 tiny source programs. Keep worker reuse and execution serialization. [CPU-PREFILL-PARTITION.md](CPU-PREFILL-PARTITION.md) records the bounded consumer extension: copied CPU cohort ownership, ordinary grouped GPU matrix ranges and original-route CPU join. CUDA linkage and112 actual CPU/GPU cases pass across seven formats, packed/padded output and bounded waves. The canonical callback extension passes24 actual pinned/pageable owner cases; the newer original/private source-frame binding passes48 ordinary/source-frame cases, malformed/stale/private-span and pre-cancel rejection, callback-failure/drained reuse and ownership retained through GLU/down. Reuse existing certified source-frame leases with checked original/private operator binding, aggregate reusable scratch and phase completion before main sequential admission; do not count ordinary fallback as CPU-assisted hybrid execution. Cross-request asynchronous reader/completion and matched model gates remain open.
+4. Extend existing event/prefetch scheduling to bounded cross-layer streaming. Qualify aggregate bytes, ready/late/unused work and retained readers without future-route oracle data.
+5. Implement canonical cache lending/restoration, including adaptation fences and current learned occupants. Qualify repeated transitions, failure/cancellation and per-device storage accounting.
+6. Test all four individually and together across the model/format matrix, matched frozen generic and updated specialized controls, MTP3 and parallel/staggered requests. Close actual Windows/multi-GPU gates or leave the goal incomplete. Require no accepted regression and held-out profile quality at least Strata's at equal bytes.
+7. Review source/evidence and prepare a bounded handoff. Do not commit/push, change defaults or claim completion without the applicable authorization and acceptance evidence.
+
+Kernel fusion, elastic cache resizing, RAM-complement exchange and complete-expert wave reorganization are deferred. The old paired-fusion experiment remains disabled. Shared prerequisites must be source-backed and limited to features 1-4.
+
+## Historical plan and evidence
+
 Current step: qualify shared graph admission beyond optional fusion layouts. Existing routed discovery/scheduler and sigmoid arithmetic gates pass; the added SCALE/TANH discovery gate passes12 cases. The retained combined-body hint gate also passes:24 optional rejections across12 cases, followed by original routed projection preparation and actual complementary CPU/GPU execution. Next audit the remaining real context, backend-session and row-semantic boundaries from source; qualify them separately under existing containment before full serving resumes. Preserve backend arithmetic and existing numerical/state checks. These are small contained component tests, not full frontend/model/platform qualification.
 
 Keep optional paired fusion disabled: its matched component ABBA measured regressions despite equal resident/staging/compute/transfer work. The source cost audit identifies doubled paired launch rows and unchanged activation/output traffic; actual occupancy/event attribution remains unproven. Model servers remain blocked; no default promotion follows.
@@ -44,3 +65,21 @@ The migration includes complete-expert prefill scheduling with existing arithmet
 Before model comparisons, retain the verified hard RAM/zero-swap/timeout/whole-tree teardown harness and qualify corrected repeated-prefill transitions. Do not blindly replay the original failed frozen workload. Compare actual input/output IDs, numerical/state bounds, CPU/GPU work, residency, transfer bytes, MTP acceptance and actual memory budgets; report unequal work as observational. Frozen specialized/parent sources remain preserved.
 
 The owner also authorized a checkpoint commit and push to this research branch before further implementation. Existing evidence qualifies the checkpoint's component scopes only.
+
+## Document-driven migration
+
+Use the preserved specialized docs/moe-specialized-strata-update-20261007/GENERIC-MIGRATION.md as the migration checklist, FEATURES.md for actual port callers and STATUS.md/RUNTIME-COMPATIBILITY.md for qualification and combination limits. Reconcile each row with current generic source before implementing it: already inherited, missing non-fusion mechanism, requires kernel fusion, or requires hardware qualification. Keep source call sites and acceptance evidence attached to each decision.
+
+Generic already has static profiles, occurrence adaptation, asynchronous complete-bank H2D replacement, expert-prefetch machinery and two-lane prefill copy/compute overlap. The prefill lookahead gap is specifically the specialized complete-expert, cross-layer ring schedule; it is an extension of existing prefetch scheduling. RAM-complement D2H exchanges are an optional storage policy, not a prerequisite for generic async adaptation. Preserve existing llama.cpp server/KV/MTP capabilities rather than importing specialized frontend restrictions.
+
+Implement the actual missing non-fusion mechanisms through their existing generic owners. Add lifetime/cancellation contract work where the selected mechanism needs it; a separate general executor redesign is not a substitute for this migration. Keep kernel fusion disabled and qualify each implemented mechanism before matched decode comparisons.
+
+## Reconciliation after release 28d73c87c
+
+The owner requested the latest release on 2026-10-08. origin/moe-cache is28d73c87cb90a9b78d4357ff1b456f456bfa1164, containing weighted corpus commit1620068b03e40abc7dd231044b3bb97ce9e2e9e4 and CLI activation cleanup. Both are merged without conflicts into checkpointa69f285dd, with local migration documentation preserved. The integration is staged and not committed; the combined tree is not yet build/runtime-qualified. Preserve prior frozen candidates as evidence of their own exact sources.
+
+Already inherited: natural-EOG workload-weighted corpus collection, version2 source ranking scores, raw-count compatibility and score lifetimes; --moe-hybrid on/off and --moe-gpu-miss-fraction; automatic source overlap/allocation defaults with strict overrides. These extend existing static profiles, asynchronous occurrence adaptation, expert prefetch and two-lane bounded prefill. Do not reimplement them. Corpus generation does not save learned online residency/heat or satisfy held-out profile quality.
+
+Remaining non-fusion migration: complete-expert prefill waves using existing kernels; bounded cross-layer issuer/copy scheduling; temporary cache lending/restoration through canonical ownership; live learned full-rank export; safe elastic cache resizing; optional RAM-complement exchange; optional measured CPU-assisted prefill. Reconcile request/MTP/device policies against existing llama.cpp capabilities and current Strata combination restrictions. Validate supported combinations instead of copying specialized restrictions into generic.
+
+First qualify the combined source and corrected repeated-prefill transitions under verified containment. Then implement and measure scheduling/memory changes separately, and run matched generic/specialized decode controls with fixed inputs, actual byte budgets and recorded MTP work. Kernel fusions remain outside the owner's requested next slice. Full-model crash-root, no-regression, Windows, physical multi-GPU/concurrency and held-out quality gates remain open.

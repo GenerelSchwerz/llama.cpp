@@ -558,6 +558,10 @@ struct common_params {
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
     bool moe_early_router = false;
+    std::string moe_hybrid; // empty preserves the process environment
+    std::string moe_gpu_miss_fraction;
+    std::string moe_profile_save;
+    int32_t moe_profile_save_interval = 60;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -944,6 +948,7 @@ std::string fs_path_to_utf8(const std::filesystem::path & path);
 // and setting an empty value unsets the variable
 std::string common_get_env(const std::string & name);
 void        common_set_env(const std::string & name, const std::string & value);
+void        common_moe_hybrid_configure(const common_params & params);
 
 // reads a path from the environment, an unset variable gives an empty path
 std::filesystem::path common_get_path_from_env(const std::string & name);
@@ -981,6 +986,11 @@ std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmod
 
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
+// A busy destination defers. The OS releases its writer lock on process exit.
+bool common_moe_profile_write(const std::filesystem::path & path, const uint8_t * data, size_t size);
+bool common_moe_profile_save(llama_context * ctx, const std::filesystem::path & path, uint32_t timeout_ms = 5000);
+bool common_moe_profile_save(const std::vector<llama_context *> & contexts, const std::filesystem::path & path, uint32_t timeout_ms = 5000);
+
 //
 // TTY utils
 //
@@ -1004,6 +1014,9 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+
+    // Call between completed requests/windows, before releasing auxiliary contexts.
+    bool save_moe_profile(bool force = false, llama_context * auxiliary = nullptr);
 
     std::vector<llama_adapter_lora_ptr> & lora();
 

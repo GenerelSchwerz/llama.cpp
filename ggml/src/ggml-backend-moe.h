@@ -729,6 +729,27 @@ typedef int32_t (*ggml_backend_moe_cpu_routed_execute_v1_t)(
     const struct ggml_backend_moe_cpu_execute_v1 * execution, const uint8_t * ownership, uint32_t n_ownership,
     struct ggml_backend_moe_cpu_execute_result_v1 * result);
 
+struct ggml_backend_moe_cpu_execute_control_v1 {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t reserved32;
+    ggml_abort_callback abort;
+    void * abort_data;
+    ggml_backend_moe_cpu_test_hook_v1_t hook;
+    void * hook_data;
+    uint64_t reserved[2];
+};
+
+#define GGML_BACKEND_MOE_CPU_CONTROLLED_EXECUTE_V1_PROC_NAME "ggml_backend_moe_cpu_controlled_execute_v1"
+// Synchronous call: callbacks/data are borrowed until return and must not throw or reenter the service.
+// Abort can run on worker threads. Scoped calls ignore the legacy epoch watermark; close still cancels all jobs.
+// Flags/reserved must be zero. Ownership is null/zero for a combined region; routed regions use the original mask.
+typedef int32_t (*ggml_backend_moe_cpu_controlled_execute_v1_t)(
+    ggml_backend_moe_cpu_service_v1_t service, ggml_backend_moe_cpu_prepared_region_v1_t region,
+    const struct ggml_backend_moe_cpu_execute_v1 * execution, const uint8_t * ownership, uint32_t n_ownership,
+    const struct ggml_backend_moe_cpu_execute_control_v1 * control, struct ggml_backend_moe_cpu_execute_result_v1 * result);
+
 // Reads metadata only; does not retain sources, create workers or allocate prepared payload.
 // Service returns base bytes. Add each region's prepared_payload_bytes once.
 struct ggml_backend_moe_cpu_fidelity_requirements_api_v1 {
@@ -780,6 +801,40 @@ struct ggml_backend_moe_source_statistics_v1 {
 typedef bool (*ggml_backend_moe_statistics_initialize_v1_t)(ggml_backend_t backend,
     const struct ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 
+#define GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V2_PROC_NAME "ggml_backend_moe_statistics_initialize_v2"
+typedef bool (*ggml_backend_moe_statistics_initialize_v2_t)(ggml_backend_t backend,
+    const struct ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores,
+    uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
+
+struct ggml_backend_moe_source_identity_v1 {
+    const struct ggml_tensor * tensor;
+    uint32_t domain;
+};
+
+struct ggml_backend_moe_source_learning_v1 {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    struct ggml_backend_moe_source_statistics_v1 source;
+    const double * heat;
+    const float * usage;
+    const int32_t * prior;
+    uint64_t windows;
+};
+
+// Views are borrowed until the callback returns. The callback must not reenter the owner.
+typedef bool (*ggml_backend_moe_learning_snapshot_callback_v1_t)(
+    const struct ggml_backend_moe_source_learning_v1 * records, uint32_t count, void * data);
+#define GGML_BACKEND_MOE_LEARNING_SNAPSHOT_V1_PROC_NAME "ggml_backend_moe_learning_snapshot_v1"
+// Quiescent snapshot; known sources without learning are omitted. Flags must be zero.
+typedef bool (*ggml_backend_moe_learning_snapshot_v1_t)(ggml_backend_t backend,
+    const struct ggml_backend_moe_source_identity_v1 * sources, uint32_t count, uint32_t flags, uint64_t deadline_ns,
+    ggml_backend_moe_learning_snapshot_callback_v1_t callback, void * data);
+
+#define GGML_BACKEND_MOE_LEARNING_RESTORE_V1_PROC_NAME "ggml_backend_moe_learning_restore_v1"
+// Install complete bank groups before their first device preparation. Flags must be zero.
+typedef bool (*ggml_backend_moe_learning_restore_v1_t)(ggml_backend_t backend,
+    const struct ggml_backend_moe_source_learning_v1 * records, uint32_t count, uint32_t flags, uint64_t deadline_ns);
+
 struct ggml_backend_moe_hybrid_config_v1 {
     uint32_t struct_size;
     uint32_t n_threads;
@@ -806,6 +861,7 @@ struct ggml_backend_moe_hybrid_config_v1 {
     const struct ggml_backend_moe_source_statistics_v1 * statistics;
     uint32_t n_statistics;
     uint32_t profile_adaptation; // zero disables, one selects synchronous occurrence adaptation, two selects asynchronous occurrence adaptation
+    const double * const * statistics_scores; // optional derived scores; same source order as statistics
 };
 
 enum ggml_backend_moe_hybrid_executor_v1 {

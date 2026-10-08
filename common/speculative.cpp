@@ -2894,6 +2894,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+    result.moe_profile_save.clear();
     result.moe_expert_profile = params_spec.moe_expert_profile;
     result.moe_profile_adaptation = params_spec.moe_profile_adaptation;
 

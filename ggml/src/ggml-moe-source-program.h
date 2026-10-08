@@ -16,10 +16,37 @@ struct ggml_moe_profile_bank_statistics {
     uint64_t observations = 0;
     uint64_t payload_bytes = 0;
     uint32_t n_experts = 0;
+    const double * scores = nullptr; // Optional ranking policy, independent of raw occurrence counts.
 };
 
 GGML_API bool ggml_moe_source_statistics_valid(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t count);
+GGML_API bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores, uint32_t count);
+GGML_API bool ggml_moe_source_learning_valid(const ggml_backend_moe_source_learning_v1 * records, uint32_t count);
 GGML_API bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks);
+
+class ggml_moe_source_profile_learning;
+
+GGML_API bool ggml_moe_source_profile_initialize(ggml_moe_source_profile_learning & state, const int32_t * prior, uint32_t count, uint32_t n_experts);
+GGML_API bool ggml_moe_source_profile_observe(ggml_moe_source_profile_learning & state, const int32_t * routes, uint32_t count);
+GGML_API bool ggml_moe_source_profile_accumulate(ggml_moe_source_profile_learning & state, const std::vector<float> & usage);
+GGML_API bool ggml_moe_source_profile_snapshot(const ggml_moe_source_profile_learning & state, std::vector<uint64_t> & counts,
+        std::vector<double> & heat, std::vector<int32_t> & ranks, uint64_t & observations, std::vector<int32_t> * prior = nullptr);
+GGML_API bool ggml_moe_source_profile_restore(ggml_moe_source_profile_learning & state, const std::vector<uint64_t> & counts,
+        const std::vector<double> & heat, const std::vector<int32_t> & prior, uint64_t observations);
+
+class ggml_moe_source_profile_learning {
+    friend bool ggml_moe_source_profile_initialize(ggml_moe_source_profile_learning &, const int32_t *, uint32_t, uint32_t);
+    friend bool ggml_moe_source_profile_observe(ggml_moe_source_profile_learning &, const int32_t *, uint32_t);
+    friend bool ggml_moe_source_profile_accumulate(ggml_moe_source_profile_learning &, const std::vector<float> &);
+    friend bool ggml_moe_source_profile_snapshot(const ggml_moe_source_profile_learning &, std::vector<uint64_t> &,
+            std::vector<double> &, std::vector<int32_t> &, uint64_t &, std::vector<int32_t> *);
+    friend bool ggml_moe_source_profile_restore(ggml_moe_source_profile_learning &, const std::vector<uint64_t> &,
+            const std::vector<double> &, const std::vector<int32_t> &, uint64_t);
+    std::vector<uint64_t> counts_;
+    std::vector<double> heat_;
+    std::vector<int32_t> prior_;
+    uint64_t observations_ = 0;
+};
 
 constexpr bool ggml_moe_source_tensor_byte_comparable =
     std::has_unique_object_representations<decltype(ggml_tensor::buffer)>::value &&

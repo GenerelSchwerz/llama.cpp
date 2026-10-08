@@ -1,5 +1,45 @@
 # Work remaining
 
+## Active checklist, 2026-10-08: features 1-4
+
+Acceptance contract: [GOAL-1-4.md](GOAL-1-4.md). No feature below is currently qualified complete.
+
+- [x] Implement additive request-scoped CPU abort/diagnostic control and integrate the actual source consumer while retaining shared workers, execution serialization and legacy v1 semantics.
+- [x] Qualify seven invalid controls, three paired cancellation/commit cases, four routed ownership cases, mixed scoped/legacy close and 14 tiny source programs with retained owner/prefill checks; preserve exact identities and whole-tree teardown.
+- [x] Build and qualify the bounded GPU consumer partition/CPU join:112 actual CPU/GPU cases across seven formats, broadcast/per-route input, packed/padded output, all-CPU/all-GPU/mixed ownership and bounded staging; preserve malformed-input/no-publication evidence.
+- [x] Build and qualify the canonical CPU-cohort entry through24 actual pinned/pageable owner cases, actual CPU service, malformed/pre-cancel rejection, callback failure/drained reuse and retained transaction through GLU/down; preserve the failed fixture and source-proven host span correction.
+- [x] Build and qualify the additive original/private operator source-frame binding and checked maps/resource/residency/device spans through48 actual ordinary/source-frame CPU/GPU cases; preserve helper/certificate setup failures and ownership through down.
+- [ ] Bound per-program prompt activation/ID/CPU-result scratch, preserve deduplicated route observations before scratch reuse, and preflight program/consumer allocation before state effects.
+- [x] Build and qualify full private-program sequential prefill with8 composed CPU/GPU checks and original IDs; rerun48 owner and14 existing decode checks on the same frozen candidate.
+- [ ] Qualify aggregate canonical resources, auxiliary/state/cancellation combinations and main sequential frontend admission before model serving.
+
+- [x] Verify current combined CPU-tool/CUDA-backend/test build identities and recovery prerequisites without blind model replay; serving qualification remains open.
+- [x] Record first source-backed contracts/gaps for all four in FEATURE-1-4-INVENTORY.md, using the specialized migration ledger.
+- [x] Add and CPU-qualify full-expert learning-state helpers and repeated-snapshot/rejection tests; live owner qualification remains open.
+- [x] Add and CPU-qualify version3 production learned metadata/restore helpers, exact roundtrip and resumed state; live-owner/file/controller gates remain open.
+- [x] Add canonical learning snapshot/cold-restore endpoints, compile both actual CUDA files, qualify shared ABI/view rejection on CPU and wire context restore/inheritance.
+- [x] Correct and CPU-qualify zero-observation learned-prior projection while preserving separate raw counts and rank semantics; live adaptation-off placement remains open.
+- [x] Implement complete context snapshot composition and single-writer atomic file publication; qualify production helpers and Linux filesystem behavior.
+- [x] Wire opt-in application saving at server idle/shutdown and completion boundaries; compile/link CPU libraries/tools and pass actual argument/metadata tests.
+- [x] Add generic same-model context-group snapshots and CPU-qualify disjoint composition, exact deduplication and conflict rejection; source/syntax scope only.
+- [x] Qualify actual synchronous owner snapshots/cold restore and3->4/4->5 controller continuation at3/10 slots across two layouts and direct/staged transport; preserve incomplete/repeated/busy rejection and no-arena cold state.
+- [ ] Qualify full context/file cold reload, async pending adaptation, auxiliary/MTP composition and continued cadence; resolve overlapping independent histories without losing data.
+- [ ] Fully implement learned full-model snapshot/save/reload, capacity independence and continued adaptation.
+- [ ] Fully implement CPU-assisted prefill through shared graph/backend semantics and existing workers.
+- [ ] Fully implement bounded cross-layer expert streaming through existing prefetch/event scheduling.
+- [ ] Fully implement canonical temporary cache lending and restoration of current learned occupants.
+- [ ] Qualify each feature and their combination for arithmetic/state, original route/auxiliary readers, bounded resources, cancellation/completion and repeated transitions.
+- [ ] Demonstrate multiple real models/graph structures/formats; record availability and complementary synthetic coverage.
+- [ ] Qualify static/adaptive profiles, MTP3 and parallel/staggered requests.
+- [ ] Close physical multi-GPU and Windows partial-pinning gates; unavailable required gates stay incomplete.
+- [ ] Meet equal-actual-byte Strata held-out quality on independent representative workloads.
+- [ ] Meet matched frozen generic no-regression gates and retain updated specialized comparisons with actual work/acceptance/resource evidence.
+- [ ] Review source and preserve feature-by-feature handoff/evidence; no unauthorized commit/push/default promotion.
+
+Historical unchecked entries below are not new active tasks. Fusion, elastic cache resizing, RAM-complement exchange and complete-expert wave reorganization are deferred. Retain old results and counterexamples without claiming they qualify the newly merged tree or these four features.
+
+## Historical checklist
+
 - [x] Extend existing bounded staging to both canonical paired banks with checked combined byte budget and backend-derived alignment.
 - [x] Qualify extracted lane-capacity arithmetic against an independent solver (6921 CPU/sanitizer cases).
 - [x] Compile12 canonical paired-source owner fixtures with stale/aliased rejection and output sentinels.

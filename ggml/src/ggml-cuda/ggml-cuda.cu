@@ -2721,16 +2721,23 @@ struct ggml_cuda_mmid_prefill_prepared {
     ggml_tensor weight = {}, input_slice = {}, output_slice = {}, destination = {};
     std::vector<int32_t> counts;
     std::vector<size_t> offsets;
+    std::vector<uint8_t> cpu_experts;
+    std::vector<int32_t> original_ids;
     size_t rows = 0;
+    int device = -1;
+    cudaStream_t stream = nullptr;
 };
 
-ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cuda_context & ctx,
-        ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride) try {
+static ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare_impl(ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride,
+        const uint8_t * cpu_experts, uint32_t n_experts, bool gpu_grouping) try {
     if (ctx.device < 0 || ctx.device >= ggml_cuda_info().device_count || !ids_host || !ggml_cuda_mmid_shape_valid(dst) ||
             !ggml_backend_dev_supports_op(ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), ctx.device), dst)) { return nullptr; }
     const auto * weight = dst->src[0];
     const auto * input = dst->src[1];
     const auto * ids = dst->src[2];
+    if ((cpu_experts == nullptr) != (n_experts == 0) || (cpu_experts && n_experts != weight->ne[2])) { return nullptr; }
+    for (uint32_t expert = 0; expert < n_experts; ++expert) { if (cpu_experts[expert] > 1) { return nullptr; } }
     const size_t routes = size_t(ids->ne[0]) * size_t(ids->ne[1]);
     const size_t ids_width = size_t(ids->ne[0]) * sizeof(int32_t);
     if (ids_row_stride < ids_width || size_t(ids->ne[1] - 1) > ids_bytes / ids_row_stride ||
@@ -2751,12 +2758,17 @@ ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cu
     auto prepared = std::unique_ptr<ggml_cuda_mmid_prefill_prepared>(new ggml_cuda_mmid_prefill_prepared(ctx.pool()));
     prepared->counts.resize(weight->ne[2]);
     prepared->offsets.resize(weight->ne[2]);
+    if (cpu_experts) {
+        prepared->cpu_experts.assign(cpu_experts, cpu_experts + n_experts);
+        prepared->original_ids.reserve(routes);
+    }
     for (int64_t row = 0; row < ids->ne[1]; ++row) {
         for (int64_t route = 0; route < ids->ne[0]; ++route) {
             int32_t expert;
             memcpy(&expert, ids_host + size_t(row) * ids_row_stride + size_t(route) * sizeof(int32_t), sizeof(expert));
             if (expert < 0 || expert >= weight->ne[2]) { return nullptr; }
             ++prepared->counts[expert];
+            if (cpu_experts) { prepared->original_ids.push_back(expert); }
         }
     }
     size_t offset = 0;
@@ -2767,10 +2779,14 @@ ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cu
     prepared->rows = routes;
     prepared->weight = *weight;
     prepared->destination = *dst;
+    prepared->device = ctx.device;
+    prepared->stream = ctx.stream();
+    if (!gpu_grouping) { return prepared.release(); }
     prepared->ids.alloc(3 * routes);
     prepared->bounds.alloc(weight->ne[2] + 1);
     prepared->input.alloc(routes * size_t(input->ne[0]) * input_element);
     prepared->output.alloc(routes * size_t(dst->ne[0]) * sizeof(float));
+    if (cpu_experts && cudaMemsetAsync(prepared->output.get(), 0, routes * size_t(dst->ne[0]) * sizeof(float), ctx.stream()) != cudaSuccess) { return nullptr; }
     for (int inverse = 0; inverse < 2; ++inverse) {
         ggml_cuda_launch_mm_ids_helper(static_cast<const int32_t *>(ids->data), prepared->ids.get() + inverse * routes,
             prepared->ids.get() + 2 * routes, prepared->bounds.get(), weight->ne[2], ids->ne[1], ids->ne[0], input->ne[1],
@@ -2798,15 +2814,32 @@ ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cu
     return nullptr;
 }
 
+ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride) {
+    return ggml_cuda_mmid_prefill_prepare_impl(ctx, dst, ids_host, ids_bytes, ids_row_stride, nullptr, 0, true);
+}
+
+ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare_partition(ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride,
+        const uint8_t * cpu_experts, uint32_t n_experts, bool gpu_grouping) {
+    if (!cpu_experts || !n_experts) { return nullptr; }
+    return ggml_cuda_mmid_prefill_prepare_impl(ctx, dst, ids_host, ids_bytes, ids_row_stride, cpu_experts, n_experts, gpu_grouping);
+}
+
 bool ggml_cuda_mmid_prefill_launch_range(ggml_backend_cuda_context & ctx,
         const ggml_cuda_mmid_prefill_prepared * prepared, const void * resident, const void * staging,
         const int32_t * source_map, uint32_t n_slots, uint32_t n_staged, int32_t expert_begin, int32_t expert_count) {
-    if (!prepared || !resident || !staging || !source_map || !n_slots || expert_begin < 0 || expert_count <= 0 ||
+    if (!prepared || prepared->device != ctx.device || prepared->stream != ctx.stream() || !prepared->input.ptr ||
+            !resident || !staging || !source_map || !n_slots || expert_begin < 0 || expert_count <= 0 ||
             uint64_t(expert_begin) + uint64_t(expert_count) > prepared->counts.size()) { return false; }
     for (int32_t expert = expert_begin; expert < expert_begin + expert_count; ++expert) {
-        if (!prepared->counts[expert]) { continue; }
+        if (!prepared->counts[expert] || (!prepared->cpu_experts.empty() && prepared->cpu_experts[expert])) { continue; }
         const int32_t slot = source_map[expert];
         if (slot < 0 || uint64_t(slot) >= uint64_t(n_slots) + n_staged) { return false; }
+    }
+    for (int32_t expert = expert_begin; expert < expert_begin + expert_count; ++expert) {
+        if (!prepared->counts[expert] || (!prepared->cpu_experts.empty() && prepared->cpu_experts[expert])) { continue; }
+        const int32_t slot = source_map[expert];
         ggml_tensor weight = prepared->weight;
         weight.ne[2] = 1; weight.nb[3] = weight.nb[2];
         weight.op = GGML_OP_VIEW;
@@ -2826,14 +2859,47 @@ bool ggml_cuda_mmid_prefill_launch_range(ggml_backend_cuda_context & ctx,
 }
 
 bool ggml_cuda_mmid_prefill_finish(ggml_backend_cuda_context & ctx, const ggml_cuda_mmid_prefill_prepared * prepared) {
-    if (!prepared) { return false; }
+    if (!prepared || prepared->device != ctx.device || prepared->stream != ctx.stream() || !prepared->ids.ptr) { return false; }
     const auto & dst = prepared->destination;
     const size_t stride = size_t(dst.ne[0]) * sizeof(float);
-    get_rows_cuda(prepared->output.ptr, GGML_TYPE_F32, prepared->ids.ptr + prepared->rows, dst.data, dst.type,
-        dst.ne[0], stride, prepared->rows * stride, prepared->rows * stride,
-        prepared->rows, 1, 1, sizeof(int32_t), prepared->rows * sizeof(int32_t), prepared->rows * sizeof(int32_t),
-        dst.nb[1], dst.nb[2], dst.nb[3], ctx.stream());
+    const bool packed = dst.nb[2] / dst.nb[1] == size_t(dst.ne[1]);
+    const size_t groups = packed ? 1 : size_t(dst.ne[2]), rows = packed ? prepared->rows : size_t(dst.ne[1]);
+    for (size_t group = 0; group < groups; ++group) {
+        get_rows_cuda(prepared->output.ptr, GGML_TYPE_F32, prepared->ids.ptr + prepared->rows + group * rows,
+            static_cast<char *>(dst.data) + group * dst.nb[2], dst.type,
+            dst.ne[0], stride, prepared->rows * stride, prepared->rows * stride,
+            rows, 1, 1, sizeof(int32_t), rows * sizeof(int32_t), rows * sizeof(int32_t),
+            dst.nb[1], dst.nb[2], dst.nb[3], ctx.stream());
+    }
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool ggml_cuda_mmid_prefill_join_cpu(ggml_backend_cuda_context & ctx, const ggml_cuda_mmid_prefill_prepared * prepared,
+        const void * cpu_output, size_t cpu_bytes, size_t cpu_route_stride) {
+    if (!prepared || prepared->device != ctx.device || prepared->stream != ctx.stream() ||
+            prepared->cpu_experts.empty() || prepared->original_ids.size() != prepared->rows) { return false; }
+    const auto & dst = prepared->destination;
+    const size_t width = size_t(dst.ne[0]) * sizeof(float);
+    bool needed = false;
+    for (size_t route = 0; route < prepared->rows; ++route) {
+        if (!prepared->cpu_experts[prepared->original_ids[route]]) { continue; }
+        needed = true;
+        if (!cpu_output || cpu_route_stride < width || route > SIZE_MAX / cpu_route_stride ||
+                route * cpu_route_stride > cpu_bytes || width > cpu_bytes - route * cpu_route_stride) { return false; }
+    }
+    if (!needed) { return true; }
+    if (reinterpret_cast<uintptr_t>(cpu_output) > UINTPTR_MAX - cpu_bytes) { return false; }
+    const size_t routes_per_row = size_t(dst.ne[1]);
+    for (size_t route = 0; route < prepared->rows;) {
+        if (!prepared->cpu_experts[prepared->original_ids[route]]) { ++route; continue; }
+        const size_t first = route++, row_end = (first / routes_per_row + 1) * routes_per_row;
+        while (route < row_end && prepared->cpu_experts[prepared->original_ids[route]]) { ++route; }
+        auto * output = static_cast<char *>(dst.data) + first / routes_per_row * dst.nb[2] + first % routes_per_row * dst.nb[1];
+        const auto * input = static_cast<const char *>(cpu_output) + first * cpu_route_stride;
+        if (cudaMemcpy2DAsync(output, dst.nb[1], input, cpu_route_stride, width, route - first,
+                cudaMemcpyHostToDevice, ctx.stream()) != cudaSuccess) { return false; }
+    }
+    return true;
 }
 
 void ggml_cuda_mmid_prefill_free(ggml_cuda_mmid_prefill_prepared * prepared) {
@@ -15930,6 +15996,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_moe_candidate_replace_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_LEARNING_SNAPSHOT_V1_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_learning_snapshot_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_LEARNING_RESTORE_V1_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_learning_restore_v1;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V2_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_statistics_initialize_v2;
     }
     if (strcmp(name, GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V1_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_statistics_initialize_v1;
