@@ -289,8 +289,19 @@ static void test(void) {
         "--spec-draft-moe-expert-profile", "draft.gguf", "--spec-draft-moe-profile-adapt", "occurrence-sync", "-md", "model.gguf"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.moe_expert_profile == "target.gguf" && params.moe_profile_adaptation == "occurrence");
+    assert(params.moe_cache_allocation == "auto");
     auto draft_params = common_base_params_to_speculative(params);
     assert(draft_params.moe_expert_profile == "draft.gguf" && draft_params.moe_profile_adaptation == "occurrence-sync");
+    argv = {"binary_name", "--moe-cache-allocation", "uniform", "--spec-draft-moe-cache-allocation", "uniform"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.moe_cache_allocation == "uniform" && common_base_params_to_speculative(params).moe_cache_allocation == "uniform");
+    for (const char * option : {"--moe-cache-allocation", "--spec-draft-moe-cache-allocation"}) {
+        argv = {"binary_name", option, "invalid"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+    params = common_params();
+    params.speculative.draft.moe_expert_profile = "draft.gguf";
+    params.speculative.draft.moe_profile_adaptation = "occurrence-sync";
     params.speculative.draft.moe_expert_profile.clear();
     params.speculative.draft.moe_profile_adaptation = "off";
     draft_params = common_base_params_to_speculative(params);

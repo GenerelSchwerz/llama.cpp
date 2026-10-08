@@ -155,7 +155,8 @@ struct llama_context {
             const llama_model & model,
                   llama_context_params params,
                   const char * profile_path = nullptr,
-                  const char * profile_adaptation = nullptr);
+                  const char * profile_adaptation = nullptr,
+                  const char * cache_allocation = "auto");
 
     ~llama_context();
 
@@ -426,6 +427,7 @@ private:
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
     void refresh_moe_candidates();
+    void plan_moe_profile_capacities(enum llama_context_type ctx_type, const uint8_t * profile_data, size_t profile_bytes);
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -587,6 +589,7 @@ private:
     std::vector<ggml_backend_moe_source_statistics_v1> moe_statistics;
     std::vector<const double *> moe_statistics_scores;
     bool moe_profile_failed = false;
+    std::unordered_map<const ggml_tensor *, uint32_t> moe_profile_capacities;
     uint32_t moe_hybrid_profile_adapt = 0;
     bool moe_hybrid_required = false;
     bool moe_hybrid_allow_runtime_allocations = false;

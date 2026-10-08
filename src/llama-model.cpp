@@ -2899,6 +2899,18 @@ const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & llama_model::moe_ex
     return pimpl->moe_cache_memory;
 }
 
+const std::vector<llama_moe_cache_memory> & llama_model::moe_expert_cache_group_memory(enum llama_context_type ctx_type) const {
+    return pimpl->moe_cache_group_context_memory[ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0];
+}
+
+ggml_backend_dev_t llama_model::moe_expert_cache_group_owner(size_t group_index) const {
+    for (const auto & bank : pimpl->moe_sources.at(group_index).banks) {
+        const auto found = pimpl->moe_cache_tensor_owners.find(bank.tensor);
+        if (found != pimpl->moe_cache_tensor_owners.end()) { return found->second; }
+    }
+    return nullptr;
+}
+
 std::map<ggml_backend_dev_t, size_t> llama_model::moe_expert_cache_host_staging(
         enum llama_context_type ctx_type) const {
     std::map<ggml_backend_dev_t, size_t> result;

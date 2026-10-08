@@ -1185,7 +1185,8 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
               const char * profile_path,
-              const char * profile_adaptation) :
+              const char * profile_adaptation,
+              const char * cache_allocation) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -1266,6 +1267,9 @@ llama_context::llama_context(
         }
     }
 
+    if (!cache_allocation || (strcmp(cache_allocation, "auto") && strcmp(cache_allocation, "uniform"))) {
+        throw std::runtime_error("MoE cache allocation must be auto or uniform");
+    }
     const char * path = profile_path;
     const char * adapt = profile_adaptation;
     if (!profile_path && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
@@ -1321,6 +1325,9 @@ llama_context::llama_context(
                 moe_profiles.push_back({down[layer], moe_profile_ranks[layer].data(), uint32_t(moe_profile_ranks[layer].size())});
             }
             LLAMA_LOG_INFO("moe-profile: file=%s groups=%zu identity=geometry-only policy=static ranked IDs use runtime capacities\n", path, moe_profiles.size());
+        }
+        if (!strcmp(cache_allocation, "auto") && source_core_enabled()) {
+            plan_moe_profile_capacities(params.ctx_type, bytes.data(), bytes.size());
         }
     }
 
@@ -2681,6 +2688,110 @@ extern "C" bool llama_moe_profile_snapshot(llama_context * ctx, uint32_t timeout
     return llama_moe_profile_snapshot_contexts(&ctx, 1, timeout_ms, write, user_data);
 }
 
+void llama_context::plan_moe_profile_capacities(enum llama_context_type ctx_type, const uint8_t * profile_data, size_t profile_bytes) {
+    const auto & sources = model.moe_sources();
+    const auto & memory = model.moe_expert_cache_group_memory(ctx_type);
+    if (memory.size() != sources.size()) { throw std::runtime_error("MoE cache capacity geometry mismatch"); }
+    std::vector<std::vector<long double>> strp_priorities(moe_profile_ranks.size());
+    if (!moe_profile_ranks.empty()) {
+        if (profile_bytes < 24 || memcmp(profile_data, "STRP", 4)) { throw std::runtime_error("MoE capacity profile format mismatch"); }
+        for (size_t layer = 0; layer < strp_priorities.size(); ++layer) { strp_priorities[layer].reserve(moe_profile_ranks[layer].size()); }
+        const uint32_t pairs = uint32_t(profile_data[20]) | uint32_t(profile_data[21]) << 8 |
+            uint32_t(profile_data[22]) << 16 | uint32_t(profile_data[23]) << 24;
+        if (pairs > (profile_bytes - 24) / 4) { throw std::runtime_error("MoE capacity profile pair extent mismatch"); }
+        for (uint32_t i = 0; i < pairs; ++i) {
+            const size_t offset = 24 + size_t(i) * 4;
+            const uint32_t layer = uint32_t(profile_data[offset]) | uint32_t(profile_data[offset + 1]) << 8;
+            if (layer >= strp_priorities.size()) { throw std::runtime_error("MoE capacity profile layer mismatch"); }
+            strp_priorities[layer].push_back(pairs - i);
+        }
+    }
+    struct owner_plan {
+        uint64_t budget = 0;
+        std::vector<ggml_moe_profile_capacity_group> groups;
+        std::vector<const ggml_tensor *> down;
+    };
+    std::map<ggml_backend_dev_t, owner_plan> owners;
+    for (size_t i = 0; i < sources.size(); ++i) {
+        const auto & source = sources[i];
+        const auto & cost = memory[i];
+        if (!cost.per_slot_device_bytes) { continue; }
+        const auto owner = model.moe_expert_cache_group_owner(i);
+        if (!owner) { throw std::runtime_error("MoE capacity profile has no accelerator owner"); }
+        const auto reg = ggml_backend_dev_backend_reg(owner);
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_CAPACITIES_V1_PROC_NAME)) {
+            throw std::runtime_error("MoE backend does not support profile capacities; select uniform allocation");
+        }
+        const auto uniform = model.moe_expert_cache_slots(owner);
+        if (uniform <= 0 || !cost.max_slots) { throw std::runtime_error("MoE uniform capacity has invalid group geometry"); }
+        const ggml_tensor * down = nullptr;
+        std::vector<ggml_moe_profile_bank_statistics> banks;
+        for (const auto & bank : source.banks) {
+            if (bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
+                    (source.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_ROUTED_MATRIX &&
+                     bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_ROUTED_WEIGHT)) { down = bank.tensor; }
+            if (moe_profile_ranks.empty() && bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                const llama_moe_profile_source_statistics * statistic = nullptr;
+                for (const auto & value : moe_profile_statistics.sources) {
+                    if (value.tensor == bank.tensor && value.domain == source.domain) { statistic = &value; break; }
+                }
+                if (!statistic || !bank.tensor) { throw std::runtime_error("MoE capacity profile misses a routed source"); }
+                banks.push_back({statistic->counts.data(), statistic->observations, bank.tensor->nb[2],
+                    uint32_t(statistic->counts.size()), statistic->scores.empty() ? nullptr : statistic->scores.data()});
+            }
+        }
+        if (!down || down->ne[2] <= 0 || uint64_t(down->ne[2]) != cost.max_slots) { throw std::runtime_error("MoE capacity profile has invalid down-bank geometry"); }
+        ggml_moe_profile_capacity_group group;
+        group.per_slot_bytes = cost.per_slot_device_bytes;
+        group.minimum_slots = std::min({uint32_t(uniform), cost.max_slots, std::max(1u, model.hparams.n_expert_used(source.layer))});
+        if (!moe_profile_ranks.empty()) {
+            if (source.layer < 0 || size_t(source.layer) >= strp_priorities.size()) { throw std::runtime_error("MoE capacity profile has no layer priority"); }
+            group.priorities = strp_priorities[source.layer];
+        } else {
+            std::vector<int32_t> ranks;
+            std::vector<long double> scores;
+            if (!ggml_moe_source_score_statistics(banks, scores) || !ggml_moe_source_rank_statistics(banks, ranks)) {
+                throw std::runtime_error("MoE capacity profile statistics are invalid");
+            }
+            for (const auto expert : ranks) { group.priorities.push_back(scores[expert] / group.per_slot_bytes); }
+        }
+        if (group.priorities.size() < std::min(uint32_t(uniform), cost.max_slots) || group.priorities.size() > cost.max_slots) {
+            throw std::runtime_error("MoE capacity profile has insufficient or excess ranks");
+        }
+        auto & plan = owners[owner];
+        if (uint32_t(uniform) > (UINT64_MAX - plan.budget) / group.per_slot_bytes) { throw std::overflow_error("MoE capacity budget overflow"); }
+        plan.budget += uint32_t(uniform) * group.per_slot_bytes;
+        plan.down.push_back(down);
+        plan.groups.push_back(std::move(group));
+    }
+    for (const auto & owner : owners) {
+        bool observed = false;
+        for (const auto & group : owner.second.groups) {
+            observed |= !group.priorities.empty() && group.priorities.front() > 0;
+        }
+        if (!observed) {
+            LLAMA_LOG_INFO("moe-cache-capacity: device=%s policy=uniform reason=no-profile-observations\n", ggml_backend_dev_name(owner.first));
+            continue;
+        }
+        std::vector<uint32_t> capacities;
+        uint64_t paid = 0;
+        if (!ggml_moe_profile_plan_capacities(owner.second.groups, owner.second.budget, capacities, paid)) {
+            throw std::runtime_error("MoE profile cannot fit fixed group capacities within the device budget");
+        }
+        uint32_t minimum = UINT32_MAX, maximum = 0;
+        uint64_t total = 0;
+        for (size_t i = 0; i < capacities.size(); ++i) {
+            if (!moe_profile_capacities.emplace(owner.second.down[i], capacities[i]).second) {
+                throw std::runtime_error("MoE capacity profile has ambiguous group identity");
+            }
+            minimum = std::min(minimum, capacities[i]); maximum = std::max(maximum, capacities[i]); total += capacities[i];
+        }
+        LLAMA_LOG_INFO("moe-cache-capacity: device=%s policy=profile groups=%zu slots=%llu min=%u max=%u variable_bytes=%llu budget_bytes=%llu fixed_costs=unchanged\n",
+            ggml_backend_dev_name(owner.first), capacities.size(), (unsigned long long) total, minimum, maximum,
+            (unsigned long long) paid, (unsigned long long) owner.second.budget);
+    }
+}
+
 void llama_context::refresh_moe_candidates() {
     if (!moe_candidate_refresh_pending) {
         return;
@@ -2703,7 +2814,22 @@ void llama_context::refresh_moe_candidates() {
             auto owner_candidates = candidates.get();
             owner_candidates.n_slots = std::max(
                 model.moe_expert_cache_slots(ggml_backend_get_device(endpoint.first)), 0);
-            const int32_t result = endpoint.second(endpoint.first, &owner_candidates);
+            int32_t result;
+            if (moe_profile_capacities.empty()) {
+                result = endpoint.second(endpoint.first, &owner_candidates);
+            } else {
+                const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(endpoint.first));
+                const auto replace = reinterpret_cast<ggml_backend_moe_candidate_replace_capacities_v1_t>(
+                    ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_CAPACITIES_V1_PROC_NAME));
+                if (!replace) { throw std::runtime_error("MoE backend does not support profile capacities; select uniform allocation"); }
+                std::vector<uint32_t> capacities(owner_candidates.n_groups, owner_candidates.n_slots);
+                for (uint32_t i = 0; i < owner_candidates.n_tensors; ++i) {
+                    const auto & tensor = owner_candidates.tensors[i];
+                    const auto found = moe_profile_capacities.find(tensor.tensor);
+                    if (found != moe_profile_capacities.end() && tensor.group_index < capacities.size()) { capacities[tensor.group_index] = found->second; }
+                }
+                result = replace(endpoint.first, &owner_candidates, capacities.data(), capacities.size());
+            }
             if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
                     result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
                 auto owner_disabled = disabled;
@@ -2712,6 +2838,10 @@ void llama_context::refresh_moe_candidates() {
             }
         }
     } catch (...) {
+        if (!moe_profile_capacities.empty()) {
+            moe_profile_failed = true;
+            LLAMA_LOG_ERROR("moe-cache-capacity: candidate publication failed; grouped execution disabled\n");
+        }
         for (const auto & endpoint : moe_candidate_replace_fns) {
             endpoint.second(endpoint.first, &disabled);
         }
@@ -7200,7 +7330,7 @@ static llama_context * llama_init_from_model_impl(
                  llama_model * model,
         llama_context_params   params,
                  const char * profile_path,
-                 const char * profile_adaptation) {
+                 const char * profile_adaptation, const char * cache_allocation = "auto") {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -7288,7 +7418,7 @@ static llama_context * llama_init_from_model_impl(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params, profile_path, profile_adaptation);
+        auto * ctx = new llama_context(*model, params, profile_path, profile_adaptation, cache_allocation);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -7316,6 +7446,11 @@ llama_context * llama_init_from_model_with_moe_profile(llama_model * model, llam
         return nullptr;
     }
     return llama_init_from_model_impl(model, params, path, adaptation);
+}
+
+llama_context * llama_init_from_model_with_moe_cache_policy(llama_model * model, llama_context_params params,
+        const char * path, const char * adaptation, const char * allocation) {
+    return llama_init_from_model_impl(model, params, path, adaptation, allocation);
 }
 
 // deprecated

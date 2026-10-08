@@ -49,6 +49,17 @@ class ggml_moe_source_profile_learning {
     uint64_t observations_ = 0;
 };
 
+GGML_API bool ggml_moe_source_score_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<long double> & scores);
+
+struct ggml_moe_profile_capacity_group {
+    uint64_t per_slot_bytes = 0;
+    uint32_t minimum_slots = 0;
+    std::vector<long double> priorities;
+};
+
+GGML_API bool ggml_moe_profile_plan_capacities(const std::vector<ggml_moe_profile_capacity_group> & groups,
+        uint64_t budget, std::vector<uint32_t> & capacities, uint64_t & paid_bytes);
+
 constexpr bool ggml_moe_source_tensor_byte_comparable =
     std::has_unique_object_representations<decltype(ggml_tensor::buffer)>::value &&
     std::has_unique_object_representations<decltype(ggml_tensor::op)>::value &&

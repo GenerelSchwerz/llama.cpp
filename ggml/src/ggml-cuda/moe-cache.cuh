@@ -1176,7 +1176,8 @@ public:
     ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
-    int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+    int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot,
+            const uint32_t * capacities = nullptr, uint32_t n_capacities = 0);
     bool initialize_profile(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
             ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
     bool initialize_statistics(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
@@ -1633,6 +1634,9 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v1(
 int32_t ggml_backend_cuda_moe_candidate_replace_v2(
     ggml_backend_t backend,
     const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+
+int32_t ggml_backend_cuda_moe_candidate_replace_capacities_v1(ggml_backend_t backend,
+    const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot, const uint32_t * capacities, uint32_t n_capacities);
 
 // Create a cache for one device.
 //   slot_size_bytes : size of one expert weight slab (uniform across slots)

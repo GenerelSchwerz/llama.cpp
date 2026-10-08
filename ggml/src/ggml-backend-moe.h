@@ -41,6 +41,7 @@ typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION 1u
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME "ggml_backend_moe_candidate_replace_v2"
+#define GGML_BACKEND_MOE_CANDIDATE_REPLACE_CAPACITIES_V1_PROC_NAME "ggml_backend_moe_candidate_replace_capacities_v1"
 #define GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME "ggml_backend_required_grouped_execution_supported"
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
@@ -306,6 +307,8 @@ struct ggml_backend_moe_candidate_snapshot_v2 {
 };
 
 typedef int32_t (*ggml_backend_moe_candidate_replace_v2_t)(ggml_backend_t backend, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+typedef int32_t (*ggml_backend_moe_candidate_replace_capacities_v1_t)(ggml_backend_t backend,
+        const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot, const uint32_t * capacities, uint32_t n_capacities);
 typedef bool (*ggml_backend_moe_cache_configure_sources_t)(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 typedef bool (*ggml_backend_required_grouped_execution_supported_t)(ggml_backend_t backend);
 

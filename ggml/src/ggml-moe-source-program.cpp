@@ -79,7 +79,7 @@ bool ggml_moe_source_scores_valid(const ggml_backend_moe_source_statistics_v1 * 
     return true;
 }
 
-bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks) try {
+bool ggml_moe_source_score_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<long double> & output) try {
     if (banks.empty() || banks.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) { return false; }
     const auto experts = banks.front().n_experts;
     uint64_t payload = 0;
@@ -94,6 +94,14 @@ bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_sta
         const auto weight = static_cast<long double>(bank.payload_bytes) / payload;
         for (uint32_t i = 0; i < experts; ++i) { scores[i] += weight * (bank.scores ? static_cast<long double>(bank.scores[i]) : static_cast<long double>(bank.counts[i]) / bank.observations); }
     }
+    output.swap(scores);
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks) try {
+    std::vector<long double> scores;
+    if (!ggml_moe_source_score_statistics(banks, scores)) { return false; }
+    const auto experts = scores.size();
     std::vector<int32_t> result;
     result.reserve(experts);
     for (uint32_t i = 0; i < experts; ++i) { result.push_back(int32_t(i)); }
@@ -204,6 +212,43 @@ bool ggml_moe_source_learning_valid(const ggml_backend_moe_source_learning_v1 * 
             if (!std::isfinite(record.usage[expert]) || record.usage[expert] < 0 || record.usage[expert] > float(record.source.counts[expert])) { return false; }
         }
     }
+    return true;
+} catch (...) { return false; }
+
+bool ggml_moe_profile_plan_capacities(const std::vector<ggml_moe_profile_capacity_group> & groups,
+        uint64_t budget, std::vector<uint32_t> & capacities, uint64_t & paid_bytes) try {
+    if (groups.empty() || groups.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) { return false; }
+    struct candidate { uint32_t group; uint32_t rank; long double priority; };
+    std::vector<candidate> candidates;
+    std::vector<uint32_t> slots(groups.size());
+    uint64_t paid = 0;
+    size_t count = 0;
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto & group = groups[i];
+        if (!group.per_slot_bytes || !group.minimum_slots || group.minimum_slots > group.priorities.size() ||
+                group.priorities.size() > (1u << 22) - count || group.minimum_slots > (budget - paid) / group.per_slot_bytes) { return false; }
+        paid += group.minimum_slots * group.per_slot_bytes;
+        count += group.priorities.size();
+        slots[i] = group.minimum_slots;
+        for (size_t rank = 0; rank < group.priorities.size(); ++rank) {
+            const auto score = group.priorities[rank];
+            if (!std::isfinite(score) || score < 0 || (rank && score > group.priorities[rank - 1])) { return false; }
+            if (rank >= group.minimum_slots) { candidates.push_back({uint32_t(i), uint32_t(rank), score}); }
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+        if (a.priority != b.priority) { return a.priority > b.priority; }
+        return a.group != b.group ? a.group < b.group : a.rank < b.rank;
+    });
+    for (const auto & candidate : candidates) {
+        const auto & group = groups[candidate.group];
+        if (candidate.rank == slots[candidate.group] && group.per_slot_bytes <= budget - paid) {
+            ++slots[candidate.group];
+            paid += group.per_slot_bytes;
+        }
+    }
+    capacities.swap(slots);
+    paid_bytes = paid;
     return true;
 } catch (...) { return false; }
 

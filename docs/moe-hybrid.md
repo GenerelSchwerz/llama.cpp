@@ -62,6 +62,20 @@ Add a supported MTP draft model with the normal speculative options:
 
 ## Profiles and adaptation
 
+### Profile-aware allocation
+
+The default `--moe-cache-allocation auto` keeps the existing allocation without a profile. With a profile and generic source execution, it distributes fixed capacities across routed groups using actual storage costs and profile priorities, within the existing per-device cache budget. Each group retains a positive execution floor. Statistics profiles rank by expected benefit per storage byte; STRP files retain their global pair order.
+
+Use `--moe-cache-allocation uniform` to keep the existing common capacity even with a profile. Draft and MTP contexts have the separate `--spec-draft-moe-cache-allocation auto|uniform` option.
+
+```sh
+--moe-hybrid on --moe-expert-cache-size 64 --moe-expert-profile calibration.gguf
+```
+
+The slot option establishes the original storage budget; profile allocation can give individual groups more or fewer than 64 slots. Fixed and shared allocation costs remain reserved. Capacities are selected during context construction and stay fixed during generation; online adaptation changes cached identities within them. This does not resize caches during requests or change the compute kernels. Look for `moe-cache-capacity` and effective grouped payload counters in the logs.
+
+Without generic source execution, allocation stays uniform. A backend that cannot publish group capacities rejects profile allocation; select `uniform` to retain its previous behavior.
+
 Keep three decisions separate:
 
 | Decision | Input/control |

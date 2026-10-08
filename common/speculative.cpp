@@ -2897,6 +2897,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.moe_profile_save.clear();
     result.moe_expert_profile = params_spec.moe_expert_profile;
     result.moe_profile_adaptation = params_spec.moe_profile_adaptation;
+    result.moe_cache_allocation = params_spec.moe_cache_allocation;
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
@@ -3021,8 +3022,9 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
-        llama_context * ctx_dft = params.moe_expert_profile.empty() ? llama_init_from_model(model_dft, cparams) :
-            llama_init_from_model_with_moe_profile(model_dft, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
+        llama_context * ctx_dft = llama_init_from_model_with_moe_cache_policy(model_dft, cparams,
+            params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str(),
+            params.moe_expert_profile.empty() ? nullptr : params.moe_profile_adaptation.c_str(), params.moe_cache_allocation.c_str());
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -3034,8 +3036,9 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
-        llama_context * ctx_dft = params.moe_expert_profile.empty() ? llama_init_from_model(model_tgt, cparams) :
-            llama_init_from_model_with_moe_profile(model_tgt, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
+        llama_context * ctx_dft = llama_init_from_model_with_moe_cache_policy(model_tgt, cparams,
+            params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str(),
+            params.moe_expert_profile.empty() ? nullptr : params.moe_profile_adaptation.c_str(), params.moe_cache_allocation.c_str());
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;

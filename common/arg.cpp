@@ -381,6 +381,11 @@ static void validate_moe_cache_arguments(const common_params & params) {
     }
 }
 
+static std::string parse_moe_cache_allocation(const std::string & value) {
+    if (value != "auto" && value != "uniform") { throw std::invalid_argument("MoE cache allocation must be auto or uniform"); }
+    return value;
+}
+
 static std::string clean_file_name(const std::string & fname) {
     std::string clean_fname = fname;
     string_replace_all(clean_fname, "\\", "_");
@@ -2990,6 +2995,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--moe-cache-allocation"}, "auto|uniform",
+        "cache allocation: auto uses profile priorities when a profile is present; uniform keeps the existing per-layer capacity (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_allocation = parse_moe_cache_allocation(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_ALLOCATION"));
+    add_opt(common_arg(
         {"--moe-expert-profile"}, "FILE",
         "expert statistics or ranked profile for this model; overrides global profile settings",
         [](common_params & params, const std::string & value) {
@@ -4487,6 +4499,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
       .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-cache-allocation"}, "auto|uniform",
+        "draft cache allocation policy (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.moe_cache_allocation = parse_moe_cache_allocation(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_CACHE_ALLOCATION"));
     add_opt(common_arg(
         {"--spec-draft-moe-expert-profile"}, "FILE",
         "expert statistics or ranked profile for the draft context",
