@@ -15728,6 +15728,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_moe_candidate_replace_v2;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_CAPACITIES_V1_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_candidate_replace_capacities_v1;
+    }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_required_grouped_execution_supported;

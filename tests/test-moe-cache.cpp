@@ -153,6 +153,7 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_grouped_graph_replay_lifecycle(dev);
+        test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
         test_grouped_graph_replay_lifecycle(dev, 393216, 2);
         test_grouped_graph_replay_lifecycle(dev, 524288, 1);
         test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);

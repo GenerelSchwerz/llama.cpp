@@ -347,6 +347,7 @@ struct common_params_speculative_draft {
     std::vector<size_t> moe_expert_cache_byte_budgets;
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
+    std::string moe_cache_allocation = "auto";
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -557,6 +558,7 @@ struct common_params {
     std::vector<size_t> moe_expert_cache_byte_budgets;
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
+    std::string moe_cache_allocation = "auto";
     bool moe_early_router = false;
     std::string moe_hybrid; // empty preserves the process environment
     std::string moe_gpu_miss_fraction;

@@ -639,6 +639,23 @@ void test_candidate_graph_coverage_ledger() {
     CHECK(registry.replace(&v2_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().n_groups == 2 && registry.state().n_weights == 4);
 
+    std::array<uint32_t, 7> capacities = {{2, 3, 12, 12, 12, 12, 12}};
+    CHECK(registry.replace(&v2_snapshot, capacities.data(), capacities.size()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    ggml_cuda_moe_candidate_group_key capacity_key;
+    ggml_cuda_moe_candidate_group_info capacity_info;
+    CHECK(registry.find_down_group_key(down, &capacity_key) && registry.get_group(capacity_key, &capacity_info) && capacity_info.n_slots == 2);
+    CHECK(registry.find_down_group_key(ungated_down, &capacity_key) && registry.get_group(capacity_key, &capacity_info) && capacity_info.n_slots == 3);
+    CHECK(registry.replace(&v2_snapshot, capacities.data(), capacities.size() - 1) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+    CHECK(!registry.state().accepted);
+    capacities[0] = 0;
+    CHECK(registry.replace(&v2_snapshot, capacities.data(), capacities.size()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+    CHECK(!registry.state().accepted);
+    capacities[0] = UINT32_MAX;
+    CHECK(registry.replace(&v2_snapshot, capacities.data(), capacities.size()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+    CHECK(!registry.state().accepted);
+    CHECK(registry.replace(&v2_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.find_down_group_key(down, &capacity_key) && registry.get_group(capacity_key, &capacity_info) && capacity_info.n_slots == 12);
+
     const candidate_route v2_route = candidate_top_k_route(fixture, 4, 2);
     std::array<ggml_tensor *, 12> v2_readers = {{
         candidate_mmid(fixture, gate_up, v2_route.ids),

@@ -1348,8 +1348,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    llama_context * lctx = params.moe_expert_profile.empty() ? llama_init_from_model(model, cparams) :
-        llama_init_from_model_with_moe_profile(model, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
+    llama_context * lctx = llama_init_from_model_with_moe_cache_policy(model, cparams,
+        params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str(),
+        params.moe_expert_profile.empty() ? nullptr : params.moe_profile_adaptation.c_str(), params.moe_cache_allocation.c_str());
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;

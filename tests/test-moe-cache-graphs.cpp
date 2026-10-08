@@ -64,8 +64,32 @@ void test_grouped_graph_replay_lifecycle(
         const auto sources = candidate_snapshot_v2(12, &group, 1, tensors.data(), tensors.size());
         CHECK(ggml_backend_cuda_moe_cached_configure_sources(buft, &sources));
     }
-    register_active_grouped_dispatch(
-        backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    if (pageable) {
+        const ggml_backend_moe_candidate_group_v2 group = {
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0,
+        };
+        std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
+        for (uint32_t i = 0; i < graph.banks.size(); ++i) {
+            tensors.push_back({graph.banks[i], 0, graph.roles[i], GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE,
+                GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER, 0});
+        }
+        if (graph.down_scale) {
+            tensors.push_back({graph.down_scale, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE,
+                GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER, 0});
+        }
+        const auto snapshot = candidate_snapshot_v2(12, &group, 1, tensors.data(), tensors.size());
+        const uint32_t capacity = 3;
+        CHECK(ggml_backend_cuda_moe_candidate_replace_capacities_v1(backend.get(), &snapshot, &capacity, 1) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+        CHECK(context != nullptr);
+        ggml_cuda_moe_candidate_group_key key;
+        ggml_cuda_moe_candidate_group_info info;
+        CHECK(context->find_down_group_key(graph.down, &key) && context->get_group(key, &info) && info.n_slots == capacity);
+    } else {
+        register_active_grouped_dispatch(
+            backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    }
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
     CHECK(context != nullptr);
     const int32_t routes[] = {3, 5};

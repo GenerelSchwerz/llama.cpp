@@ -817,6 +817,8 @@ struct llama_model {
     bool moe_expert_cache_enabled() const;
     uint32_t moe_early_router_max_rows() const;
     const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & moe_expert_cache_memory() const;
+    const std::vector<llama_moe_cache_memory> & moe_expert_cache_group_memory(enum llama_context_type ctx_type) const;
+    ggml_backend_dev_t moe_expert_cache_group_owner(size_t group_index) const;
     std::map<ggml_backend_buffer_type_t, size_t> moe_expert_cache_memory_breakdown(enum llama_context_type ctx_type) const;
     std::map<ggml_backend_dev_t, size_t> moe_expert_cache_host_staging(enum llama_context_type ctx_type) const;
     void build_moe_sources();

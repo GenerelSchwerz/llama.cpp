@@ -889,6 +889,31 @@ struct profile_corpus_average {
 };
 
 static int test_source_profile_statistics() {
+    {
+        std::vector<ggml_moe_profile_capacity_group> groups{{10, 1, {9, 8, 7, 6}}, {20, 1, {5, 4, 3, 2}}};
+        std::vector<uint32_t> capacities;
+        uint64_t paid = 0;
+        if (!ggml_moe_profile_plan_capacities(groups, 60, capacities, paid) || capacities != std::vector<uint32_t>{4, 1} || paid != 60) { return 1; }
+        for (uint64_t budget = 30; budget <= 130; ++budget) {
+            if (!ggml_moe_profile_plan_capacities(groups, budget, capacities, paid) || capacities.size() != groups.size() ||
+                    capacities[0] < 1 || capacities[0] > 4 || capacities[1] < 1 || capacities[1] > 4 ||
+                    paid != capacities[0] * 10 + capacities[1] * 20 || paid > budget) { return 1; }
+        }
+        const auto unchanged = capacities;
+        const auto unchanged_paid = paid;
+        for (uint32_t variant = 0; variant < 7; ++variant) {
+            auto invalid = groups;
+            uint64_t budget = 60;
+            if (variant == 0) { invalid[0].per_slot_bytes = 0; }
+            if (variant == 1) { invalid[0].minimum_slots = 0; }
+            if (variant == 2) { invalid[0].minimum_slots = 5; }
+            if (variant == 3) { invalid[0].priorities[1] = 10; }
+            if (variant == 4) { invalid[0].priorities[0] = std::numeric_limits<long double>::infinity(); }
+            if (variant == 5) { invalid[0].per_slot_bytes = UINT64_MAX; }
+            if (variant == 6) { budget = 29; }
+            if (ggml_moe_profile_plan_capacities(invalid, budget, capacities, paid) || capacities != unchanged || paid != unchanged_paid) { return 1; }
+        }
+    }
     const uint64_t small[] = {9, 1, 0}, scaled[] = {900, 100, 0}, other[] = {0, 10, 0}, zero[] = {0, 0, 0};
     std::vector<ggml_moe_profile_bank_statistics> banks{{small, 10, 9, 3}, {other, 10, 1, 3}};
     std::vector<int32_t> ranks;

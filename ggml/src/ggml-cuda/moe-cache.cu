@@ -649,6 +649,7 @@ struct moe_candidate_bank_record {
 };
 
 struct moe_candidate_group_record {
+    uint32_t n_slots = 0;
     uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
     uint32_t domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_INVALID;
     uint32_t semantic_group_index = UINT32_MAX;
@@ -2266,6 +2267,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
     }
 
     moe_candidate_group_record group;
+    group.n_slots = n_slots;
     group.layout = input.layout;
     group.domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
     group.semantic_group_index = group_index;
@@ -8196,7 +8198,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         input = {};
         input.candidate = key;
         input.resource_generation = resource_generation;
-        input.n_slots = table.n_slots;
+        input.n_slots = table.groups[key.group_index].n_slots;
         input.n_groups = static_cast<uint32_t>(table.groups.size());
         const auto & group = table.groups[key.group_index];
         input.down = group.down;
@@ -8332,7 +8334,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         const auto & snapshot = resource.snapshot;
         const auto & candidate = snapshot.acquisition.candidate;
         if (!state.accepted || candidate.generation != state.generation || candidate.group_index >= table.groups.size() ||
-                snapshot.n_slots != table.n_slots) {
+                snapshot.n_slots != table.groups[candidate.group_index].n_slots) {
             return false;
         }
         const auto & group = table.groups[candidate.group_index];
@@ -8757,7 +8759,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!draining && !replacement_pending && state.accepted && input.candidate.generation == state.generation &&
-                    input.candidate.group_index < table.groups.size() && input.n_slots == table.n_slots &&
+                    input.candidate.group_index < table.groups.size() && input.n_slots == table.groups[input.candidate.group_index].n_slots &&
                     input.n_groups == table.groups.size()) {
                 const auto & group = table.groups[input.candidate.group_index];
                 if (input.down == group.down && input.layout == group.layout && input.n_banks == moe_candidate_resource_bank_count(group)) {
@@ -10865,7 +10867,8 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
     }
 }
 
-int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot) {
+int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot,
+        const uint32_t * capacities, uint32_t n_capacities) {
     if (snapshot == nullptr) {
         return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT);
     }
@@ -10873,11 +10876,33 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
             snapshot->abi_version != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION || snapshot->struct_size != sizeof(*snapshot)) {
         return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
     }
+    if ((capacities == nullptr) != (n_capacities == 0) || (capacities && n_capacities != snapshot->n_groups)) {
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+    }
     try {
         moe_candidate_table table;
         const auto rejection = moe_candidate_build_v2(impl_->owner, *snapshot, table);
         if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
             return impl_->publish_failure(rejection, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+        }
+        if (capacities) {
+            table.slot_bound_bytes = 0;
+            for (auto & group : table.groups) {
+                const uint32_t slots = capacities[group.semantic_group_index];
+                if (!slots || slots > INT32_MAX || !group.down || slots > group.down->ne[2]) {
+                    return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+                }
+                group.n_slots = slots;
+                moe_candidate_hash_value(table.logical_signature, slots);
+                for (const auto & bank : group.banks) {
+                    if (!moe_candidate_slot_resource(bank)) { continue; }
+                    uint64_t bytes = 0;
+                    if (!moe_candidate_mul(bank.info.expert_stride, slots, bytes) ||
+                            !moe_candidate_add(table.slot_bound_bytes, bytes, table.slot_bound_bytes)) {
+                        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+                    }
+                }
+            }
         }
         return impl_->publish(std::move(table));
     } catch (...) {
@@ -10946,7 +10971,7 @@ bool ggml_cuda_moe_grouped_context::get_group(
         info->flags = group.flags;
         info->n_banks = static_cast<uint32_t>(group.banks.size());
         info->n_resource_banks = moe_candidate_resource_bank_count(group);
-        info->n_slots = impl_->table.n_slots;
+        info->n_slots = group.n_slots;
     }
     return true;
 }
@@ -12418,8 +12443,8 @@ bool ggml_cuda_moe_grouped_context::initialize_placement(const ggml_backend_moe_
                 banks.push_back({value.counts, value.observations, resource->info.expert_stride, value.n_experts, scores ? scores[size_t(*statistic - statistics)] : nullptr});
             }
             std::vector<int32_t> ranks;
-            if (!ggml_moe_source_rank_statistics(banks, ranks) || !impl_->table.n_slots || ranks.size() < impl_->table.n_slots) { return false; }
-            ranks.resize(impl_->table.n_slots);
+            if (!ggml_moe_source_rank_statistics(banks, ranks) || !group.n_slots || ranks.size() < group.n_slots) { return false; }
+            ranks.resize(group.n_slots);
             ggml_cuda_moe_complete_group_key key;
             key.candidate = {impl_->state.generation, index}; key.layout = group.layout; key.n_banks = count;
             keys.push_back(key); selected.push_back(std::move(ranks));
@@ -12910,7 +12935,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             observation.unproven = true;
         }
         const ggml_tensor * ids = node->src[2];
-        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots, source_residency);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], group.n_slots, source_residency);
         const bool prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL && !geometry.required_grouped;
         observation.prefill = observation.prefill || prefill;
         observation.decode = observation.decode || !prefill;
@@ -12968,7 +12993,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const auto capability = moe_candidate_capability(
             bank.info.tensor, bank.info.source_data, bank.info.byte_extent, bank.info.expert_stride, bank.ne, bank.nb,
             bank.info.role, bank.info.type, input_type, node->type, n_tokens,
-            geometry.top_k, geometry.n_rows, geometry.n_routes, geometry.row_stride, impl_->state.n_slots,
+            geometry.top_k, geometry.n_rows, geometry.n_routes, geometry.row_stride, group.n_slots,
             geometry.row_semantics, geometry.strategy, impl_->device);
         if (bank.slot_index >= observation.n_banks) {
             observation.unproven = true;
@@ -12976,7 +13001,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             observation.capabilities[bank.slot_index] = capability;
         } else if (!moe_candidate_capability_matches(
                 observation.capabilities[bank.slot_index], bank, node, geometry.top_k, geometry.n_rows,
-                geometry.n_routes, geometry.row_stride, impl_->state.n_slots, impl_->device) ||
+                geometry.n_routes, geometry.row_stride, group.n_slots, impl_->device) ||
                 observation.capabilities[bank.slot_index].consumer != capability.consumer ||
                 observation.capabilities[bank.slot_index].reason != capability.reason) {
             observation.unproven = true;
@@ -13467,7 +13492,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                     bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
                 return false;
             }
-            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], group.n_slots);
             if (!geometry.tensor_valid) {
                 geometry_invalid = true;
             }
@@ -13512,7 +13537,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         if (bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
             source_invalid = true;
         }
-        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], group.n_slots);
         const bool reader_prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL && !geometry.required_grouped;
         prefill = prefill || reader_prefill;
         decode = decode || !reader_prefill;
@@ -13524,7 +13549,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         if (geometry.grouped_eligible) {
             if (bank.slot_index >= record.n_banks || !moe_candidate_capability_matches(
                     record.capabilities[bank.slot_index], bank, node, geometry.top_k, geometry.n_rows,
-                    geometry.n_routes, geometry.row_stride, impl_->state.n_slots, impl_->device)) {
+                    geometry.n_routes, geometry.row_stride, group.n_slots, impl_->device)) {
                 capability_invalid = true;
             } else if (!moe_candidate_capability_invariant_valid(record.capabilities[bank.slot_index])) {
                 capability_invalid = true;
@@ -13858,7 +13883,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
             const auto & bank = group.banks[bank_index];
             const ggml_tensor * ids = node != nullptr ? node->src[2] : nullptr;
-            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], group.n_slots);
             if (node == nullptr || node != record.nodes[role_slot] || node->op != GGML_OP_MUL_MAT_ID ||
                     (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
                     bank.info.role != role || !moe_candidate_record_matches(bank, node->src[0]) || !moe_candidate_ids_valid(ids) ||
@@ -14148,7 +14173,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
             memcpy(grouped_nb, bank.nb, sizeof(grouped_nb));
             int64_t materialized_experts = 0;
             if (strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT) {
-                materialized_experts = impl_->state.n_slots;
+                materialized_experts = resource->snapshot.n_slots;
             } else if (strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED && bank.ne[2] > 0) {
                 materialized_experts = capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP ? bank.ne[2] :
                     capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_DIRECT ? std::min<int64_t>(n_routes, bank.ne[2]) : 0;
@@ -14169,7 +14194,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
                     memcmp(capability.grouped_nb, grouped_nb, sizeof(grouped_nb)) != 0 ||
                     capability.strategy != strategy ||
                     capability.top_k != top_k || capability.n_rows != n_rows || capability.n_routes != n_routes ||
-                    capability.row_stride != row_stride || capability.n_slots != impl_->state.n_slots) {
+                    capability.row_stride != row_stride || capability.n_slots != resource->snapshot.n_slots) {
                 return false;
             }
             moe_grouped_resource_fingerprint_add(result, device.bank_data[bank_index]);
@@ -15450,12 +15475,12 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_host_
             const auto & capability = group->capabilities[bank_index];
             if (bank == nullptr || capability.strategy != GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED ||
                     !moe_candidate_capability_matches(capability, *bank, node,
-                        top_k, n_rows, n_routes, row_stride, impl_->state.n_slots, impl_->device) ||
+                        top_k, n_rows, n_routes, row_stride, candidate.n_slots, impl_->device) ||
                     !moe_candidate_capability_supported(capability)) {
                 return fail();
             }
         }
-        n_slots = impl_->state.n_slots;
+        n_slots = candidate.n_slots;
         n_experts = static_cast<uint32_t>(node->src[0]->ne[2]);
     }
     if (n_slots == 0 || n_experts == 0 || n_unique_experts > n_experts) {
@@ -17045,7 +17070,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph
                     !moe_candidate_capability_matches(group->capabilities[bank_index], bank, node,
                         static_cast<uint32_t>(group->key.ids.ne[0]), static_cast<uint32_t>(group->key.ids.ne[1]),
                         static_cast<uint32_t>(group->key.ids.ne[0] * group->key.ids.ne[1]),
-                        static_cast<uint32_t>(group->key.ids.nb[1] / sizeof(int32_t)), impl_->state.n_slots, impl_->device) ||
+                        static_cast<uint32_t>(group->key.ids.nb[1] / sizeof(int32_t)), candidate.n_slots, impl_->device) ||
                     !moe_candidate_capability_supported(group->capabilities[bank_index])) {
                 return record_prepare_error();
             }
@@ -17184,7 +17209,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_prefi
                 !moe_candidate_record_matches(candidate.banks[binding.bank_index], node->src[0])) {
             return fail();
         }
-        n_slots = impl_->state.n_slots;
+        n_slots = candidate.n_slots;
         n_experts = static_cast<uint32_t>(node->src[0]->ne[2]);
     }
     if (n_slots == 0 || n_experts == 0) {
@@ -17891,6 +17916,25 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
     }
     return ctx->moe_grouped_context->replace(snapshot);
+}
+
+extern "C"
+int32_t ggml_backend_cuda_moe_candidate_replace_capacities_v1(
+        ggml_backend_t backend,
+        const ggml_backend_moe_candidate_snapshot_v2 * snapshot, const uint32_t * capacities, uint32_t n_capacities) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || backend->device == nullptr) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT;
+    }
+
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    try {
+        std::call_once(ctx->moe_grouped_context_once, [&]() {
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device, ctx->moe_early_router_max_rows);
+        });
+    } catch (...) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+    }
+    return ctx->moe_grouped_context->replace(snapshot, capacities, n_capacities);
 }
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend) {

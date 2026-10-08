@@ -350,3 +350,7 @@ LLAMA_API bool llama_moe_profile_initialize(struct llama_context * ctx);
 // Explicit profile selection overrides global profile settings and is copied during construction.
 extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_profile(
         struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation);
+
+// Allocation is auto or uniform. A null profile keeps normal profile selection.
+extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_cache_policy(
+        struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation, const char * allocation);
