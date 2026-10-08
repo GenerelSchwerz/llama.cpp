@@ -45,7 +45,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -106,13 +106,17 @@ static __global__ void mul_mat_f(
 
     const int channel_x   = has_ids ? expert_idx : (channel_dst / channel_ratio);
     const int channel_y   = channel_dst;
-    const int sample_dst  = blockIdx.z;
+    const int sample_dst  = blockIdx.z / warp_splits;
+    const int split       = blockIdx.z % warp_splits;
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
+    if constexpr (warp_splits > 1) {
+        dst += int64_t(split) * stride_sample_dst * (gridDim.z / warp_splits);
+    }
 
     if constexpr (has_ids) {
         constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
@@ -168,7 +172,7 @@ static __global__ void mul_mat_f(
     }
 
 
-    for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
+    for (int col = (split*nwarps + threadIdx.y)*warp_size + threadIdx.x; col < ncols; col += warp_splits*nwarps*warp_size) {
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
@@ -272,7 +276,12 @@ static __global__ void mul_mat_f(
             for (int i1 = 0; i1 < sizeof(sum)/sizeof(sum[0]); ++i1) {
                 const int i = i0 + i1*warp_size + threadIdx.x;
 
-                sum[i1] += buf_iw[j*kiw + i];
+                if constexpr (warp_splits > 1) {
+                    static_assert(nwarps == 1 && !has_ids, "one original warp per split");
+                    sum[i1] = buf_iw[j*kiw + i];
+                } else {
+                    sum[i1] += buf_iw[j*kiw + i];
+                }
             }
         }
 

@@ -10,6 +10,49 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+
+static __global__ void mul_mat_f_reduce_warps(const float * partial, float * dst, const int64_t count) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int warp = 0; warp < 8; ++warp) {
+        sum += partial[int64_t(warp)*count + i];
+    }
+    dst[i] = sum;
+}
+
+template <typename T, int cols>
+static void mul_mat_f_split_warps(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, float * partial) {
+    const int vals = sizeof(T) == 4 && !std::is_same_v<T, float> ? 2 : 1;
+    const int64_t count = ggml_nelements(dst);
+    const dim3 blocks(src0->ne[1]/MMF_ROWS_PER_BLOCK, dst->ne[2], dst->ne[3]*8);
+    const dim3 threads(32, 1, 1);
+    const int shared = std::max(16*36*4, GGML_PAD(cols, 8)*(32 + 4)*4);
+    // Each block keeps one original warp's K sequence; the second launch keeps its sum order.
+    mul_mat_f<T, MMF_ROWS_PER_BLOCK, cols, 1, false, 8><<<blocks, threads, shared, ctx.stream()>>>(
+        (const T *) src0->data, (const float *) src1->data, nullptr, partial,
+        src0->ne[0]/vals, cols, dst->ne[2], src0->nb[1]/sizeof(T), src1->nb[1]/sizeof(float)/vals, dst->nb[1]/sizeof(float),
+        0, 0, dst->ne[2]/src0->ne[2], src0->nb[2]/sizeof(T), src1->nb[2]/sizeof(float), dst->nb[2]/sizeof(float),
+        dst->ne[3]/src0->ne[3], src0->nb[3]/sizeof(T), src1->nb[3]/sizeof(float), dst->nb[3]/sizeof(float));
+    mul_mat_f_reduce_warps<<<(count + 255)/256, 256, 0, ctx.stream()>>>(partial, (float *) dst->data, count);
+}
+
+template <typename T>
+static void mul_mat_f_split_warps_switch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, float * partial) {
+    switch (dst->ne[1]) {
+#define MMF_SPLIT_CASE(cols) case cols: mul_mat_f_split_warps<T, cols>(ctx, src0, src1, dst, partial); break
+        MMF_SPLIT_CASE(1);  MMF_SPLIT_CASE(2);  MMF_SPLIT_CASE(3);  MMF_SPLIT_CASE(4);
+        MMF_SPLIT_CASE(5);  MMF_SPLIT_CASE(6);  MMF_SPLIT_CASE(7);  MMF_SPLIT_CASE(8);
+        MMF_SPLIT_CASE(9);  MMF_SPLIT_CASE(10); MMF_SPLIT_CASE(11); MMF_SPLIT_CASE(12);
+        MMF_SPLIT_CASE(13); MMF_SPLIT_CASE(14); MMF_SPLIT_CASE(15); MMF_SPLIT_CASE(16);
+#undef MMF_SPLIT_CASE
+        default: GGML_ABORT("unsupported column count");
+    }
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
@@ -99,6 +142,24 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    const int64_t blocks = ne01/rows_per_block * ne2 * ne3;
+    const int64_t packed_cols = ne00 / (src0->type == GGML_TYPE_F32 ? 1 : 2);
+    const int64_t iterations = (packed_cols + 16*warp_size - 1)/(16*warp_size);
+    const bool original_eight_warps = iterations < (packed_cols + 14*warp_size - 1)/(14*warp_size);
+    if (!ids && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
+            ggml_is_contiguous(dst) && packed_cols >= 2048 && original_eight_warps &&
+            blocks < ggml_cuda_info().devices[device].nsm/2 && ne3 <= 65535/8) {
+        ggml_cuda_pool_alloc<float> partial(ctx.pool(), ggml_nelements(dst)*8);
+        switch (src0->type) {
+            case GGML_TYPE_F32:  mul_mat_f_split_warps_switch<float>(ctx, src0, src1, dst, partial.get()); break;
+            case GGML_TYPE_F16:  mul_mat_f_split_warps_switch<half2>(ctx, src0, src1, dst, partial.get()); break;
+            case GGML_TYPE_BF16: mul_mat_f_split_warps_switch<nv_bfloat162>(ctx, src0, src1, dst, partial.get()); break;
+            default: GGML_ABORT("unsupported type");
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
