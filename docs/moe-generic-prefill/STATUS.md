@@ -1,5 +1,15 @@
 # Status
 
+## Features1/2 qualification resumed, 2026-10-08
+
+The owner requested completeness testing, then original sizes and Flash Next with RAM/VRAM caps removed. Timeout, fatal-CUDA handling, GGML_NO_BACKTRACE and ordered shared locks remain. A fresh unlimited-scope CPU synthetic fatal test verifies whole-tree teardown before the Flash test. The original incident root remains unproven; no frozen faulty control was replayed.
+
+Feature1 now passes actual context/file saving, exact cold snapshots in fresh model instances at two cache sizes, and four continued source windows with retained counts/heat/prior/history. Six cases cover generated LLAMA/Qwen3MoE F32/Q4, local Tiny Mixtral Q5_K and Flash Next RCO IQ3_XXS. Tiny Mixtral uses4096 context/2048 prompt rows/cache4->5. Flash uses4096 context/2048 prompt rows/cache64->65, MTP off and load mode none:144/144 sources observed,2374368 saved bytes, exact cold snapshot and both continuations pass. Flash takes72.28s total with53.69GiB accounted RAM and11770MiB sampled GPU; whole tree is gone. The corrected resource-bound candidate separately passes the same Flash check in74.36s with54.49GiB accounted RAM and11908MiB sampled GPU, exact144-source snapshots and both continuations. This is correctness, not matched serving performance or held-out quality.
+
+Static/synchronous/asynchronous owner checks on the committed source pass24 retained-owner ordinary-prefill transitions; occurrence adaptation also passes16 cold restores and16 controller continuations. Expanded CPU-assisted private-prefill checks exposed a2048-row Q5_K fixed-pool rejection before CPU execution:4803584bytes reserved versus9391104bytes required by smaller-wave MMQ fixup. The generic backend bound and original-ID map reserve now correct it. All30 checks across Q5_K/IQ4_NL/Q4_K/Q8_0/F32,9/65/2048 rows and two steps pass at unchanged2e-5 tolerance; CUDA memcheck passes the same30 with zero errors. See [PREFILL-WAVE-RESOURCES.md](PREFILL-WAVE-RESOURCES.md). Main sequential normal-serving admission stays disabled, so Flash ordinary prefill cannot qualify feature2.
+
+Evidence: /home/gencoolpc/moe-cache-tests/results/generic-strata-prefill-20261007/feature12-qualification-20261008/RESULTS.json. The owner authorized committing and pushing the test changes and two-file backend resource correction after checkpoint baf0661e3 on2026-10-08. This publishes a research checkpoint without promoting the executor default. Model/MTP/concurrency/platform, aggregate memory, matched performance and equal-byte Strata-quality gates remain open; features3/4 remain pending. None is fully complete.
+
 ## Paused owner-requested checkpoint, 2026-10-08
 
 The owner paused implementation and requested a local commit of the combined incoming release and feature work. No push or default promotion is part of this checkpoint. All owned build/test jobs are terminal with verified limits and empty process trees. Full model-server/original Flash replay remains blocked; the incident root defect remains unproven.

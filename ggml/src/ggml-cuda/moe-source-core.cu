@@ -1400,7 +1400,9 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             if (!cpu_api->execute_routed || !ggml_cuda_mmid_requirements(parent->device, &layer.routed_output, layer.routed_resources)) { return false; }
             input_bytes = ggml_nbytes(layer.descriptor->activation);
             if (!product(geometry.route_capacity, layer.descriptor->output->nb[1], output_bytes)) { return false; }
-            pool_bytes = std::max(pool_bytes, layer.routed_resources.pool_bytes);
+            size_t routed_pool_bytes = layer.routed_resources.pool_bytes;
+            if (prefill && !ggml_cuda_mmid_pool_reserve(routed_pool_bytes, geometry.expert_count, sizeof(int32_t))) { return false; }
+            pool_bytes = std::max(pool_bytes, routed_pool_bytes);
         } else if (!product(geometry.row_capacity, size_t(expert.input_width) * sizeof(float), input_bytes) ||
                 !product(geometry.route_capacity, size_t(expert.output_width) * sizeof(float), output_bytes) ||
                 (!expert.generic_body && !product(geometry.row_capacity, size_t(expert.input_width) / 32 * sizeof(block_q8_1), quant))) { return false; }

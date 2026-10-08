@@ -1345,11 +1345,11 @@ static int test_source_profile_statistics() {
     return 0;
 }
 
-static int test_model_source_learning(const char * path, const char * output_path) {
+static int test_model_source_learning(const char * path, const char * output_path, uint32_t slots, uint32_t context_size, uint32_t batch_size) {
     if (!output_path || !*output_path) { return 1; }
     auto model_params = llama_model_default_params();
     model_params.n_gpu_layers = 99;
-    model_params.moe_expert_cache_slots = 1;
+    model_params.moe_expert_cache_slots = slots;
     model_params.moe_expert_cache_host_pinned_size = 0;
     model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     model_params.progress_callback = silent_model_load_progress;
@@ -1361,7 +1361,7 @@ static int test_model_source_learning(const char * path, const char * output_pat
     auto seed_path = std::filesystem::u8path(output_path); seed_path += ".seed.gguf";
     if (!common_moe_profile_write(seed_path, seed_bytes.data(), seed_bytes.size())) { return 1; }
     auto params = llama_context_default_params();
-    params.n_ctx = 512; params.n_batch = params.n_ubatch = 128;
+    params.n_ctx = context_size; params.n_batch = params.n_ubatch = batch_size;
     params.n_threads = params.n_threads_batch = 4; params.phase_aware_workspace = true;
     const auto filename = fs_path_to_utf8(seed_path);
     llama_context_ptr context(llama_init_from_model_with_moe_profile(model.get(), params, filename.c_str(), "occurrence-sync"));
@@ -1369,6 +1369,8 @@ static int test_model_source_learning(const char * path, const char * output_pat
     const auto * vocab = llama_model_get_vocab(model.get());
     auto tokens = common_tokenize(vocab, "Hello there.", true, true);
     if (tokens.empty() || tokens.size() > params.n_batch) { return 1; }
+    auto prompt_token = tokens.back();
+    tokens.resize(params.n_batch, prompt_token);
     auto batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
     if (llama_decode(context.get(), batch)) { return 1; }
     for (int i = 0; i < 8; ++i) {
@@ -1385,9 +1387,39 @@ static int test_model_source_learning(const char * path, const char * output_pat
     const auto learned = llama_moe_profile_statistics_parse(before.data(), before.size(), sources);
     const auto observed = std::count_if(learned.sources.begin(), learned.sources.end(), [](const auto & source) { return source.observations > 0; });
     if (!observed) { return 1; }
-    llama_context_ptr restored(llama_init_from_model_with_moe_profile(model.get(), params, output_path, "occurrence-sync"));
-    std::vector<uint8_t> after;
-    if (!restored || !restored->snapshot_moe_learning(after, 5000) || before != after) { return 1; }
+    context.reset();
+    model.reset();
+    for (const uint32_t restored_slots : {slots, slots + 1}) {
+        model_params.moe_expert_cache_slots = restored_slots;
+        llama_model_ptr fresh_model(llama_model_load_from_file(path, model_params));
+        if (!fresh_model) { return 1; }
+        llama_context_ptr restored(llama_init_from_model_with_moe_profile(fresh_model.get(), params, output_path, "occurrence-sync"));
+        std::vector<uint8_t> after;
+        if (!restored || !restored->snapshot_moe_learning(after, 5000) || before != after) { return 1; }
+        batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
+        if (llama_decode(restored.get(), batch)) { return 1; }
+        for (uint32_t i = 0; i < 4; ++i) {
+            batch = llama_batch_get_one(&prompt_token, 1);
+            if (llama_decode(restored.get(), batch)) { return 1; }
+            const auto * logits = llama_get_logits_ith(restored.get(), -1);
+            if (!logits || !std::all_of(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(fresh_model.get())),
+                    [](float value) { return std::isfinite(value); })) { return 1; }
+        }
+        llama_synchronize(restored.get());
+        if (!restored->snapshot_moe_learning(after, 5000)) { return 1; }
+        const auto continued = llama_moe_profile_statistics_parse(after.data(), after.size(), fresh_model->moe_sources());
+        if (continued.sources.size() != learned.sources.size()) { return 1; }
+        for (size_t i = 0; i < learned.sources.size(); ++i) {
+            const auto & initial = learned.sources[i];
+            const auto & current = continued.sources[i];
+            if (current.observations < initial.observations || current.windows < initial.windows || current.prior != initial.prior ||
+                    (initial.observations && (current.observations == initial.observations || current.windows < initial.windows + 4))) { return 1; }
+            for (size_t j = 0; j < initial.counts.size(); ++j) {
+                if (current.counts[j] < initial.counts[j] || current.heat[j] < initial.heat[j]) { return 1; }
+            }
+        }
+        fprintf(stderr, "test-model-source-learning: fresh_model=1 slots=%u prompt_rows=%zu continued_windows=4 full_history_retained OK\n", restored_slots, tokens.size());
+    }
     fprintf(stderr, "test-model-source-learning: full_sources=%zu observed_sources=%zu saved_bytes=%zu cold_snapshot=exact load_mode=none\n",
         learned.sources.size(), size_t(observed), before.size());
     return 0;
@@ -7032,6 +7064,9 @@ int main(int argc, char ** argv) {
     const char * source_profile_path = nullptr;
     const char * source_learning_path = nullptr;
     const char * source_learning_output = nullptr;
+    uint32_t source_learning_slots = 1;
+    uint32_t source_learning_context = 512;
+    uint32_t source_learning_batch = 128;
     const char * source_statistics_file = nullptr;
     bool source_statistics = false;
     const char * profile_model_path = nullptr;
@@ -7105,6 +7140,18 @@ int main(int argc, char ** argv) {
             source_learning_path = argv[++i];
         } else if (strcmp(argv[i], "--source-learning-output") == 0 && i + 1 < argc) {
             source_learning_output = argv[++i];
+        } else if ((strcmp(argv[i], "--source-learning-cache-slots") == 0 || strcmp(argv[i], "--source-learning-context") == 0 ||
+                strcmp(argv[i], "--source-learning-batch") == 0) && i + 1 < argc) {
+            const char * option = argv[i];
+            const char * value = argv[++i];
+            char * end = nullptr;
+            const long parsed = strtol(value, &end, 10);
+            const long limit = strcmp(option, "--source-learning-cache-slots") == 0 ? 65535 :
+                strcmp(option, "--source-learning-context") == 0 ? 32768 : 2048;
+            if (!*value || *end || parsed < 1 || parsed > limit) { return 1; }
+            if (strcmp(option, "--source-learning-cache-slots") == 0) { source_learning_slots = uint32_t(parsed); }
+            else if (strcmp(option, "--source-learning-context") == 0) { source_learning_context = uint32_t(parsed); }
+            else { source_learning_batch = uint32_t(parsed); }
         } else if (strcmp(argv[i], "--source-statistics-file") == 0 && i + 1 < argc) {
             source_statistics_file = argv[++i];
         } else if (strcmp(argv[i], "--test-source-statistics") == 0) {
@@ -7286,7 +7333,10 @@ int main(int argc, char ** argv) {
         }
         if (source_uses_path) { return test_model_source_uses(source_uses_path); }
         if (source_profile_path) { return test_model_source_profile(source_profile_path, source_statistics_file); }
-        if (source_learning_path) { return test_model_source_learning(source_learning_path, source_learning_output); }
+        if (source_learning_path) {
+            if (source_learning_context < source_learning_batch + 16) { return 1; }
+            return test_model_source_learning(source_learning_path, source_learning_output, source_learning_slots, source_learning_context, source_learning_batch);
+        }
         if (source_statistics) { return test_source_profile_statistics(); }
         if (moe_replay_path) { return test_model_moe_replay(moe_replay_path, replay_reference_path, replay_read, replay_independent_sources, replay_cache_slots, replay_cpu_oracle, replay_gpu_oracle, replay_load_mode, replay_prompt_path, replay_rows, replay_split); }
         if (run_moe_placement) {

@@ -8715,9 +8715,9 @@ void test_hybrid_metadata() {
         }
         if (!strcmp(mode, "source-core-prefill")) {
             CHECK(ggml_moe_fidelity_selection().valid && ggml_moe_fidelity_selection().source_pool && ggml_moe_fidelity_selection().reference);
-            for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL}) {
+            for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
                 const hybrid_layer_signature signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, type, type, LLM_FFN_SILU, 256, 256};
-                for (uint32_t rows : {9u, 65u}) {
+                for (uint32_t rows : {9u, 65u, 2048u}) {
                     test_fidelity_real_window(device, rows, GGML_CUDA_MOE_FIDELITY_POLL, false, true, signature, 4, 1, 16,
                         false, 0, false, false, true);
                 }

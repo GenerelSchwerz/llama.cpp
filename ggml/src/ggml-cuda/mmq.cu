@@ -1183,6 +1183,17 @@ bool ggml_cuda_mmq_routed_requirements(int device, const ggml_tensor * dst, ggml
             weight->ne[1], bound ? measured.rows : size_t(input->ne[2]), weight->ne[2], 1,
             weight->ne[0] / ggml_blck_size(weight->type), scratch)) { return false; }
     measured.fixup_elements = scratch.fixup_elements;
+    if (bound) {
+        // Smaller expert waves can need fixup when the full-row launch does not.
+        for (int tile = 8; tile <= 128; tile += 8) {
+            const auto wave = ggml_cuda_mmq_get_config(weight->type, tile, fallback, cc, precision);
+            if (wave.type == GGML_TYPE_COUNT || !wave.stream_k || mmq_get_nbytes_shared(wave, cc) > ggml_cuda_info().devices[device].smpbo) { continue; }
+            const size_t nsm = size_t(ggml_cuda_info().devices[device].nsm);
+            if (wave.I <= 0 || wave.J <= 0 || !nsm || nsm > SIZE_MAX / size_t(wave.I) ||
+                    nsm * size_t(wave.I) > SIZE_MAX / size_t(wave.J)) { return false; }
+            measured.fixup_elements = std::max(measured.fixup_elements, nsm * size_t(wave.I) * size_t(wave.J));
+        }
+    }
     resources = measured;
     return true;
 }

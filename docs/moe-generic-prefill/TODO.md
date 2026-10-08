@@ -23,7 +23,9 @@ Acceptance contract: [GOAL-1-4.md](GOAL-1-4.md). No feature below is currently q
 - [x] Wire opt-in application saving at server idle/shutdown and completion boundaries; compile/link CPU libraries/tools and pass actual argument/metadata tests.
 - [x] Add generic same-model context-group snapshots and CPU-qualify disjoint composition, exact deduplication and conflict rejection; source/syntax scope only.
 - [x] Qualify actual synchronous owner snapshots/cold restore and3->4/4->5 controller continuation at3/10 slots across two layouts and direct/staged transport; preserve incomplete/repeated/busy rejection and no-arena cold state.
-- [ ] Qualify full context/file cold reload, async pending adaptation, auxiliary/MTP composition and continued cadence; resolve overlapping independent histories without losing data.
+- [x] Qualify actual file/context cold reload into fresh models at two capacities and continued source windows on generated LLAMA/Qwen3MoE, Tiny Mixtral and Flash Next; retain original2048-row sizes and exact snapshots.
+- [ ] Qualify async pending adaptation and auxiliary/MTP context composition; resolve overlapping independent histories without losing data.
+- [x] Diagnose and correct the2048-row main private-prefill scratch under-reservation; preserve the failure and qualify30 five-format checks plus CUDA memcheck at unchanged numerical limits.
 - [ ] Fully implement learned full-model snapshot/save/reload, capacity independence and continued adaptation.
 - [ ] Fully implement CPU-assisted prefill through shared graph/backend semantics and existing workers.
 - [ ] Fully implement bounded cross-layer expert streaming through existing prefetch/event scheduling.
