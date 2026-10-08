@@ -4155,7 +4155,7 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if ((match.post && (input->ne[2] != 1 || input->ne[3] != 1)) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
+            if (prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }
             if (match.post && input->ne[0] % MATRIX_ROW_PADDING && match.norm->ne[0] >= input->ne[0]) {

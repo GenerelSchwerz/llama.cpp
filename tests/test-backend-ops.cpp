@@ -5335,6 +5335,26 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_hc_norm : public test_mul_mat {
+    test_mul_mat_hc_norm(std::array<int64_t, 2> banks)
+        : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 65, 4, 512, banks, {1, 1}, {0, 1, 2, 3}, 0, 2) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_HC_NORM"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t tokens = bs[0]*bs[1];
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, tokens);
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, tokens);
+        ggml_tensor * hc = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_set_output(hc);
+        ggml_tensor * b = ggml_rms_norm(ctx, ggml_reshape_4d(ctx, hc, k, n, bs[0], bs[1]), 1e-6f);
+        ggml_set_output(b);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        return ggml_add(ctx, ggml_mul_mat(ctx, a, b), ggml_mul_mat(ctx, a, b));
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10690,6 +10710,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_mul_mat_hc_norm({3, 1}));
+    test_cases.emplace_back(new test_mul_mat_hc_norm({1, 3}));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
