@@ -565,6 +565,7 @@ ggml_graph_execution_certificate layer_certificate(bool required = false) {
 }
 
 struct layer_fixture {
+    bool routed_backend_stage = false;
     bool independent_overlap = false;
     bool ordinary_scratch = false;
     bool ordinary_matmul = false;
@@ -873,6 +874,29 @@ struct layer_fixture {
                                       LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, layer, logits[layer], gate_up[layer], nullptr,
                                       up_scale[layer], gate_scale[layer], down_scale[layer]);
             auto & region         = result.get_moe_regions().back();
+            if (routed_backend_stage) {
+                const auto found = std::find_if(region.body_operations.begin(), region.body_operations.end(), [&](const ggml_tensor * node) {
+                    return node->op == GGML_OP_MUL_MAT_ID && node->src[0] == down[layer];
+                });
+                CHECK(found != region.body_operations.end());
+                const size_t index = found - region.body_operations.begin();
+                auto * projection = const_cast<ggml_tensor *>(*found);
+                auto * scaled = ggml_scale(ctx, projection->src[1], 4.0f);
+                auto * activated = ggml_tanh(ctx, scaled);
+                ggml_set_name(scaled, "routed_backend_scale");
+                ggml_set_name(activated, "routed_backend_tanh");
+                projection->src[1] = activated;
+                region.body_operations.insert(region.body_operations.begin() + index, scaled);
+                region.body_operations.insert(region.body_operations.begin() + index + 1, activated);
+                const auto operation = std::find(region.operations.begin(), region.operations.end(), projection);
+                CHECK(operation != region.operations.end());
+                region.operations.insert(operation, {scaled, activated});
+                // The builder expanded the old dependencies before this fixture added the stages.
+                auto * graph = result.get_gf();
+                const std::vector<ggml_tensor *> roots(graph->nodes, graph->nodes + graph->n_nodes);
+                ggml_graph_clear(graph);
+                for (auto * root : roots) { ggml_build_forward_expand(graph, root); }
+            }
             region.semantic_group = layer;
             region.domain         = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
             ids[layer]            = region.route;
@@ -5738,6 +5762,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
     for (auto * target : {&fixture, &reference}) {
         target->independent_overlap = overlap_fixture;
         const char * mode = getenv("GGML_TEST_MOE_FIDELITY");
+        target->routed_backend_stage = mode && (!strcmp(mode, "routed-new-op") || !strcmp(mode, "routed-new-op-fallback"));
         target->activation_images = mode && !strcmp(mode, "source-core-images");
         target->ordinary_scratch = mode && !strcmp(mode, "source-core-resources");
         target->ordinary_matmul = mode && !strcmp(mode, "source-core-matmul");
@@ -6015,11 +6040,11 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
         config.n_threads = 2;
         const char * scheduler_mode = getenv("GGML_TEST_MOE_FIDELITY");
         const bool routed_discovery = source_core && scheduler_mode &&
-            (!strcmp(scheduler_mode, "routed-discovery") || !strcmp(scheduler_mode, "routed-profile") ||
+            (!strcmp(scheduler_mode, "routed-discovery") || !strcmp(scheduler_mode, "routed-new-op") || !strcmp(scheduler_mode, "routed-profile") ||
              !strcmp(scheduler_mode, "routed-adapt") || !strcmp(scheduler_mode, "routed-async") ||
              !strcmp(scheduler_mode, "routed-statistics") || !strcmp(scheduler_mode, "routed-statistics-adapt") || !strcmp(scheduler_mode, "routed-statistics-async"));
         const bool routed_scheduler = routed_discovery ||
-            (source_core && scheduler_mode && !strcmp(scheduler_mode, "routed-scheduler"));
+            (source_core && scheduler_mode && (!strcmp(scheduler_mode, "routed-scheduler") || !strcmp(scheduler_mode, "routed-new-op-fallback")));
         config.max_regions = owner->descriptors.size() * (routed_scheduler ? 3 : 1);
         config.max_prepared_regions = config.max_regions * (routes + 1);
         config.gpu_miss_quota = quota;
@@ -6128,6 +6153,19 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             }
         };
         const auto prepare_regions = [&](const ggml_graph_execution_certificate * supplied) {
+            if (fixture.routed_backend_stage) {
+                uint32_t stages = 0;
+                for (int i = 0; i < fixture.result.get_gf()->n_nodes; ++i) {
+                    const auto * node = fixture.result.get_gf()->nodes[i];
+                    if (strcmp(node->name, "routed_backend_scale") && strcmp(node->name, "routed_backend_tanh")) { continue; }
+                    CHECK((node->op == GGML_OP_SCALE || (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_TANH)) &&
+                        ggml_backend_dev_supports_op(ggml_backend_get_device(owner->gpu.get()), node) &&
+                        ggml_backend_dev_supports_op(ggml_backend_get_device(owner->cpu.get()), node));
+                    ++stages;
+                }
+                CHECK(stages == 4);
+                fprintf(stderr, "test-moe-cache: four original SCALE/TANH stages outside combined-body matcher retained for shared backend execution\n");
+            }
             if (source_core && empty_prefix) {
                 uint32_t empty_nodes = 0;
                 const auto * graph = fixture.result.get_gf();
@@ -6146,6 +6184,12 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             if (routed_scheduler) {
                 uint32_t count = 0;
                 for (const auto & region : fixture.result.get_moe_regions()) {
+                    if (fixture.routed_backend_stage && !routed_discovery) {
+                        const auto residency = read_residency();
+                        CHECK(region.prepare_hybrid(owner->sched.get(), source_owner, 2, supplied) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION);
+                        CHECK(read_residency() == residency);
+                        fprintf(stderr, "test-moe-cache: optional combined body declined; original SCALE/TANH and canonical residency retained for routed preparation\n");
+                    }
                     std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> projections;
                     CHECK(region.prepare_routed_metadata(source_owner, 2, projections) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
                     for (const auto & projection : projections) {
@@ -6161,6 +6205,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                         invalid = descriptor;
                         ++invalid.split_graph_uid;
                         CHECK(ggml_backend_sched_moe_hybrid_prepare_v1(owner->sched.get(), &invalid) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT);
+                        if (fixture.routed_backend_stage && !routed_discovery) { ++count; continue; }
                         const int32_t status = ggml_backend_sched_moe_hybrid_prepare_v1(owner->sched.get(), &descriptor);
                         if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
                             fprintf(stderr, "test-moe-cache: original routed scheduler status=%d rows=%u routes=%u input_period=%lld\n",
@@ -6169,6 +6214,12 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                         }
                         CHECK(status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
                         ++count;
+                    }
+                    if (fixture.routed_backend_stage && !routed_discovery) {
+                        const auto residency = read_residency();
+                        CHECK(region.prepare_hybrid(owner->sched.get(), source_owner, 2, supplied, true) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK);
+                        CHECK(read_residency() == residency);
+                        fprintf(stderr, "test-moe-cache: production region preparation retains original operations after optional-body decline OK\n");
                     }
                 }
                 fprintf(stderr, "test-moe-cache: %u original routed descriptors prepared for complementary CPU/GPU execution; stale allocator/split rejected\n", count);
@@ -6999,6 +7050,98 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             auto * released = owner->sched.release();
             CHECK(ggml_backend_sched_moe_source_free_v1(&released) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK && !released);
         } else { owner->sched.reset(); }
+        if (static_profile) {
+            const auto retained_state = grouped->state();
+            const auto retired_residency = read_residency();
+            std::array<ggml_cuda_moe_candidate_group_key, 2> retained_keys;
+            std::array<std::array<const ggml_tensor *, 4>, 2> retained_banks;
+            std::array<std::array<void *, 4>, 2> retained_payloads = {};
+            for (uint32_t layer = 0; layer < retained_keys.size(); ++layer) {
+                CHECK(grouped->find_down_group_key(fixture.down[layer], &retained_keys[layer]));
+                retained_banks[layer] = {fixture.gate_up[layer], fixture.gate[layer], fixture.up[layer], fixture.down[layer]};
+                for (uint32_t bank = 0; bank < retained_banks[layer].size(); ++bank) {
+                    if (!retained_banks[layer][bank]) { continue; }
+                    retained_payloads[layer][bank] = ggml_cuda_moe_grouped_context_test_access::device_bank_data(
+                        *grouped, retained_keys[layer], retained_banks[layer][bank]);
+                    CHECK(retained_payloads[layer][bank]);
+                }
+            }
+            const bool previous_debug = ggml_backend_cuda_moe_get_debug_mm();
+            ggml_backend_cuda_moe_set_debug_mm(true);
+            size_t lane_bytes = 0;
+            for (const auto & bank : fixture.tensors) {
+                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                    lane_bytes = std::max(lane_bytes, 2 * bank.tensor->nb[2]);
+                }
+            }
+            CHECK(ggml_cuda_moe_grouped_context_test_access::set_prefill_staging_lane_bytes(*grouped, lane_bytes));
+            ggml_backend_sched_reset(owner->oracle.get());
+            owner->regions.clear(); owner->descriptors.clear(); owner->metadata.clear();
+            owner->graph_nodes.clear(); owner->input_buffers.clear();
+            const uint32_t saved_capacity = capacity;
+            capacity = 128;
+            fixture.build_graph(false, nullptr, nullptr, false, capacity);
+            reference.build_graph(false, nullptr, nullptr, false, capacity);
+            allocate_inputs();
+            ggml_backend_t backends[]{owner->gpu.get(), owner->cpu.get()};
+            ggml_backend_sched_ptr prefill(ggml_backend_sched_new(backends, nullptr, 2, 256, false, true));
+            CHECK(prefill && ggml_cuda_moe_grouped_context_for_test(owner->gpu.get()) == grouped);
+            for (auto & region : fixture.result.get_moe_regions()) { CHECK(region.place(prefill.get(), owner->gpu.get())); }
+            for (auto & region : reference.result.get_moe_regions()) { CHECK(region.place(owner->oracle.get(), owner->gpu.get())); }
+            CHECK(ggml_backend_sched_alloc_graph(prefill.get(), fixture.result.get_gf()));
+            CHECK(ggml_backend_sched_alloc_graph(owner->oracle.get(), reference.result.get_gf()));
+            CHECK(read_residency() == retired_residency && grouped->state().generation == retained_state.generation);
+            auto prefill_certificate = layer_certificate();
+            prefill_certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+            prefill_certificate.n_rows = capacity;
+            ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*grouped);
+            for (uint32_t step = 0; step < 2; ++step) {
+                for (auto * target : {&fixture, &reference}) {
+                    set_inputs(*target, false, step);
+                    for (auto * logits : target->logits) {
+                        std::vector<float> scores(size_t(capacity) * experts, -10.0f);
+                        for (uint32_t row = 0; row < capacity; ++row) {
+                            for (uint32_t rank = 0; rank < routes; ++rank) {
+                                scores[size_t(row) * experts + (row + rank + step) % experts] = 10.0f - float(rank);
+                            }
+                        }
+                        ggml_backend_tensor_set(logits, scores.data(), 0, scores.size() * sizeof(float));
+                    }
+                }
+                CHECK(ggml_backend_sched_graph_compute_ext(owner->oracle.get(), reference.result.get_gf(), &prefill_certificate) == GGML_STATUS_SUCCESS);
+                CHECK(ggml_backend_sched_graph_compute_ext(prefill.get(), fixture.result.get_gf(), &prefill_certificate) == GGML_STATUS_SUCCESS);
+                const auto actual = active_grouped_tensor_values(fixture.output[1]);
+                const auto expected = active_grouped_tensor_values(reference.output[1]);
+                CHECK(actual.size() == expected.size());
+                double error = 0, norm = 0;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    CHECK(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+                    const double difference = double(actual[i]) - expected[i];
+                    error += difference * difference;
+                    norm += double(expected[i]) * expected[i];
+                }
+                CHECK(norm > 0 && error / norm <= 2e-5);
+                const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*grouped);
+                CHECK(telemetry.prefill_grouped == 2 && telemetry.prefill_staged == 0);
+                CHECK(telemetry.prefill_bounded_ops == 2 * (signature.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3u : 2u));
+                CHECK(telemetry.prefill_bounded_waves > telemetry.prefill_bounded_ops);
+                CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+                CHECK(grouped->state().generation == retained_state.generation);
+                for (uint32_t layer = 0; layer < retained_keys.size(); ++layer) {
+                    ggml_cuda_moe_candidate_group_key key;
+                    CHECK(grouped->find_down_group_key(fixture.down[layer], &key));
+                    CHECK(key.generation == retained_keys[layer].generation && key.group_index == retained_keys[layer].group_index);
+                    for (uint32_t bank = 0; bank < retained_banks[layer].size(); ++bank) {
+                        if (!retained_banks[layer][bank]) { continue; }
+                        CHECK(ggml_cuda_moe_grouped_context_test_access::device_bank_data(*grouped, key, retained_banks[layer][bank]) == retained_payloads[layer][bank]);
+                    }
+                }
+                fprintf(stderr, "test-moe-cache: profile/adaptation=%u source-retirement -> sequential prefill step=%u rows=%u owner/payload retained relative_mse=%.9g OK\n",
+                    profile_adaptation, step, capacity, error / norm);
+            }
+            capacity = saved_capacity;
+            ggml_backend_cuda_moe_set_debug_mm(previous_debug);
+        }
         owner->model->close_moe_source_owner();
         fprintf(stderr, "test-moe-cache: fidelity scheduler R%u segmented prepare/replay/state/drain OK\n", capacity);
         return;
@@ -7767,7 +7910,7 @@ void test_hybrid_metadata() {
         }
         if (strcmp(mode, "sort-resources") == 0) { test_source_sort_resources(device); return; }
         if (strcmp(mode, "softmax-resources") == 0) { test_source_softmax_resources(device); return; }
-        if (strcmp(mode, "routed-scheduler") == 0 || strcmp(mode, "routed-discovery") == 0) {
+        if (strcmp(mode, "routed-scheduler") == 0 || strcmp(mode, "routed-discovery") == 0 || strcmp(mode, "routed-new-op") == 0 || strcmp(mode, "routed-new-op-fallback") == 0) {
             CHECK(ggml_moe_fidelity_selection().valid && ggml_moe_fidelity_selection().source_pool && ggml_moe_fidelity_selection().reference);
             for (const auto types : {std::pair<ggml_type, ggml_type>{GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL},
                     std::pair<ggml_type, ggml_type>{GGML_TYPE_Q5_K, GGML_TYPE_Q5_K}}) {

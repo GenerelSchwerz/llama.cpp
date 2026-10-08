@@ -7,7 +7,7 @@
 
 #include <climits>
 
-static bool ggml_cuda_mmid_shape_valid(const ggml_tensor * dst) {
+bool ggml_cuda_mmid_shape_valid(const ggml_tensor * dst) {
     if (!dst || dst->op != GGML_OP_MUL_MAT_ID || !dst->src[0] || !dst->src[1] || !dst->src[2]) { return false; }
     const auto * weight = dst->src[0];
     const auto * input = dst->src[1];

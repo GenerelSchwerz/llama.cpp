@@ -1,5 +1,6 @@
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-moe.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
@@ -1311,6 +1312,78 @@ static void test_scheduler_direct_dependency_with_copied_input() {
     }
 }
 
+static void test_scheduler_copy_identity() {
+    for (bool parallel : {false, true}) {
+        for (bool resizable : {false, true}) {
+            auto device = dummy_backend_init(SIZE_MAX, 4, true, true);
+            auto host = dummy_backend_init(SIZE_MAX, 4, true, true);
+            ggml_backend_t backends[]{device.handle.get(), host.handle.get()};
+            ggml_backend_buffer_type_t bufts[]{&device.buffer_type, &host.buffer_type};
+            ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, parallel, false));
+            if (resizable) { GGML_ASSERT(ggml_backend_sched_set_resizable(sched.get(), nullptr)); }
+            const int copies = ggml_backend_sched_get_n_copies(sched.get());
+            GGML_ASSERT(copies >= 1 && (parallel || copies == 1));
+            std::vector<void *> copy_data(copies);
+            std::vector<std::vector<float>> copy_values(copies);
+            std::vector<test_context_with_graph> graphs;
+            std::vector<ggml_backend_buffer_ptr> inputs;
+            uint64_t source_uid = 0, split_uid = 0, generation = 0;
+            for (int request = 0; request < 2 * copies + 2; ++request) {
+                if (request) { ggml_backend_sched_reset(sched.get()); }
+                if (request == 2 * copies + 1) { ggml_backend_sched_synchronize(sched.get()); }
+                graphs.push_back(make_context());
+                auto & graph = graphs.back();
+                auto * input = make_input_1d(graph.ctx, 4);
+                inputs.emplace_back(ggml_backend_buft_alloc_buffer(&host.buffer_type, ggml_nbytes(input)));
+                GGML_ASSERT(inputs.back() && ggml_backend_tensor_alloc(inputs.back().get(), input,
+                    ggml_backend_buffer_get_base(inputs.back().get())) == GGML_STATUS_SUCCESS);
+                auto * output = ggml_scale(graph.ctx, input, 2.0f);
+                ggml_set_output(output);
+                ggml_build_forward_expand(graph.graph, output);
+                ggml_backend_sched_set_tensor_backend(sched.get(), output, device.handle.get());
+                GGML_ASSERT(ggml_backend_sched_alloc_graph_async(sched.get(), graph.graph));
+                GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 1);
+                const ggml_tensor * body[]{output};
+                const ggml_tensor * dynamic[]{input};
+                const ggml_backend_sched_region_live_output_v1 live{nullptr, output, 0, 0};
+                const ggml_backend_sched_region_query_v1 query{sizeof(query), 1, graph.graph, body, 1, 0, dynamic, 1, 1, &live, nullptr};
+                ggml_backend_sched_region_handoff_v1 handoff = {};
+                handoff.struct_size = sizeof(handoff); handoff.abi_version = 1;
+                GGML_ASSERT(ggml_backend_sched_region_finalize_v1(sched.get(), &query, &handoff) == GGML_BACKEND_SCHED_REGION_STATUS_V1_OK);
+                GGML_ASSERT(handoff.split_index == 0 && handoff.n_dynamic_inputs == 1 &&
+                    handoff.dynamic_inputs[0] == output->src[0] && handoff.dynamic_inputs[0] != input);
+                GGML_ASSERT(handoff.source_graph_uid && handoff.source_graph_uid != source_uid &&
+                    handoff.split_graph_uid && handoff.split_graph_uid != split_uid);
+                source_uid = handoff.source_graph_uid; split_uid = handoff.split_graph_uid;
+                const auto current_generation = sched_generation(sched.get());
+                if (request) { GGML_ASSERT(current_generation == generation); }
+                generation = current_generation;
+                const int copy = request == 2 * copies + 1 ? 0 : request % copies;
+                auto * data = output->src[0]->data;
+                GGML_ASSERT(data && (request < copies || copy_data[copy] == data));
+                if (request < copies) { copy_data[copy] = data; }
+                for (int other = 0; other < copies; ++other) {
+                    if (other == copy || !copy_data[other]) { continue; }
+                    GGML_ASSERT(data != copy_data[other]);
+                }
+                const std::vector<float> values{float(request + 1), float(request + 2), float(request + 3), float(request + 4)};
+                ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+                GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph.graph) == GGML_STATUS_SUCCESS);
+                copy_values[copy] = values;
+                for (int retained = 0; retained < copies; ++retained) {
+                    if (!copy_data[retained]) { continue; }
+                    GGML_ASSERT(memcmp(copy_data[retained], copy_values[retained].data(), ggml_nbytes(input)) == 0);
+                }
+            }
+            const auto compute_count = device.context->graph_compute_count;
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_synchronize(sched.get());
+            sched.reset();
+            GGML_ASSERT(compute_count == 2 * copies + 2 && device.context->allocated_total() == 0);
+        }
+    }
+}
+
 struct buffer_retirement_probe {
     ggml_gallocr_t alloc = nullptr;
     std::vector<const dummy_backend_context *> contexts;
@@ -1755,6 +1828,7 @@ int main() {
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
     run("test_scheduler_direct_dependency_with_copied_input", test_scheduler_direct_dependency_with_copied_input);
+    run("test_scheduler_copy_identity", test_scheduler_copy_identity);
     run("test_checked_shared_buffer_retirement", test_checked_shared_buffer_retirement);
     run("test_checked_private_buffer_retirement", test_checked_private_buffer_retirement);
     run("test_checked_retirement_allocation_failure", test_checked_retirement_allocation_failure);

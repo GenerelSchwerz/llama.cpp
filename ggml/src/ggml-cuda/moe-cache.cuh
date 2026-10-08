@@ -1268,14 +1268,21 @@ public:
             ggml_cuda_moe_stream_t stream,
             const int32_t * unique_experts,
             uint32_t n_unique_experts);
-    ggml_cuda_moe_grouped_decode_result execute_bounded_prefill_mmq(
+    ggml_cuda_moe_grouped_decode_result execute_bounded_prefill(
             ggml_backend_cuda_context & context,
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
             const int32_t * unique_experts,
-            uint32_t n_unique_experts);
+            uint32_t n_unique_experts,
+            const char * ids_host,
+            size_t ids_bytes,
+            size_t ids_row_stride,
+            const int64_t * expert_rows,
+            const ggml_cuda_moe_graph_binding * paired_binding = nullptr,
+            ggml_tensor * paired_node = nullptr,
+            ggml_tensor * paired_output = nullptr);
     ggml_cuda_moe_grouped_decode_result prepare_host_staged_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
@@ -1379,7 +1386,7 @@ public:
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
             const float ** source) const;
-    bool finish_prefill_add_id(
+    bool finish_prefill_auxiliary(
             const ggml_cuda_moe_graph_execution & execution,
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
@@ -1448,6 +1455,7 @@ private:
             uint64_t * pending_declines) const;
     bool set_prefill_resident_budget_for_test(size_t byte_budget);
     bool set_prefill_staging_lane_bytes_for_test(size_t byte_budget);
+    ggml_cuda_moe_stream_t prefill_copy_stream_for_test() const;
     bool set_original_auxiliary_budget_for_test(size_t byte_budget);
     size_t original_auxiliary_bytes_for_test() const;
     void fail_device_resource_allocation_for_test(uint32_t stage);

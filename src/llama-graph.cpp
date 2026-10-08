@@ -2480,17 +2480,32 @@ int32_t llm_graph_moe_region::prepare_hybrid_metadata(
 
 int32_t llm_graph_moe_region::prepare_hybrid(
         ggml_backend_sched_t sched, const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
-        const ggml_graph_execution_certificate * certificate) const {
+        const ggml_graph_execution_certificate * certificate, bool allow_routed) const {
+    const auto prepare = [&](const llm_graph_moe_hybrid_prepared & metadata) {
+        auto descriptor = metadata.descriptor();
+        if (certificate != nullptr) {
+            descriptor.certificate = *certificate;
+            descriptor.certificate.source_graph_uid = descriptor.source_graph_uid;
+            descriptor.certificate.split_graph_uid = descriptor.split_graph_uid;
+        }
+        return ggml_backend_sched_moe_hybrid_prepare_v1(sched, &descriptor);
+    };
     std::unique_ptr<llm_graph_moe_hybrid_prepared> prepared;
-    const int32_t status = prepare_hybrid_metadata(owner, n_threads, prepared);
-    if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { return status; }
-    auto descriptor = prepared->descriptor();
-    if (certificate != nullptr) {
-        descriptor.certificate = *certificate;
-        descriptor.certificate.source_graph_uid = descriptor.source_graph_uid;
-        descriptor.certificate.split_graph_uid = descriptor.split_graph_uid;
+    int32_t status = prepare_hybrid_metadata(owner, n_threads, prepared);
+    if (status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { status = prepare(*prepared); }
+    if (!allow_routed || (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION &&
+            status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) { return status; }
+    prepared.reset();
+    std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> projections;
+    status = prepare_routed_metadata(owner, n_threads, projections);
+    if (status == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
+        for (const auto & projection : projections) {
+            status = prepare(*projection);
+            if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { break; }
+        }
     }
-    return ggml_backend_sched_moe_hybrid_prepare_v1(sched, &descriptor);
+    LLAMA_LOG_INFO("moe-source-operation-preparation: layer=%d projections=%zu status=%d\n", layer, projections.size(), status);
+    return status;
 }
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :

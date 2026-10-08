@@ -2519,25 +2519,7 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             config.module_release = ggml_backend_moe_module_release_v1;
             int32_t prepared = ggml_backend_sched_moe_hybrid_configure_v1(sched.get(), &config);
             if (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
-                prepared = region.prepare_hybrid(sched.get(), owner, config.n_threads, certificate);
-                if (source_core_enabled() && (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION ||
-                        prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_PRECISION)) {
-                    std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> projections;
-                    prepared = region.prepare_routed_metadata(owner, config.n_threads, projections);
-                    if (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
-                        for (const auto & projection : projections) {
-                            auto descriptor = projection->descriptor();
-                            if (certificate) {
-                                descriptor.certificate = *certificate;
-                                descriptor.certificate.source_graph_uid = descriptor.source_graph_uid;
-                                descriptor.certificate.split_graph_uid = descriptor.split_graph_uid;
-                            }
-                            prepared = ggml_backend_sched_moe_hybrid_prepare_v1(sched.get(), &descriptor);
-                            if (prepared != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) { break; }
-                        }
-                    }
-                    LLAMA_LOG_INFO("moe-source-operation-preparation: layer=%d projections=%zu status=%d\n", region.layer, projections.size(), prepared);
-                }
+                prepared = region.prepare_hybrid(sched.get(), owner, config.n_threads, certificate, source_core_enabled());
             }
             if (prepared != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
                 if (source_core_enabled() && (prepared == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION ||

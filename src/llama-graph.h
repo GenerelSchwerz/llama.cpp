@@ -1030,7 +1030,7 @@ struct llm_graph_moe_region {
                               uint64_t owner_generation, uint64_t allocator_generation);
     int32_t prepare_hybrid(ggml_backend_sched_t sched,
                            const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
-                           const ggml_graph_execution_certificate * certificate = nullptr) const;
+                           const ggml_graph_execution_certificate * certificate = nullptr, bool allow_routed = false) const;
     int32_t prepare_hybrid_metadata(const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,
                                     std::unique_ptr<llm_graph_moe_hybrid_prepared> & prepared) const;
     int32_t prepare_routed_metadata(const ggml_backend_moe_source_owner_v1 & owner, uint32_t n_threads,

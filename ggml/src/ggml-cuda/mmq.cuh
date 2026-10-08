@@ -971,8 +971,8 @@ static __global__ void mul_mat_q(
         const uint3 ntx, const char * __restrict__ x_secondary, const int32_t * __restrict__ x_channel_map,
         const int32_t x_channel_split, const int32_t * __restrict__ x_wait_class,
         const uint32_t * __restrict__ x_stage_ready, const char * __restrict__ x_second, const int nrows_bank,
-        const void * const * __restrict__ x_expert_sources) {
-    static_assert(!use_x_map || !two_banks);
+        const void * const * __restrict__ x_expert_sources, const char * __restrict__ x_second_secondary,
+        const void * const * __restrict__ x_second_expert_sources) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT) {
@@ -1064,10 +1064,21 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*J - 1;
 
         int x_channel = fastdiv(zt, channel_ratio);
+        int row = it*I;
         const char * x_cur = x;
+        const char * x_staged = x_secondary;
+        const void * const * x_sources = x_expert_sources;
+        if constexpr (two_banks) {
+            if (row >= nrows_bank) {
+                x_cur = x_second;
+                x_staged = x_second_secondary;
+                x_sources = x_second_expert_sources;
+                row -= nrows_bank;
+            }
+        }
         if constexpr (use_x_map) {
-            if (x_expert_sources) {
-                x_cur = static_cast<const char *>(x_expert_sources[x_channel]);
+            if (x_sources) {
+                x_cur = static_cast<const char *>(x_sources[x_channel]);
                 x_channel = 0;
             } else {
                 if (x_stage_ready != nullptr) {
@@ -1083,16 +1094,9 @@ static __global__ void mul_mat_q(
                 }
                 x_channel = x_channel_map[x_channel];
                 if (x_channel >= x_channel_split) {
-                    x_cur = x_secondary;
+                    x_cur = x_staged;
                     x_channel -= x_channel_split;
                 }
-            }
-        }
-        int row = it*I;
-        if constexpr (two_banks) {
-            if (row >= nrows_bank) {
-                x_cur = x_second;
-                row -= nrows_bank;
             }
         }
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + row*stride_row_x;
@@ -1190,10 +1194,21 @@ static __global__ void mul_mat_q(
         const int tile_y_max_j = col_diff - jt*J - 1;
 
         int x_channel = fastdiv(zt, channel_ratio);
+        int row = it*I;
         const char * x_cur = x;
+        const char * x_staged = x_secondary;
+        const void * const * x_sources = x_expert_sources;
+        if constexpr (two_banks) {
+            if (row >= nrows_bank) {
+                x_cur = x_second;
+                x_staged = x_second_secondary;
+                x_sources = x_second_expert_sources;
+                row -= nrows_bank;
+            }
+        }
         if constexpr (use_x_map) {
-            if (x_expert_sources) {
-                x_cur = static_cast<const char *>(x_expert_sources[x_channel]);
+            if (x_sources) {
+                x_cur = static_cast<const char *>(x_sources[x_channel]);
                 x_channel = 0;
             } else {
                 if (x_stage_ready != nullptr) {
@@ -1209,16 +1224,9 @@ static __global__ void mul_mat_q(
                 }
                 x_channel = x_channel_map[x_channel];
                 if (x_channel >= x_channel_split) {
-                    x_cur = x_secondary;
+                    x_cur = x_staged;
                     x_channel -= x_channel_split;
                 }
-            }
-        }
-        int row = it*I;
-        if constexpr (two_banks) {
-            if (row >= nrows_bank) {
-                x_cur = x_second;
-                row -= nrows_bank;
             }
         }
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + row*stride_row_x;
@@ -1306,10 +1314,21 @@ static __global__ void mul_mat_q(
     const int tile_y_max_j = col_diff - jt*J - 1;
 
     int x_channel = fastdiv(zt, channel_ratio);
+    int row = it*I;
     const char * x_cur = x;
+    const char * x_staged = x_secondary;
+    const void * const * x_sources = x_expert_sources;
+    if constexpr (two_banks) {
+        if (row >= nrows_bank) {
+            x_cur = x_second;
+            x_staged = x_second_secondary;
+            x_sources = x_second_expert_sources;
+            row -= nrows_bank;
+        }
+    }
     if constexpr (use_x_map) {
-        if (x_expert_sources) {
-            x_cur = static_cast<const char *>(x_expert_sources[x_channel]);
+        if (x_sources) {
+            x_cur = static_cast<const char *>(x_sources[x_channel]);
             x_channel = 0;
         } else {
             if (x_stage_ready != nullptr) {
@@ -1325,16 +1344,9 @@ static __global__ void mul_mat_q(
             }
             x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
-                x_cur = x_secondary;
+                x_cur = x_staged;
                 x_channel -= x_channel_split;
             }
-        }
-    }
-    int row = it*I;
-    if constexpr (two_banks) {
-        if (row >= nrows_bank) {
-            x_cur = x_second;
-            row -= nrows_bank;
         }
     }
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + row*stride_row_x;
@@ -1503,6 +1515,8 @@ struct mmq_args {
     const char * x_second = nullptr;
     int64_t nrows_bank = 0;
     const void * const * x_expert_sources = nullptr;
+    const char * x_second_secondary = nullptr;
+    const void * const * x_second_expert_sources = nullptr;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1584,7 +1598,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready, args.x_second, args.nrows_bank, args.x_expert_sources);
+             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready, args.x_second, args.nrows_bank, args.x_expert_sources,
+             args.x_second_secondary, args.x_second_expert_sources);
         return;
     }
 
@@ -1608,7 +1623,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready, args.x_second, args.nrows_bank, args.x_expert_sources);
+         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready, args.x_second, args.nrows_bank, args.x_expert_sources,
+             args.x_second_secondary, args.x_second_expert_sources);
 
     if (!fixup_needed) {
         return;
@@ -1712,12 +1728,12 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
 template <ggml_type type, bool use_x_map = false, ggml_prec prec_src1 = GGML_PREC_Q8>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    if constexpr (prec_src1 == GGML_PREC_Q8 && !use_x_map) {
+    if constexpr (prec_src1 == GGML_PREC_Q8) {
         if (args.x_second) {
             if (args.nrows_x % 128 == 0) {
-                mul_mat_q_switch_J<type, false, false, prec_src1, true>(ctx, args, stream);
+                mul_mat_q_switch_J<type, false, use_x_map, prec_src1, true>(ctx, args, stream);
             } else {
-                mul_mat_q_switch_J<type, true, false, prec_src1, true>(ctx, args, stream);
+                mul_mat_q_switch_J<type, true, use_x_map, prec_src1, true>(ctx, args, stream);
             }
             return;
         }
@@ -1836,9 +1852,19 @@ bool ggml_cuda_mmq_mmid_launch_range(
         const int32_t * source_map,
         int32_t source_split,
         int32_t expert_begin,
-        int32_t expert_count);
+        int32_t expert_count,
+        int64_t max_rows);
 
 void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared);
+
+// Keep both bank sources and maps alive through all waves. Finish after every routed expert is computed.
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
+bool ggml_cuda_mmq_mmid_launch_pair_range(
+        ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_up, const void * staging_up, const void * resident_gate, const void * staging_gate,
+        const int32_t * source_map, int32_t source_split, int32_t expert_begin, int32_t expert_count, int64_t max_rows);
+bool ggml_cuda_mmq_mmid_finish_pair(ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo);

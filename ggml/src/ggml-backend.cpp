@@ -795,12 +795,21 @@ struct ggml_backend_sched_split {
 
 struct ggml_backend_sched_hybrid_region {
     uint32_t split_index;
+    uint32_t copy_index;
+    uint64_t source_graph_uid;
+    uint64_t split_graph_uid;
     uint64_t allocator_generation;
     std::vector<ggml_backend_moe_cpu_prepared_region_v1_t> cpu;
     void * device;
     std::vector<std::pair<const ggml_tensor *, ggml_tensor>> witnesses;
 
-    bool matches() const {
+    bool matches_binding(uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) const {
+        return source_graph_uid == source_uid && split_graph_uid == split_uid &&
+            allocator_generation == generation && copy_index == copy;
+    }
+
+    bool matches(uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) const {
+        if (!matches_binding(source_uid, split_uid, generation, copy)) { return false; }
         for (const auto & witness : witnesses) {
             if (!ggml_moe_source_tensor_matches(*witness.first, witness.second)) { return false; }
         }
@@ -840,10 +849,11 @@ struct ggml_backend_sched_hybrid {
         for (auto & session : split_sessions) { visit(session.get()); }
     }
 
-    ggml_backend_sched_hybrid * find_split(uint32_t split_index) {
+    ggml_backend_sched_hybrid * find_split(uint32_t split_index, uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) {
         ggml_backend_sched_hybrid * found = nullptr;
         each_session([&](ggml_backend_sched_hybrid * session) {
-            if (!session->regions.empty() && session->regions.front().split_index == split_index) { found = session; }
+            if (!session->regions.empty() && session->regions.front().split_index == split_index &&
+                    session->regions.front().matches_binding(source_uid, split_uid, generation, copy)) { found = session; }
         });
         return found;
     }
@@ -1566,11 +1576,12 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
     }
     if (n_regions >= selected->max_regions) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
     auto * root = selected;
-    if (selected->source_api) {
-        if (auto * found = selected->find_split(region->split_index)) { selected = found; }
-    }
     uint64_t allocator_generation = 0, shrink_generation = 0;
     ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    if (selected->source_api) {
+        if (auto * found = selected->find_split(region->split_index, region->source_graph_uid,
+                region->split_graph_uid, allocator_generation, sched->cur_copy)) { selected = found; }
+    }
     if (region->split_graph_uid != split.graph.uid || sched->backends[split.backend_id] != selected->backend ||
             region->allocator_generation != allocator_generation ||
             region->first_node > region->last_node || region->first_node < uint32_t(split.i_start) ||
@@ -1651,7 +1662,9 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
         }
     }
     std::unique_ptr<ggml_backend_sched_hybrid> pending;
-    if (root->source_api && selected == root && !root->regions.empty() && root->regions.front().split_index != region->split_index) {
+    if (root->source_api && selected == root && !root->regions.empty() &&
+            (root->regions.front().split_index != region->split_index || !root->regions.front().matches_binding(
+                region->source_graph_uid, region->split_graph_uid, allocator_generation, sched->cur_copy))) {
         root->split_sessions.reserve(root->split_sessions.size() + 1);
         const auto status = ggml_backend_sched_moe_hybrid_create(&root->config, root->source_cpu, pending);
         if (status) { return status; }
@@ -1666,6 +1679,9 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
         ~preparation_guard() { if (!published) { state.release(region); } }
     } guard{state, prepared};
     prepared.split_index = region->split_index;
+    prepared.copy_index = sched->cur_copy;
+    prepared.source_graph_uid = region->source_graph_uid;
+    prepared.split_graph_uid = region->split_graph_uid;
     prepared.allocator_generation = allocator_generation;
     prepared.cpu.resize(uint64_t(region->n_cpu_queries) + region->n_cpu_batch_queries);
     prepared.witnesses.reserve(region->query->n_body_nodes * (GGML_MAX_SRC + 1));
@@ -2755,21 +2771,25 @@ static enum ggml_status ggml_backend_sched_hybrid_dispatch_prepare(
             certificate.row_semantics, certificate.n_rows, certificate.n_sequences, certificate.flags);
         return GGML_STATUS_FAILED;
     }
-    auto * selected = sched->hybrids[sched->splits[split_id].backend_id];
-    if (selected && selected->source_api) { selected = selected->find_split(split_id); }
-    if (selected) { selected->dispatch.clear(); }
     uint64_t allocator_generation = 0, shrink_generation = 0;
     ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    auto * selected = sched->hybrids[sched->splits[split_id].backend_id];
+    if (selected && selected->source_api) {
+        selected = selected->find_split(split_id, source_graph_uid, sched->splits[split_id].graph.uid, allocator_generation, sched->cur_copy);
+    }
+    if (selected) { selected->dispatch.clear(); }
     bool valid = true;
     for (int i = 0; i < sched->n_backends; ++i) {
         auto * root = sched->hybrids[i];
         if (!root) { continue; }
         root->each_session([&](ggml_backend_sched_hybrid * entry) {
             for (const auto & region : entry->regions) {
-                if (region.allocator_generation != allocator_generation || !region.matches()) {
-                    GGML_LOG_ERROR("%s: hybrid region storage witness rejected: graph_uid=%llu split=%d region_split=%u generation=%llu expected_generation=%llu\n",
+                if (region.split_index >= uint32_t(sched->n_splits) || !region.matches(source_graph_uid,
+                        sched->splits[region.split_index].graph.uid, allocator_generation, sched->cur_copy)) {
+                    GGML_LOG_ERROR("%s: hybrid region storage witness rejected: graph_uid=%llu split=%d region_split=%u generation=%llu expected_generation=%llu copy=%u expected_copy=%d\n",
                         __func__, (unsigned long long) source_graph_uid, split_id, region.split_index,
-                        (unsigned long long) region.allocator_generation, (unsigned long long) allocator_generation);
+                        (unsigned long long) region.allocator_generation, (unsigned long long) allocator_generation,
+                        region.copy_index, sched->cur_copy);
                     valid = false; return;
                 }
                 if (region.split_index == uint32_t(split_id)) {

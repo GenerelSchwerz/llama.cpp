@@ -1,0 +1,21 @@
+# Generic Strata-derived prefill
+
+Owner request, 2026-10-07: start from the latest released moe-cache and make fast Strata-derived prompt execution work for every MoE model supported by llama.cpp, including future graph/model updates. Use tensor descriptors and existing backend operators, not model-specific executors or fixed expert dimensions.
+
+Base: origin/moe-cache 081cf1d792596a2cac5aa06090751d0850aadaab, fetched on 2026-10-07. Own worktree: /home/gencoolpc/llama-moe-generic-prefill-20261007, branch design/generic-strata-prefill-20261007. Earlier generic and specialized research trees remain preserved. The owner authorized one checkpoint commit and push to this research branch on 2026-10-08. No PR, extra agents or changes to another session's source/build.
+
+Performance is a requirement. Loading a model or reaching decode alone does not qualify this work. Retain matched prefill controls, actual selected execution paths, numerical checks, input/output work, MTP, residency, byte budgets and resource/teardown evidence. Preserve decoding, model graph semantics, partial pinning, Windows, multiple devices and concurrent requests. Physical platform gates must be labeled honestly.
+
+Use an own build. Hold /tmp/beellama-cuda-build.lock then /tmp/beellama-single-gpu.lock for the whole build/model job. Preserve existing files and ccache. CPU evidence uses cores 16-23; build/GPU jobs use cores 0-15. Extended drains remain skipped per owner.
+
+This is one slice of the active model-independent hybrid goal. Support must flow from llama.cpp graphs and shared operator/backend contracts, without per-model admission patches, a permanent hybrid operation whitelist, native/generic tiers, mandatory requantization or whole-model ordinary-backend fallback counted as hybrid support. Specialized fusion is optional within this pipeline. No accepted regression against matched frozen controls is allowed. Canonical residency remains the sole owner; static model statistics, hardware tuning and online adaptation remain separate. Held-out profile quality at equal byte budgets must be at least Strata's, alongside Windows partial pinning, multi-GPU, concurrent/staggered requests and MTP qualification. This prefill slice cannot redefine completion of that larger goal.
+
+Crash-prevention constraint after the2026-10-07 global OOM: Source/planning and small contained diagnostic tests. No model-server/GPU replay or memory-heavy parallel build while the identified failure is under investigation. Preserve incident evidence and read CRASH-RECOVERY.md before resuming work. Verified hard memory/swap/runtime/group teardown controls are prerequisites, not a reason to blindly retry the failed workload.
+
+Containment prerequisites now pass, including actual cgroup OOM. Corrected tiny test-only source-to-prefill and paired-source/canonical-owner fixtures are device-qualified under scoped3072MiB/zero-swap/120s exceptions; model-server/original Flash replay remains blocked. No root-cause/default/performance promotion is implied.
+
+Current evidence does not satisfy the full goal: contained shared-admission fixtures pass, optional paired fusion is rejected for measured component regression, longer held-out generated-profile quality is below Strata, and original Flash/platform/serving gates remain open. Keep this scope unchanged while proceeding through shared contracts.
+
+Production preparation is now shared between context and fixture;124416 CPU policy/lifetime scenarios and12 contained device cases/24 production preparations pass. This closes that preparation-method gate only. Multi-copy source scheduling, full context/serving and physical platform/profile-quality gates remain open.
+
+The scheduler now records complete graph/allocation/copy identity for prepared regions and selects sessions by that identity. CPU contract checks and12 tiny single-copy source device cases pass. Single-copy and callback guards remain until actual graph/source/CPU reader lifetime and asynchronous submission are implemented and qualified; neither a copy tag nor serialized compatibility satisfies multi-GPU/concurrency performance. The existing shared CPU cancellation watermark is not request-scoped; qualify its contract extension before admitting independent in-flight programs.
