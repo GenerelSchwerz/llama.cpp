@@ -2995,6 +2995,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_PROFILE"));
     add_opt(common_arg(
+        {"--moe-hybrid"}, "on|off",
+        "generic CPU/GPU MoE execution with checked failures (default: off); on selects the source executor",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") { throw std::invalid_argument("--moe-hybrid must be on or off"); }
+            params.moe_hybrid = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID"));
+    add_opt(common_arg(
+        {"--moe-gpu-miss-fraction"}, "F",
+        "fraction of distinct hybrid expert cache misses transferred to GPU, in [0,1] (default: 0.17); resident hits use GPU",
+        [](common_params & params, const std::string & value) {
+            size_t parsed = 0;
+            double fraction;
+            try { fraction = std::stod(value, &parsed); }
+            catch (const std::exception &) { throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]"); }
+            if (parsed != value.size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1) {
+                throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
+            }
+            params.moe_gpu_miss_fraction = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION"));
+    add_opt(common_arg(
         {"--moe-profile-adapt"}, "MODE",
         "profile adaptation: off, occurrence or occurrence-sync (default: off)",
         [](common_params & params, const std::string & value) {

@@ -574,6 +574,7 @@ private:
     bool moe_profile_failed = false;
     uint32_t moe_hybrid_profile_adapt = 0;
     bool moe_hybrid_required = false;
+    bool moe_hybrid_allow_runtime_allocations = false;
     bool moe_source_graph_capacity = false;
     std::atomic<bool> moe_source_poisoned{false};
     std::atomic<bool> moe_source_closed{false};

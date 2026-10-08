@@ -959,6 +959,29 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
+void common_moe_hybrid_configure(const common_params & params) {
+    if (!params.moe_hybrid.empty() && params.moe_hybrid != "on" && params.moe_hybrid != "off") {
+        throw std::invalid_argument("--moe-hybrid must be on or off");
+    }
+    if (!params.moe_gpu_miss_fraction.empty()) {
+        size_t parsed = 0;
+        double fraction;
+        try { fraction = std::stod(params.moe_gpu_miss_fraction, &parsed); }
+        catch (const std::exception &) { throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]"); }
+        if (parsed != params.moe_gpu_miss_fraction.size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1) {
+            throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
+        }
+    }
+    // Configure the existing process selection before model/context preparation.
+    if (!params.moe_hybrid.empty()) {
+        common_set_env("GGML_MOE_HYBRID", params.moe_hybrid == "on" ? "required" : "off");
+        if (params.moe_hybrid == "on") { common_set_env("GGML_MOE_HYBRID_EXECUTOR", "source"); }
+    }
+    if (!params.moe_gpu_miss_fraction.empty()) {
+        common_set_env("GGML_MOE_SOURCE_GPU_MISS_FRACTION", params.moe_gpu_miss_fraction);
+    }
+}
+
 std::filesystem::path common_get_path_from_env(const std::string & name) {
 #if defined(_WIN32)
     const std::wstring wname = utf8_to_wstring(name);
@@ -1379,6 +1402,7 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_moe_hybrid_configure(params);
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

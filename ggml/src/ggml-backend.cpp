@@ -4352,12 +4352,15 @@ const ggml_moe_fidelity_config & ggml_moe_fidelity_selection() {
         c.reference = mode && (!std::strcmp(mode, "reference") || !std::strcmp(mode, "reference-conversion"));
         c.source_pool = mode && (!std::strcmp(mode, "conversion") || !std::strcmp(mode, "reference-conversion"));
         const char * executor = std::getenv("GGML_MOE_HYBRID_EXECUTOR");
-        const bool source_executor = executor && !std::strcmp(executor, "source");
+        const char * hybrid = std::getenv("GGML_MOE_HYBRID");
+        const bool source_executor = executor ? !std::strcmp(executor, "source") :
+            hybrid && !std::strcmp(hybrid, "required");
         if (source_executor) {
             if (mode && std::strcmp(mode, "reference-conversion")) { c.valid = false; }
             c.reference = c.source_pool = true;
         }
         const char * value = std::getenv(source_executor ? "GGML_MOE_SOURCE_GPU_MISS_FRACTION" : "GGML_MOE_FIDELITY_PCIE_FRAC");
+        if (source_executor && !value) { value = "0.17"; }
         if (c.reference && !value) { c.valid = false; }
         if (value) {
             char * end = nullptr;

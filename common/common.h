@@ -558,6 +558,8 @@ struct common_params {
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
     bool moe_early_router = false;
+    std::string moe_hybrid; // empty preserves the process environment
+    std::string moe_gpu_miss_fraction;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -944,6 +946,7 @@ std::string fs_path_to_utf8(const std::filesystem::path & path);
 // and setting an empty value unsets the variable
 std::string common_get_env(const std::string & name);
 void        common_set_env(const std::string & name, const std::string & value);
+void        common_moe_hybrid_configure(const common_params & params);
 
 // reads a path from the environment, an unset variable gives an empty path
 std::filesystem::path common_get_path_from_env(const std::string & name);

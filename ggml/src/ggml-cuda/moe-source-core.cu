@@ -491,7 +491,7 @@ struct core_session {
     bool supervisor_needs_wake = false;
     bool caller_active = false, closed = false, stopping = false, dispatch = false, resources_live = false;
     bool prepared = false, segmented = false, noalias = false, effect_failure = false;
-    bool overlap_enabled = false, overlap_probe = false;
+    bool overlap_enabled = true, overlap_probe = false;
     bool weighted_enabled = false;
     bool kernel_copy_enabled = true;
     bool device_tail = true;

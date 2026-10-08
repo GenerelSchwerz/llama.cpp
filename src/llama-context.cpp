@@ -945,22 +945,29 @@ llama_context::llama_context(
     moe_source_graph_capacity = params.moe_source_graph_capacity;
     moe_hybrid_metadata |= moe_hybrid_required;
     if (moe_hybrid_required) {
-        if (const char * executor = getenv("GGML_MOE_HYBRID_EXECUTOR")) {
-            const bool source_executor = strcmp(executor, "source") == 0;
-            if (strcmp(executor, "eager") != 0 && strcmp(executor, "fidelity") != 0 && !source_executor) {
-                throw std::runtime_error("GGML_MOE_HYBRID_EXECUTOR must be eager, source or fidelity");
+        const char * executor = getenv("GGML_MOE_HYBRID_EXECUTOR");
+        if (!executor) { executor = "source"; }
+        const bool source_executor = strcmp(executor, "source") == 0;
+        if (strcmp(executor, "eager") != 0 && strcmp(executor, "fidelity") != 0 && !source_executor) {
+            throw std::runtime_error("GGML_MOE_HYBRID_EXECUTOR must be eager, source or fidelity");
+        }
+        moe_hybrid_executor = strcmp(executor, "fidelity") == 0 || source_executor ?
+            GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY : GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_EAGER;
+        if (source_executor && !ggml_moe_fidelity_selection().valid) {
+            throw std::runtime_error("source hybrid execution requires a finite GPU miss fraction in [0,1] and compatible pipeline settings");
+        }
+        if (moe_hybrid_executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY && !source_executor) {
+            const char * live_experiment = getenv("GGML_MOE_FIDELITY_LIVE_EXPERIMENT");
+            if (live_experiment == nullptr || strcmp(live_experiment, "1") != 0) {
+                throw std::runtime_error("fidelity hybrid execution requires GGML_MOE_FIDELITY_LIVE_EXPERIMENT=1");
             }
-            moe_hybrid_executor = strcmp(executor, "fidelity") == 0 || source_executor ?
-                GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY : GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_EAGER;
-            if (source_executor && !ggml_moe_fidelity_selection().valid) {
-                throw std::runtime_error("source hybrid execution requires a finite GGML_MOE_SOURCE_GPU_MISS_FRACTION in [0,1] and compatible pipeline settings");
+        }
+        moe_hybrid_allow_runtime_allocations = source_core_enabled();
+        if (const char * allocations = getenv("GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS")) {
+            if (strcmp(allocations, "0") && strcmp(allocations, "1")) {
+                throw std::runtime_error("GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS must be 0 or 1");
             }
-            if (moe_hybrid_executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY && !source_executor) {
-                const char * live_experiment = getenv("GGML_MOE_FIDELITY_LIVE_EXPERIMENT");
-                if (live_experiment == nullptr || strcmp(live_experiment, "1") != 0) {
-                    throw std::runtime_error("fidelity hybrid execution requires GGML_MOE_FIDELITY_LIVE_EXPERIMENT=1");
-                }
-            }
+            moe_hybrid_allow_runtime_allocations = !strcmp(allocations, "1");
         }
         if (const char * batch = getenv("GGML_MOE_HYBRID_RESIDENT_BATCH")) {
             if (strcmp(batch, "off") != 0 && strcmp(batch, "on") != 0) {
@@ -2535,7 +2542,7 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             config.resident_batch = moe_hybrid_resident_batch;
             config.executor = moe_hybrid_executor;
             config.cpu_flags = GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNKNOWN_THREAD_STACK_BYTES;
-            if (getenv("GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS") != nullptr) {
+            if (moe_hybrid_allow_runtime_allocations) {
                 config.cpu_flags |= GGML_BACKEND_MOE_CPU_SERVICE_FLAG_V1_ALLOW_UNPROVEN_RUNTIME_ALLOCATIONS;
             }
             config.backend = region.backend;

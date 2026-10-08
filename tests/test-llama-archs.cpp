@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-cuda/moe-source-core.cuh"
 #include "../ggml/src/ggml-impl.h"
 #include "common.h"
+#include "arg.h"
 #include "fit.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -148,6 +149,8 @@ static void usage(char ** argv) {
     LOG("  --profile-corpus <json>  Workload weights and calibration requests\n");
     LOG("  --profile-output <gguf>  New profile path; evidence goes in <gguf>.calibration\n");
     LOG("  --profile-threads <N>    Calibration CPU threads (default 4)\n");
+    LOG("  --moe-hybrid on|off     Generic CPU/GPU execution (corpus collection defaults on)\n");
+    LOG("  --moe-gpu-miss-fraction <F> GPU transfer share of distinct misses (default 0.17)\n");
     LOG("  --source-statistics-file <file> Write synthetic source statistics for the profile loading fixture\n");
     LOG("  --test-moe-replay <model> Record or replay identical-token full-logit rows\n");
     LOG("  --test-source-variants Check sequence-aware source captures against --replay-reference\n");
@@ -6739,6 +6742,7 @@ int main(int argc, char ** argv) {
     bool source_statistics = false;
     const char * profile_model_path = nullptr;
     const char * profile_corpus_path = nullptr;
+    std::vector<std::string> hybrid_args{"test-llama-archs"};
     const char * profile_output_path = nullptr;
     uint32_t profile_threads = 4;
     const char * moe_replay_path = nullptr;
@@ -6809,6 +6813,9 @@ int main(int argc, char ** argv) {
             source_statistics = true;
         } else if (strcmp(argv[i], "--collect-moe-profile") == 0 && i + 1 < argc) {
             profile_model_path = argv[++i];
+        } else if ((strcmp(argv[i], "--moe-hybrid") == 0 || strcmp(argv[i], "--moe-gpu-miss-fraction") == 0) && i + 1 < argc) {
+            hybrid_args.push_back(argv[i]);
+            hybrid_args.push_back(argv[++i]);
         } else if (strcmp(argv[i], "--profile-corpus") == 0 && i + 1 < argc) {
             profile_corpus_path = argv[++i];
         } else if (strcmp(argv[i], "--profile-output") == 0 && i + 1 < argc) {
@@ -6938,6 +6945,15 @@ int main(int argc, char ** argv) {
 
     try {
         if (!profile_model_path && (profile_corpus_path || profile_output_path)) { throw std::runtime_error("profile inputs require --collect-moe-profile"); }
+        if (profile_model_path || hybrid_args.size() > 1) {
+            common_params hybrid_params;
+            std::vector<char *> hybrid_argv;
+            for (auto & argument : hybrid_args) { hybrid_argv.push_back(argument.data()); }
+            if (!common_params_parse(hybrid_argv.size(), hybrid_argv.data(), hybrid_params, LLAMA_EXAMPLE_SERVER)) { return 1; }
+            if (profile_model_path && hybrid_params.moe_hybrid.empty()) { hybrid_params.moe_hybrid = "on"; }
+            if (profile_model_path && hybrid_params.moe_hybrid == "off") { throw std::runtime_error("corpus collection requires --moe-hybrid on"); }
+            common_moe_hybrid_configure(hybrid_params);
+        }
         if (profile_model_path) { return collect_model_moe_corpus(profile_model_path, profile_corpus_path, profile_output_path, replay_cache_slots, profile_threads, replay_load_mode); }
         if (run_mtp_draft_vocab) {
             test_mtp_draft_vocab(seed, stdev);
