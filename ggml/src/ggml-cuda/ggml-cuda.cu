@@ -4038,7 +4038,29 @@ static int ggml_cuda_match_mmvf_pair(ggml_cgraph * graph, int i, int device, con
     return -1;
 }
 
+static bool ggml_cuda_hc_pre_emit_ok(const ggml_tensor * dst, int device) {
+    if (dst->op != GGML_OP_DSV4_HC_PRE || !(dst->flags & GGML_TENSOR_FLAG_COMPUTE) || dst->type != GGML_TYPE_F32 ||
+            !dst->src[0] || !dst->src[1] || !ggml_is_contiguous(dst) || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            dst->ne[0] <= 0 || dst->ne[1] <= 0 || dst->ne[0] > INT_MAX/dst->ne[1]) { return false; }
+    const ggml_tensor * x = dst->src[0], * weight = dst->src[1];
+    const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
+    if (x->ne[0] != dst->ne[0] || x->ne[2] != dst->ne[1] || x->ne[1] <= 0 || x->ne[3] != 1 ||
+            (gated && !ggml_are_same_shape(x, weight)) || (!gated && (weight->ne[0] != x->ne[1] || weight->ne[1] != x->ne[2] || weight->ne[2] != 1 || weight->ne[3] != 1))) { return false; }
+    uintptr_t begin, end;
+    if (!ggml_cuda_prepared_range(dst, device, begin, end) || begin % sizeof(float)) { return false; }
+    for (const ggml_tensor * input : {x, weight}) {
+        uintptr_t rb, re;
+        if (input->type != GGML_TYPE_F32 || !ggml_cuda_prepared_range(input, device, rb, re) || rb % sizeof(float) ||
+                (begin < re && rb < end)) { return false; }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (input->ne[d] <= 0 || input->nb[d] % sizeof(float) || input->nb[d]/sizeof(float) > INT64_MAX) { return false; }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_norm_emit_match {
+    ggml_tensor * hc_pre = nullptr;
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
@@ -4101,7 +4123,7 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
 }
 
 static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgraph * graph, int device,
-        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
+        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse, const std::unordered_set<const ggml_tensor *> & hc_up) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (keys[i] != GGML_TYPE_F16 && keys[i] != GGML_TYPE_BF16) { continue; }
@@ -4114,7 +4136,11 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_emit(graph, i, device);
-        if (!match.norm) { continue; }
+        if (!match.norm && !hc_up.count(graph->nodes[i]) && ggml_cuda_hc_pre_emit_ok(graph->nodes[i], device)) {
+            match.hc_pre = match.dst = graph->nodes[i];
+            match.last = i;
+        }
+        if (!match.norm && !match.hc_pre) { continue; }
         const auto can_emit = [&](int node, int prepare) {
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
@@ -7034,9 +7060,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, input_keys, input_sizes, ggml_cuda_prepared_input_overwritten);
+            std::unordered_set<const ggml_tensor *> hc_up;
+            if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    if (cgraph->nodes[i]->op != GGML_OP_DSV4_HC_PRE) { continue; }
+                    for (int j = std::max(0, i - 3); j < i; ++j) {
+                        const auto match = ggml_cuda_match_hc_up(*cuda_ctx, cgraph, j);
+                        if (match.dst == cgraph->nodes[i]) { hc_up.insert(match.dst); }
+                    }
+                }
+            }
             std::vector<ggml_cuda_norm_emit_match> norm_emits;
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                norm_emits = ggml_cuda_plan_norm_emit(cgraph, cuda_ctx->device, input_keys, input_sizes, reuse);
+                norm_emits = ggml_cuda_plan_norm_emit(cgraph, cuda_ctx->device, input_keys, input_sizes, reuse, hc_up);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> shared_inputs(cuda_ctx->pool(), reuse);
             const auto prepare_group = [&](int group) {
@@ -7336,6 +7372,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary,
                         affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data, affine_injection.hc.scale);
                 };
+                if (!norm_emits.empty() && norm_emits[i].hc_pre) {
+                    ggml_cuda_hc_pre_emit_data images;
+                    const auto typed_image = [&](int g) -> void * {
+                        if (g < 0) { return nullptr; }
+                        shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
+                        return shared_inputs[g].get();
+                    };
+                    images.f16 = typed_image(norm_emits[i].f16);
+                    images.bf16 = typed_image(norm_emits[i].bf16);
+                    ggml_cuda_op_dsv4_hc_pre_emit(*cuda_ctx, node, images);
+                    continue;
+                }
                 if (!mmq_emits.empty() && mmq_emits[emit_i].post && (q8_emits.empty() || !q8_emits[emit_i].norm)) {
                     const auto & emit = mmq_emits[emit_i];
                     const auto * typed = !norm_emits.empty() && norm_emits[emit_i].norm ? &norm_emits[emit_i] : nullptr;

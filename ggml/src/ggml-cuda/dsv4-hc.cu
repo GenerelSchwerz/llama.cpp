@@ -117,7 +117,22 @@ struct ggml_cuda_hc_gate_convert {
     }
 };
 
-template <bool gated, typename Gate>
+struct ggml_cuda_hc_pre_store {
+    __device__ __forceinline__ void operator()(float * dst, int64_t index, int64_t, int64_t, float value) const { dst[index] = value; }
+};
+
+struct ggml_cuda_hc_pre_image_store {
+    ggml_cuda_hc_pre_emit_data images;
+    int64_t cols;
+    __device__ __forceinline__ void operator()(float * dst, int64_t index, int64_t col, int64_t row, float value) const {
+        dst[index] = value;
+        const int64_t flat = row*cols + col;
+        if (images.f16) { ((half *) images.f16)[flat] = ggml_cuda_cast<half>(value); }
+        if (images.bf16) { ((nv_bfloat16 *) images.bf16)[flat] = ggml_cuda_cast<nv_bfloat16>(value); }
+    }
+};
+
+template <bool gated, typename Gate, typename Store = ggml_cuda_hc_pre_store>
 static __device__ __forceinline__ void dsv4_hc_pre_impl(
         const float * x,
         const Gate weights,
@@ -133,7 +148,7 @@ static __device__ __forceinline__ void dsv4_hc_pre_impl(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale, Store store = {}) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -159,7 +174,7 @@ static __device__ __forceinline__ void dsv4_hc_pre_impl(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    store(dst, i0*sd0 + it*sd1, i0, it, scale * sum);
 }
 
 template <bool gated>
@@ -182,6 +197,17 @@ static __global__ void dsv4_hc_pre_f32(
     dsv4_hc_pre_impl<gated>(
             x, ggml_cuda_hc_gate_f32{weights}, dst, n_embd, hc, n_tokens,
             sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale);
+}
+
+template <bool gated>
+static __global__ void dsv4_hc_pre_images(
+        const float * x, const float * weights, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens,
+        int64_t sx0, int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale, ggml_cuda_hc_pre_emit_data images) {
+    dsv4_hc_pre_impl<gated>(x, ggml_cuda_hc_gate_f32{weights}, dst, n_embd, hc, n_tokens,
+        sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, ggml_cuda_hc_pre_image_store{images, n_embd});
 }
 
 template <typename T>
@@ -321,6 +347,19 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
             scale);
+}
+
+void ggml_cuda_op_dsv4_hc_pre_emit(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data & images) {
+    const ggml_tensor * x = dst->src[0], * weights = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && (images.f16 || images.bf16));
+    const int64_t nr = x->ne[0]*x->ne[2];
+    const ggml_cuda_kernel_launch_params params(dim3((nr + 255)/256), dim3(256), 0, ctx.stream());
+    auto kernel = ggml_get_op_params_i32(dst, 1) ? dsv4_hc_pre_images<true> : dsv4_hc_pre_images<false>;
+    ggml_cuda_kernel_launch(kernel, params, (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+        x->ne[0], x->ne[1], x->ne[2], x->nb[0]/sizeof(float), x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+        weights->nb[0]/sizeof(float), weights->nb[1]/sizeof(float), weights->nb[2]/sizeof(float),
+        dst->nb[0]/sizeof(float), dst->nb[1]/sizeof(float), ggml_get_op_params_f32(dst, 0), images);
 }
 
 void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst) {
