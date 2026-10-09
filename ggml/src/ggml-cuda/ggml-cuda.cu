@@ -73,6 +73,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3923,6 +3924,120 @@ static bool ggml_cuda_hc_post_norm_memory_ok(const ggml_cgraph * cgraph, int i, 
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+static bool ggml_cuda_mmvf_pair_node(const ggml_tensor * node, int device, bool allocated) {
+    if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src ||
+            node->type != GGML_TYPE_F32 || !node->src[0] || !node->src[1] || node->ne[1] != 1 ||
+            !ggml_is_contiguous(node) || ggml_cuda_op_mul_mat_use_fwht(node)) { return false; }
+    const ggml_tensor * weight = node->src[0], * input = node->src[1];
+    if ((weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16) ||
+            input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[1] != 1 ||
+            input->nb[2] % (2*sizeof(float)) || input->nb[3] % (2*sizeof(float)) ||
+            input->ne[0] > INT_MAX || node->ne[0] > INT_MAX || node->ne[2] > 65535 || node->ne[3] > 65535 ||
+            ggml_cuda_mul_mat_kernel(weight, input, node, device) != GGML_CUDA_MM_MMVF) { return false; }
+    for (const ggml_tensor * tensor : {weight, input, node}) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            const size_t size = ggml_type_size(tensor->type);
+            if (tensor->ne[d] <= 0 || tensor->nb[d] % size || tensor->nb[d]/size > INT_MAX) { return false; }
+        }
+        if (allocated) {
+            uintptr_t begin, end;
+            const size_t alignment = tensor == node ? sizeof(float) : 2*ggml_type_size(tensor->type);
+            if (!ggml_cuda_prepared_range(tensor, device, begin, end) || begin % alignment) { return false; }
+        }
+    }
+    return true;
+}
+
+struct ggml_cuda_mmvf_pair_plan {
+    std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
+    std::unordered_map<const ggml_tensor *, int> indices;
+
+    ggml_cuda_mmvf_pair_plan(ggml_cgraph * graph, int device, bool allocated, bool enabled = true) {
+        if (!enabled) { return; }
+        std::unordered_set<const ggml_tensor *> reserved;
+        std::vector<const ggml_tensor *> pending;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            indices[node] = i;
+            if (node->op == GGML_OP_GLU || node->op == GGML_OP_DSV4_HC_PRE || node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+                for (const ggml_tensor * src : node->src) { if (src) { pending.push_back(src); } }
+            }
+        }
+        std::unordered_set<const ggml_tensor *> visited;
+        while (!pending.empty()) {
+            const ggml_tensor * node = pending.back();
+            pending.pop_back();
+            if (!visited.insert(node).second) { continue; }
+            if (node->op == GGML_OP_MUL_MAT) {
+                reserved.insert(node);
+            } else if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW || node->op == GGML_OP_SCALE ||
+                    node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+                for (const ggml_tensor * src : node->src) { if (src) { pending.push_back(src); } }
+            }
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (!reserved.count(node) && ggml_cuda_mmvf_pair_node(node, device, allocated)) {
+                readers[node->src[1]].push_back(i);
+            }
+        }
+    }
+};
+
+static int ggml_cuda_match_mmvf_pair(ggml_cgraph * graph, int i, int device, const ggml_cuda_mmvf_pair_plan & plan, bool allocated = true) {
+    ggml_tensor * first = graph->nodes[i];
+    if (first->op != GGML_OP_MUL_MAT) { return -1; }
+    const auto readers = plan.readers.find(first->src[1]);
+    if (readers == plan.readers.end() || !std::binary_search(readers->second.begin(), readers->second.end(), i)) { return -1; }
+    const auto ready = [&](const ggml_tensor * tensor) {
+        const ggml_tensor * root = tensor->view_src ? tensor->view_src : tensor;
+        if (root->op == GGML_OP_NONE) { return true; }
+        const auto index = plan.indices.find(root);
+        return index != plan.indices.end() && index->second < i;
+    };
+    for (const int j : readers->second) {
+        if (j <= i) { continue; }
+        ggml_tensor * second = graph->nodes[j];
+        if (second->op != GGML_OP_MUL_MAT || second->src[1] != first->src[1] ||
+                !ggml_cuda_mmvf_pair_node(second, device, allocated) || !ready(second->src[0]) ||
+                first->src[0]->type != second->src[0]->type || first->op_params[0] != second->op_params[0] ||
+                first->ne[0] > INT_MAX - second->ne[0]) { continue; }
+        bool same_batch = true;
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            same_batch = same_batch && first->ne[d] == second->ne[d] && first->src[0]->ne[d] == second->src[0]->ne[d];
+        }
+        if (!same_batch) { continue; }
+        bool safe = true;
+        uintptr_t begin = 0, end = 0;
+        if (allocated && !ggml_cuda_prepared_range(second, device, begin, end)) { continue; }
+        for (int k = i; k <= j && safe; ++k) {
+            ggml_tensor * node = graph->nodes[k];
+            if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) { safe = false; break; }
+            for (const ggml_tensor * read : node->src) {
+                if (!read) { continue; }
+                const ggml_tensor * root = read->view_src ? read->view_src : read;
+                if (k < j && root == second) { safe = false; break; }
+                if (allocated) {
+                    uintptr_t other_begin, other_end;
+                    if (!ggml_cuda_prepared_range(read, device, other_begin, other_end) ||
+                            (begin < other_end && other_begin < end)) { safe = false; break; }
+                }
+            }
+            if (node == second || ggml_cuda_is_view_or_noop(node) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) { continue; }
+            if (allocated && (ggml_cuda_prepared_input_overwritten(node, first->src[1]) ||
+                    ggml_cuda_prepared_input_overwritten(node, second->src[0]))) { safe = false; break; }
+            if (allocated) {
+                uintptr_t other_begin, other_end;
+                if (!ggml_cuda_prepared_range(node, device, other_begin, other_end) ||
+                        (begin < other_end && other_begin < end)) { safe = false; }
+            }
+        }
+        if (safe) { return j; }
+    }
+    return -1;
+}
+
 struct ggml_cuda_norm_emit_match {
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
@@ -6994,6 +7109,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             };
 
+            const ggml_cuda_mmvf_pair_plan mmvf_pairs(cgraph, cuda_ctx->device, true, !disable_reuse && stream_ctx.concurrent_events.empty());
+            std::unordered_set<const ggml_tensor *> paired_mmvf;
             std::unordered_map<const ggml_tensor *, ggml_cuda_moe_shared_match> moe_shared_emits;
             std::unordered_map<const ggml_tensor *, ggml_cuda_repeat_mul_add_match> repeat_emits;
             std::unordered_map<const ggml_tensor *, ggml_cuda_pre_mul_norm_match> repeat_norm_emits;
@@ -7302,6 +7419,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (paired_mmvf.count(node)) { continue; }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized, prepared_hc_post, affine_match, nullptr, prepared_src1);
 
                 if (nodes_to_skip != 0) {
@@ -7313,6 +7432,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
                     i += nodes_to_skip;
                     continue;
+                }
+                if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
+                    const int partner = ggml_cuda_match_mmvf_pair(cgraph, i, cuda_ctx->device, mmvf_pairs);
+                    if (partner >= 0 && !paired_mmvf.count(cgraph->nodes[partner])) {
+                        ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node, cgraph->nodes[partner]);
+                        paired_mmvf.insert(cgraph->nodes[partner]);
+                        continue;
+                    }
                 }
 #ifndef NDEBUG
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
@@ -7509,6 +7636,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        const ggml_cuda_mmvf_pair_plan mmvf_pairs(cgraph, cuda_ctx->device, false);
+        std::unordered_set<const ggml_tensor *> paired_mmvf;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (paired_mmvf.count(cgraph->nodes[i])) { continue; }
+            const int partner = ggml_cuda_match_mmvf_pair(cgraph, i, cuda_ctx->device, mmvf_pairs, false);
+            if (partner < 0 || paired_mmvf.count(cgraph->nodes[partner])) { continue; }
+            ggml_tensor * first = cgraph->nodes[i], * second = cgraph->nodes[partner];
+            for (ggml_tensor * tensor : {first, second, first->src[0], first->src[1], second->src[0]}) {
+                params->add_alloc_dep(params->user_data, tensor, first);
+            }
+            paired_mmvf.insert(second);
+        }
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
