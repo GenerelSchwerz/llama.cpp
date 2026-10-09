@@ -3582,7 +3582,7 @@ static std::vector<ggml_cuda_glu_mmq_id_emit> ggml_cuda_plan_glu_mmq_id(ggml_cgr
         const ggml_cuda_stream_context & streams, const std::vector<int> & keys, const std::vector<size_t> & route_sizes,
         const std::vector<size_t> & image_sizes, ggml_cuda_reuse_plan & routes, ggml_cuda_reuse_plan & reuse,
         std::vector<bool> & inverse) {
-    if (keys.empty() || !streams.concurrent_events.empty()) { return {}; }
+    if (keys.empty() || std::none_of(keys.begin(), keys.end(), [](int key) { return key >= 0 && key <= 3; })) { return {}; }
     size_t route_budget = 0, image_budget = 0;
     for (const auto & group : routes.groups) {
         if (group.size > SIZE_MAX - route_budget) { return {}; }
@@ -3593,13 +3593,26 @@ static std::vector<ggml_cuda_glu_mmq_id_emit> ggml_cuda_plan_glu_mmq_id(ggml_cgr
         image_budget += group.size;
     }
     std::unordered_map<const ggml_tensor *, int> indices;
-    for (int i = 0; i < graph->n_nodes; ++i) { indices[graph->nodes[i]] = i; }
+    std::vector<int> forks, joins, lanes;
+    if (!ggml_cuda_reuse_stream_order(graph, streams, indices, forks, joins, lanes)) { return {}; }
+    for (const auto & entry : streams.concurrent_events) {
+        const int fork = indices.at(entry.first), join = indices.at(entry.second.join_node);
+        for (int i = fork + 1; i < join; ++i) {
+            if (forks[i] != fork || joins[i] != join || lanes[i] < 1 || lanes[i] > entry.second.n_streams) { return {}; }
+        }
+    }
+    const auto branched = [&](int i) { return !forks.empty() && forks[i] >= 0; };
+    const auto ordered = [&](int before, int after) {
+        return before < after && (!branched(before) || joins[before] <= after ||
+            (forks[before] == forks[after] && lanes[before] == lanes[after]));
+    };
+    const auto finish = [&](int i) { return branched(i) ? joins[i] : i; };
     std::vector<ggml_cuda_glu_mmq_id_emit> emits(graph->n_nodes);
     inverse.resize(routes.groups.size(), false);
     bool moved = false;
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * dst = graph->nodes[i];
-        if (!ggml_cuda_can_emit_glu_mmq_id(dst, device)) { continue; }
+        if (!ggml_cuda_can_emit_glu_mmq_id(dst, device) || streams.concurrent_events.count(dst)) { continue; }
         for (int j = i + 1; j < graph->n_nodes; ++j) {
             if (keys[j] < 0 || keys[j] > 3) { continue; }
             const ggml_tensor * reader = graph->nodes[j], * input = reader->src[1], * ids = reader->src[2];
@@ -3614,12 +3627,18 @@ static std::vector<ggml_cuda_glu_mmq_id_emit> ggml_cuda_plan_glu_mmq_id(ggml_cgr
                     (begin < ids_end && ids_begin < end)) { continue; }
             const ggml_tensor * id_root = ids->view_src ? ids->view_src : ids;
             const auto found = indices.find(id_root);
-            if (found == indices.end() ? id_root->op != GGML_OP_NONE : found->second >= i) { continue; }
+            if (found == indices.end() ? id_root->op != GGML_OP_NONE : !ordered(found->second, i)) { continue; }
+            if (!ordered(i, j)) { continue; }
             int image = reuse.nodes.empty() ? -1 : reuse.nodes[j];
             int route = routes.nodes.empty() ? -1 : routes.nodes[j];
             const int prepare = image < 0 ? j : reuse.groups[image].prepare;
-            bool safe = prepare > i;
-            for (int k = i; safe && k <= prepare; ++k) {
+            bool safe = ordered(i, prepare) || (prepare == i && image >= 0 && reuse.groups[image].after);
+            int first = i, last = prepare;
+            for (int node : {i, prepare}) {
+                if (branched(node)) { first = std::min(first, forks[node] + 1); last = std::max(last, joins[node] - 1); }
+            }
+            for (int k = first; safe && k <= last; ++k) {
+                if ((k < i && ordered(k, i)) || (k > prepare && ordered(prepare, k))) { continue; }
                 safe = !ggml_cuda_mmq_id_input_overwritten(graph->nodes[k], ids) &&
                     (k == i || !ggml_cuda_mmq_id_input_overwritten(graph->nodes[k], input));
             }
@@ -3636,14 +3655,14 @@ static std::vector<ggml_cuda_glu_mmq_id_emit> ggml_cuda_plan_glu_mmq_id(ggml_cgr
             if (reuse.nodes.empty()) { reuse.nodes.assign(graph->n_nodes, -1); reuse.starts.assign(graph->n_nodes, -1); }
             if (route < 0) {
                 route = int(routes.groups.size());
-                routes.groups.push_back({j, i, j, -1, false, add_route});
+                routes.groups.push_back({j, i, finish(j), -1, false, add_route});
                 inverse.push_back(false);
                 routes.nodes[j] = route;
                 route_budget += add_route;
             }
             if (image < 0) {
                 image = int(reuse.groups.size());
-                reuse.groups.push_back({j, i, j, -1, true, add_image});
+                reuse.groups.push_back({j, i, finish(j), -1, true, add_image});
                 reuse.nodes[j] = image;
                 image_budget += add_image;
             }
@@ -4665,6 +4684,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (!emits.empty() && !stream_ctx.concurrent_events.empty()) {
+                        for (int k = i; k <= i + nodes_to_skip; ++k) {
+                            if (emits[k].image >= 0) {
+                                prepare_route(emits[k].route);
+                                prepare_group(emits[k].image);
+                            }
+                        }
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

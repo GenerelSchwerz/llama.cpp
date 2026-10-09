@@ -35,6 +35,33 @@ struct ggml_cuda_reuse_group {
     size_t size, offset = 0;
 };
 
+static bool ggml_cuda_reuse_stream_order(const ggml_cgraph * graph, const ggml_cuda_stream_context & streams,
+        std::unordered_map<const ggml_tensor *, int> & indices, std::vector<int> & forks,
+        std::vector<int> & joins, std::vector<int> & lanes) {
+    const int n = graph->n_nodes;
+    for (int i = 0; i < n; ++i) { indices[graph->nodes[i]] = i; }
+    if (streams.concurrent_events.empty()) { return true; }
+    forks.assign(n, -1);
+    joins.assign(n, -1);
+    lanes.assign(n, 0);
+    for (const auto & entry : streams.concurrent_events) {
+        const auto first = indices.find(entry.first), last = indices.find(entry.second.join_node);
+        if (first == indices.end() || last == indices.end() || first->second >= last->second) { return false; }
+        const int fork = first->second, join = last->second;
+        for (const auto & mapping : entry.second.stream_mapping) {
+            const auto it = indices.find(mapping.first);
+            if (it == indices.end()) { return false; }
+            const int i = it->second;
+            if (i > fork && i < join) {
+                forks[i] = fork;
+                joins[i] = join;
+                lanes[i] = mapping.second;
+            }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_reuse_plan {
     std::vector<ggml_cuda_reuse_group> groups;
     std::vector<int> nodes;
@@ -55,26 +82,9 @@ struct ggml_cuda_reuse_plan {
         nodes.assign(n, -1);
         starts.assign(n, -1);
         const bool concurrent = !streams.concurrent_events.empty();
-        std::vector<int> forks(concurrent ? n : 0, -1), joins(concurrent ? n : 0, -1), lanes(concurrent ? n : 0, 0);
-        if (!streams.concurrent_events.empty()) {
-            for (int i = 0; i < n; ++i) { indices[graph->nodes[i]] = i; }
-        }
-        for (const auto & entry : streams.concurrent_events) {
-            const auto first = indices.find(entry.first), last = indices.find(entry.second.join_node);
-            if (first == indices.end() || last == indices.end() || first->second >= last->second) {
-                nodes.clear(); starts.clear(); indices.clear(); return;
-            }
-            const int fork = first->second, join = last->second;
-            for (const auto & mapping : entry.second.stream_mapping) {
-                const auto it = indices.find(mapping.first);
-                if (it == indices.end()) { nodes.clear(); starts.clear(); indices.clear(); return; }
-                const int i = it->second;
-                if (i > fork && i < join) {
-                    forks[i] = fork;
-                    joins[i] = join;
-                    lanes[i] = mapping.second;
-                }
-            }
+        std::vector<int> forks, joins, lanes;
+        if (concurrent && !ggml_cuda_reuse_stream_order(graph, streams, indices, forks, joins, lanes)) {
+            nodes.clear(); starts.clear(); indices.clear(); return;
         }
         const auto ready = [&](const ggml_tensor * tensor, int fork) {
             while (tensor->view_src) { tensor = tensor->view_src; }
