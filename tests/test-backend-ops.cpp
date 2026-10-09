@@ -5354,9 +5354,11 @@ struct test_mul_mat_id_fusion : public test_case {
     const int64_t k;
     const uint32_t o; // number of outputs
     const bool mul;
+    const int reuse_case;
+    const ggml_prec precision;
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul);
+        return VARS_TO_STR12(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, reuse_case, precision);
     }
 
     double max_nmse_err() override {
@@ -5370,9 +5372,9 @@ struct test_mul_mat_id_fusion : public test_case {
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, int reuse_case = 0, ggml_prec precision = GGML_PREC_UNDEFINED)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul) {
+            m(m), n(n), k(k), o(o), mul(mul), reuse_case(reuse_case), precision(precision) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -5388,15 +5390,59 @@ struct test_mul_mat_id_fusion : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k + (reuse_case == 6 ? 8 : 0), reuse_case == 18 ? n_used/2 : this->b ? 1 : n_used, n);
+        if (reuse_case == 6) {
+            b = ggml_view_3d(ctx, b, k, b->ne[1], n, b->nb[1], b->nb[2], 0);
+        }
         ggml_set_name(b, "b");
+        if (reuse_case >= 9) {
+            if (reuse_case == 10 || reuse_case == 11) {
+                b = ggml_glu(ctx, ggml_new_tensor_3d(ctx, type_b, 2*k, b->ne[1], n), GGML_GLU_OP_SWIGLU, reuse_case == 11);
+            } else {
+                ggml_tensor * up = ggml_new_tensor_3d(ctx, type_b, k, b->ne[1], n);
+                const ggml_glu_op ops[] = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK };
+                b = reuse_case == 16 ? ggml_swiglu_oai(ctx, b, up, 1.234f, 7.0f) : reuse_case == 17 ? ggml_swiglu_clamp(ctx, b, up, 7.0f) : ggml_glu_split(ctx, b, up, ops[reuse_case == 9 || reuse_case == 18 ? 0 : reuse_case - 11]);
+            }
+            ggml_set_output(b);
+            ggml_build_forward_expand(gf, b);
+        }
+        ggml_tensor * inputs[] = {b, nullptr, nullptr, nullptr};
+        if (reuse_case == 8) {
+            for (int i = 1; i < 4; ++i) { inputs[i] = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n); }
+        }
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (precision != GGML_PREC_UNDEFINED) {
+            ggml_prec_set_src(out, precision, 1);
+        }
 
         for (uint32_t i = 1; i < o; ++i) {
             ggml_tensor * a2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
-            ggml_tensor * out2 = ggml_mul_mat_id(ctx, a2, b, ids);
+            ggml_tensor * next_b = reuse_case == 8 ? inputs[i % 4] : b;
+            ggml_tensor * next_ids = ids;
+            if (reuse_case == 2) {
+                next_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+                next_ids = ggml_view_2d(ctx, next_ids, n_used, n, next_ids->nb[1], 0);
+            } else if (reuse_case == 3) {
+                next_b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+            } else if (reuse_case == 4) {
+                ggml_tensor * replacement = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+                ggml_build_forward_expand(gf, out);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, replacement, b));
+            } else if (reuse_case == 5) {
+                ggml_tensor * replacement = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+                replacement = ggml_view_2d(ctx, replacement, n_used, n, replacement->nb[1], 0);
+                ggml_build_forward_expand(gf, out);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, replacement, ids));
+            } else if (reuse_case == 7) {
+                out = ggml_silu(ctx, out);
+                ggml_build_forward_expand(gf, out);
+            }
+            ggml_tensor * out2 = ggml_mul_mat_id(ctx, a2, next_b, next_ids);
+            if (precision != GGML_PREC_UNDEFINED) {
+                ggml_prec_set_src(out2, precision, 1);
+            }
             ggml_set_name(out2, "out2");
             out = ggml_add(ctx, out, out2);
         }
@@ -5419,7 +5465,7 @@ struct test_mul_mat_id_fusion : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MUL_MAT_ID_FUSION";
+        return reuse_case ? "MUL_MAT_ID_SHARED_INPUT" : "MUL_MAT_ID_FUSION";
     }
 };
 
@@ -10449,6 +10495,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q8_0}) {
+        for (bool broadcast : {false, true}) {
+            for (int mode = 9; mode <= 18; ++mode) {
+                if (mode == 18 && broadcast) { continue; }
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 4, broadcast, 64, 33, 256, 2, false, mode, GGML_PREC_Q8));
+            }
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 4, broadcast, 64, 33, 256, 1, false, 9, GGML_PREC_Q8));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 9, 32, 129}) {
+            for (bool broadcast : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 2, broadcast, 64, n, 256, 8, false, 8, GGML_PREC_Q8));
+                for (int reuse_case : {1, 2, 3, 4, 5, 6, 7}) {
+                    test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 2, broadcast, 64, n, 256, 3, false, reuse_case, GGML_PREC_Q8));
+                }
+            }
+        }
+    }
+    for (int experts : {32, 512}) {
+        const int used = experts == 512 ? 10 : 4;
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ3_S, GGML_TYPE_F32, experts, used, true, 64, 32, 256, 2, false, 1));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

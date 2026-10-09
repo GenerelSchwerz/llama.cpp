@@ -1613,7 +1613,29 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+// MMQ can read a full tile past the last routed row.
+static constexpr size_t MMQ_ID_INPUT_GUARD = 128;
+
+struct ggml_cuda_mmq_id_input {
+    const ggml_cuda_mmq_id_input * routes = nullptr;
+    size_t guard = 0;
+    ggml_cuda_pool_alloc<int32_t> ids_src1;
+    ggml_cuda_pool_alloc<int32_t> ids_dst;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds;
+    ggml_cuda_pool_alloc<int32_t> inverse;
+    ggml_cuda_pool_alloc<char> quantized;
+    ggml_cuda_pool_alloc<float> scale;
+
+    explicit ggml_cuda_mmq_id_input(ggml_cuda_pool & pool) : ids_src1(pool), ids_dst(pool), expert_bounds(pool), inverse(pool), quantized(pool), scale(pool) {}
+};
+
+ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
+size_t ggml_cuda_mmq_id_input_size(const ggml_tensor * node, int cc);
+void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_cuda_mmq_id_input & input, size_t guard = 0, bool inverse = false);
+void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node, size_t size, ggml_cuda_mmq_id_input & input, const ggml_cuda_mmq_id_input * routes = nullptr);
+
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mmq_id_input * input = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
