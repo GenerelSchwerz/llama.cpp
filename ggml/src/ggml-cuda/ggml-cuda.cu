@@ -3447,7 +3447,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 static bool ggml_cuda_can_share_mmvq_input(const ggml_tensor * node, int device) {
-    if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->view_src ||
+    const bool routed = node->op == GGML_OP_MUL_MAT_ID;
+    if ((node->op != GGML_OP_MUL_MAT && !routed) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->view_src ||
             node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
         return false;
     }
@@ -3455,9 +3456,21 @@ static bool ggml_cuda_can_share_mmvq_input(const ggml_tensor * node, int device)
     const ggml_tensor * input = node->src[1];
     const int cc = ggml_cuda_info().devices[device].cc;
     if (cc <= GGML_CUDA_CC_PASCAL || input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) ||
-            input->ne[1] < 1 || input->ne[2] != 1 || input->ne[3] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1 ||
-            !ggml_is_contiguous(weight) || !ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) ||
-            ggml_cuda_op_mul_mat_use_fwht(node)) {
+            input->ne[1] < 1 || input->ne[3] != 1 || weight->ne[3] != 1 ||
+            !ggml_is_contiguous(weight) || ggml_cuda_op_mul_mat_use_fwht(node)) {
+        return false;
+    }
+    if (routed) {
+        const ggml_tensor * ids = node->src[2];
+        if (!ggml_is_quantized(weight->type) || input->ne[2] < 1 || input->ne[2] > get_mmvq_mmid_max_batch(weight->type, cc) ||
+                !ids || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
+                !ids->buffer || !ids->data || ids->buffer->buft != ggml_backend_cuda_buffer_type(device)) {
+            return false;
+        }
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (input->nb[d] % sizeof(float) || ids->nb[d] % sizeof(int32_t)) { return false; }
+        }
+    } else if (input->ne[2] != 1 || weight->ne[2] != 1 || !ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1])) {
         return false;
     }
     for (const ggml_tensor * tensor : { weight, input, node }) {
@@ -4549,8 +4562,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         if (blocks > SIZE_MAX/sizeof(block_q8_1)) { continue; }
                         const size_t row = blocks*sizeof(block_q8_1);
                         if (uint64_t(input->ne[1]) > SIZE_MAX/row) { continue; }
+                        const size_t plane = size_t(input->ne[1])*row;
+                        if (input->ne[2] < 1 || uint64_t(input->ne[2]) > SIZE_MAX/plane) { continue; }
                         mmvq_keys[i] = 0;
-                        mmvq_sizes[i] = size_t(input->ne[1])*row;
+                        mmvq_sizes[i] = size_t(input->ne[2])*plane;
                     }
                 }
             }
@@ -4689,7 +4704,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 bool ok;
                 if (quantized) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, nullptr, quantized);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1],
+                        node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr, node, nullptr, quantized);
                     ok = true;
                 } else {
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);

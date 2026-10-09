@@ -7168,40 +7168,53 @@ struct test_mul_mat_reused_input : public test_case {
     const int64_t k;
     const int64_t columns;
     const int input_mode;
+    const bool use_id;
     std::vector<ggml_tensor *> outputs;
 
-    test_mul_mat_reused_input(ggml_type type, int64_t k, int64_t columns, int input_mode)
-        : type(type), k(k), columns(columns), input_mode(input_mode) {}
+    test_mul_mat_reused_input(ggml_type type, int64_t k, int64_t columns, int input_mode, bool use_id = false)
+        : type(type), k(k), columns(columns), input_mode(input_mode), use_id(use_id) {}
 
-    std::string vars() override { return VARS_TO_STR4(type, k, columns, input_mode); }
+    std::string vars() override { return VARS_TO_STR5(type, k, columns, input_mode, use_id); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_REUSED_INPUT"; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     double max_nmse_err() override { return 5e-4; }
 
+    void initialize_tensors(ggml_context * ctx) override {
+        if (use_id) { init_mul_mat_id_tensors(ctx, 8); }
+        else { test_case::initialize_tensors(ctx); }
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         outputs.clear();
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (input_mode == 2 ? 32 : 0), columns);
+        const auto new_input = [&](int64_t cols) {
+            return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, use_id ? (input_mode == 9 ? 3 : 1) : columns, use_id ? columns : 1);
+        };
+        ggml_tensor * ids = use_id ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, columns) : nullptr;
+        if (ids) { ids = ggml_view_2d(ctx, ids, 3, columns, ids->nb[1], 0); }
+        ggml_tensor * input = new_input(k + (input_mode == 2 ? 32 : 0));
         if (input_mode == 2) {
-            input = ggml_view_2d(ctx, input, k, columns, input->nb[1], 0);
+            input = ggml_view_3d(ctx, input, k, input->ne[1], input->ne[2], input->nb[1], input->nb[2], 0);
         }
+        if (input_mode == 8) { input = ggml_rms_norm(ctx, input, 1e-6f); }
         std::vector<ggml_tensor *> inputs = { input };
-        if (input_mode >= 6) {
+        if (input_mode == 6 || input_mode == 7) {
             for (int i = 1; i < (input_mode == 7 ? 4 : 2); ++i) {
-                inputs.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns));
+                inputs.push_back(new_input(k));
             }
         }
         ggml_tensor * result = nullptr;
         for (int i = 0; i < (input_mode == 7 ? 8 : 4); ++i) {
-            ggml_tensor * src = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : inputs[i % inputs.size()];
+            ggml_tensor * src = input_mode == 1 ? new_input(k) : inputs[i % inputs.size()];
             const ggml_type weight_type = input_mode == 3 && i % 2 ? GGML_TYPE_Q8_0 : type;
-            ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, 64 + 32*i);
-            ggml_tensor * projection = ggml_mul_mat(ctx, weight, src);
+            ggml_tensor * weight = ggml_new_tensor_3d(ctx, weight_type, k, 64 + 32*i, use_id ? 8 : 1);
+            ggml_tensor * projection = use_id ? ggml_mul_mat_id(ctx, weight, src, ids) : ggml_mul_mat(ctx, weight, src);
             if (input_mode == 4) {
-                projection = ggml_add(ctx, projection, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64 + 32*i, columns));
+                ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64 + 32*i, use_id ? 8 : columns);
+                projection = use_id ? ggml_add_id(ctx, projection, bias, ids) : ggml_add(ctx, projection, bias);
             } else if (input_mode == 5) {
-                ggml_tensor * gate = ggml_new_tensor_2d(ctx, weight_type, k, 64 + 32*i);
-                projection = ggml_swiglu_split(ctx, projection, ggml_mul_mat(ctx, gate, src));
+                ggml_tensor * gate = ggml_new_tensor_3d(ctx, weight_type, k, 64 + 32*i, use_id ? 8 : 1);
+                projection = ggml_swiglu_split(ctx, projection, use_id ? ggml_mul_mat_id(ctx, gate, src, ids) : ggml_mul_mat(ctx, gate, src));
             }
             ggml_set_output(projection);
             outputs.push_back(projection);
@@ -11277,6 +11290,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7 }) {
                     test_cases.emplace_back(new test_mul_mat_reused_input(type, k, columns, input_mode));
                 }
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16 }) {
+        for (int64_t columns : { 1, 3, 16 }) {
+            for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }) {
+                test_cases.emplace_back(new test_mul_mat_reused_input(type, 2560, columns, input_mode, true));
             }
         }
     }
