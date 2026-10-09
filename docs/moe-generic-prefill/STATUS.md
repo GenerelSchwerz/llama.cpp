@@ -1,3 +1,7 @@
+# Workspace naming, 2026-10-08
+
+Current generic branch: design/generic-hybrid-features-20261007. Current owned worktree: /home/gencoolpc/llama-moe-generic-hybrid-features-20261007. The owner requested generic names for this implementation. See [WORKSPACE.md](WORKSPACE.md) for build/recovery details. Source and performance qualification remain pinned to 98a3f3194 and frozen 18c; naming changes do not promote the default or close feature gates. Historical evidence retains its original paths and source identities.
+
 # Generic upstream integration, 2026-10-08
 
 Owner-authorized generic checkpoint 04caf6fd and profile-capacity checkpoint 4d2fc5aa are committed locally. The actual upstream c35b6674 merge has no unresolved conflicts. Frozen combined candidate 18c builds and passes the focused component, Tiny Q5_K learned reload, allocator/argument/batch and 894 CUDA numerical operator gates. Fresh Flash uniform controls complete with CPU-assisted prefill off: MTP 83.50->78.98 decode tok/s and no-MTP 57.02->53.43; initial resident IDs/bytes match, but generated IDs/routes differ. The decode decline remains open and is not attributed to MTP alone or CPU prefill. Standalone Strata/specialized engine trees are excluded. See [UPSTREAM-INTEGRATION-20261008.md](UPSTREAM-INTEGRATION-20261008.md) for lineage, observations and diagnostic limitations. This integration targets the owner fork research branch; exact publication identity is retained with the external integration evidence. It does not promote the default or complete features1-4.
@@ -32,7 +36,7 @@ Evidence: `/home/gencoolpc/moe-cache-tests/results/strata-specialized-update-202
 
 ## Strata/FreeToken review and CPU workspace reuse, 2026-10-08
 
-Current Strata HEAD `fb58e0d` and FreeToken upstream `0781324` were reviewed for CPU prompt partitioning, scratch lifetime, copy scheduling and cache lending. The owner-authorized FreeToken-current update is complete and clean; dependencies/build/installed engine were not changed. [STRATA-FREETOKEN-PREFILL-REVIEW.md](STRATA-FREETOKEN-PREFILL-REVIEW.md) records pinned source, the actual prefill/decode distinction and the generic consequences.
+Current Strata HEAD `fb58e0d` and FreeToken upstream `0781324` were reviewed for CPU prompt partitioning, scratch lifetime, copy scheduling and cache lending. The owner-authorized FreeToken-current update is complete and clean; dependencies/build/installed engine were not changed. [PREFILL-REFERENCE-REVIEW.md](PREFILL-REFERENCE-REVIEW.md) records pinned source, the actual prefill/decode distinction and the generic consequences.
 
 The pending generic source adds opt-in main CPU prefill and fixes pre-capture resource validation, profile-triggered owner-token reacquisition and zero-row GPU waves. Tiny Mixtral Q5_K and Nemotron Q4_K passed actual CPU prefill and exact learned profile fresh reload on the prior candidate. Flash was stopped by its GPU-monitor timeout before completed prefill; its root defect remains unproven. The approved follow-up replaces duplicated routed CPU lane execution slabs with one largest service slab under the existing execution mutex, with private graph metadata and transactional checked growth/rebinding/accounting.
 
