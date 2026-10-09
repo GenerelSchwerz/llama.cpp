@@ -4612,6 +4612,64 @@ static bool ggml_cuda_scaled_unary_memory_ok(const ggml_cuda_scaled_unary_match 
     return true;
 }
 
+struct ggml_cuda_mmvf_pair_postop_match {
+    ggml_cuda_scaled_unary_match first;
+    ggml_cuda_scaled_unary_match second;
+    int partner = -1;
+};
+
+static ggml_cuda_mmvf_pair_postop_match ggml_cuda_match_mmvf_pair_postop(ggml_cgraph * graph, int i, int j, int device, bool allocated = true) {
+    if (j < 0) { return {}; }
+    const auto chain = [&](int index) {
+        ggml_cuda_scaled_unary_match result;
+        if (index + 1 >= graph->n_nodes || graph->nodes[index + 1]->src[0] != graph->nodes[index]) { return result; }
+        result = ggml_cuda_match_scaled_unary(graph, index + 1, true);
+        if (!result.count) { return result; }
+        const int next = index + result.count + 1;
+        if (next < graph->n_nodes && graph->nodes[next]->op == GGML_OP_DSV4_HC_POST && graph->nodes[next]->src[2] == result.last) { return ggml_cuda_scaled_unary_match{}; }
+        for (int k = index + 1; k < next; ++k) {
+            if (!(graph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE)) { return ggml_cuda_scaled_unary_match{}; }
+        }
+        return result;
+    };
+    ggml_cuda_mmvf_pair_postop_match match{chain(i), chain(j), j};
+    if (!match.first.count && !match.second.count) { return {}; }
+    if (i + match.first.count >= j) { return {}; }
+    std::vector<int> writes;
+    for (int k = i; k <= i + match.first.count; ++k) { writes.push_back(k); }
+    for (int k = j; k <= j + match.second.count; ++k) { writes.push_back(k); }
+    if (!allocated) { return match; }
+    std::vector<uintptr_t> begin(writes.size()), end(writes.size());
+    for (size_t w = 0; w < writes.size(); ++w) {
+        if (!ggml_cuda_prepared_range(graph->nodes[writes[w]], device, begin[w], end[w]) || begin[w] % sizeof(float)) { return {}; }
+        for (size_t v = 0; v < w; ++v) {
+            if (begin[w] < end[v] && begin[v] < end[w] &&
+                    !((writes[w] < j) == (writes[v] < j) && begin[w] == begin[v] && end[w] == end[v])) { return {}; }
+        }
+        for (const ggml_tensor * read : {graph->nodes[i]->src[0], graph->nodes[i]->src[1], graph->nodes[j]->src[0]}) {
+            uintptr_t rb, re;
+            if (!ggml_cuda_prepared_range(read, device, rb, re) || (begin[w] < re && rb < end[w])) { return {}; }
+        }
+    }
+    for (int k = i; k <= j + match.second.count; ++k) {
+        if (std::binary_search(writes.begin(), writes.end(), k)) { continue; }
+        const ggml_tensor * node = graph->nodes[k];
+        if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) { return {}; }
+        for (size_t w = 0; w < writes.size(); ++w) {
+            if (k > writes[w]) { continue; }
+            for (const ggml_tensor * read : node->src) {
+                if (!read) { continue; }
+                uintptr_t rb, re;
+                if (!ggml_cuda_prepared_range(read, device, rb, re) || (begin[w] < re && rb < end[w])) { return {}; }
+            }
+            if (ggml_cuda_is_view_or_noop(node) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) { continue; }
+            uintptr_t wb, we;
+            if (!ggml_cuda_prepared_range(node, device, wb, we) || (begin[w] < we && wb < end[w])) { return {}; }
+        }
+    }
+    return match;
+}
+
 static bool ggml_cuda_hc_injection_bytes(const ggml_tensor * tensor, size_t & bytes) {
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         if (tensor->ne[d] <= 0) { return false; }
@@ -7117,6 +7175,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::unordered_map<const ggml_tensor *, ggml_cuda_repeat_add_match> repeat_add_emits;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (paired_mmvf.count(node)) { continue; }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -7419,7 +7478,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
-                if (paired_mmvf.count(node)) { continue; }
+                int mmvf_partner = -1;
+                if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
+                    mmvf_partner = ggml_cuda_match_mmvf_pair(cgraph, i, cuda_ctx->device, mmvf_pairs);
+                    const auto joint = ggml_cuda_match_mmvf_pair_postop(cgraph, i, mmvf_partner, cuda_ctx->device);
+                    if (joint.partner >= 0 && !paired_mmvf.count(cgraph->nodes[mmvf_partner])) {
+                        const ggml_cuda_scaled_unary_args first_ops{joint.first.first, joint.first.unary, joint.first.last};
+                        const ggml_cuda_scaled_unary_args second_ops{joint.second.first, joint.second.unary, joint.second.last};
+                        ggml_cuda_mul_mat_vec_f_pair_postop(*cuda_ctx, node, cgraph->nodes[mmvf_partner], first_ops, second_ops);
+                        for (int k = i + 1; k <= i + joint.first.count; ++k) { paired_mmvf.insert(cgraph->nodes[k]); }
+                        for (int k = mmvf_partner; k <= mmvf_partner + joint.second.count; ++k) { paired_mmvf.insert(cgraph->nodes[k]); }
+                        continue;
+                    }
+                }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized, prepared_hc_post, affine_match, nullptr, prepared_src1);
 
@@ -7434,7 +7505,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
-                    const int partner = ggml_cuda_match_mmvf_pair(cgraph, i, cuda_ctx->device, mmvf_pairs);
+                    const int partner = mmvf_partner;
                     if (partner >= 0 && !paired_mmvf.count(cgraph->nodes[partner])) {
                         ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node, cgraph->nodes[partner]);
                         paired_mmvf.insert(cgraph->nodes[partner]);
@@ -7645,6 +7716,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_tensor * first = cgraph->nodes[i], * second = cgraph->nodes[partner];
             for (ggml_tensor * tensor : {first, second, first->src[0], first->src[1], second->src[0]}) {
                 params->add_alloc_dep(params->user_data, tensor, first);
+            }
+            const auto joint = ggml_cuda_match_mmvf_pair_postop(cgraph, i, partner, cuda_ctx->device, false);
+            if (joint.partner >= 0) {
+                for (int k = i + 1; k <= i + joint.first.count; ++k) { params->add_alloc_dep(params->user_data, cgraph->nodes[k], first); }
+                for (int k = partner + 1; k <= partner + joint.second.count; ++k) { params->add_alloc_dep(params->user_data, cgraph->nodes[k], first); }
             }
             paired_mmvf.insert(second);
         }

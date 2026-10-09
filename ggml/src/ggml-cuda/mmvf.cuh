@@ -18,3 +18,7 @@ void ggml_cuda_mul_mat_vec_f_hc_pre(ggml_backend_cuda_context & ctx, const ggml_
 bool ggml_cuda_should_fuse_hc_up(const ggml_tensor * weight, const ggml_tensor * norm, int device);
 
 void ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second);
+
+struct ggml_cuda_scaled_unary_args;
+void ggml_cuda_mul_mat_vec_f_pair_postop(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second,
+        const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops);
