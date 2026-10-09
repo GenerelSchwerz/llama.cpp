@@ -4978,9 +4978,10 @@ struct test_mul_mat : public test_case {
     const bool src_overlap; // a and b are overlapping views of the same tensor
     const int64_t m_v; // rows of a in memory, the batches of a are strided for m_v > m, no view for m_v == 0
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
+    const int norm_mode;
 
     std::string vars() override {
-        return VARS_TO_STR13(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad);
+        return VARS_TO_STR14(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad, norm_mode);
     }
 
     double max_nmse_err() override {
@@ -5011,8 +5012,8 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, int norm_mode = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), norm_mode(norm_mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5086,6 +5087,19 @@ struct test_mul_mat : public test_case {
             ggml_set_name(b, "b");
         }
 
+        if (norm_mode) {
+            b = ggml_rms_norm(ctx, b, 1e-5f);
+            if (norm_mode == 2 || norm_mode == 3) {
+                b = ggml_mul(ctx, b, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+                if (norm_mode == 3) {
+                    b = ggml_add(ctx, b, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+                }
+            } else if (norm_mode == 4) {
+                b = ggml_scale(ctx, b, 0.75f);
+            }
+            ggml_set_output(b);
+        }
+
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         ggml_set_name(out, "out");
         for (uint32_t i = 1; i < o; ++i) {
@@ -5097,7 +5111,7 @@ struct test_mul_mat : public test_case {
         return out;
     }
 
-    bool run_whole_graph() override { return o > 1; }
+    bool run_whole_graph() override { return o > 1 || norm_mode != 0; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7149,6 +7163,80 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+struct test_mul_mat_reused_input : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t columns;
+    const int input_mode;
+    const bool use_id;
+    std::vector<ggml_tensor *> outputs;
+
+    test_mul_mat_reused_input(ggml_type type, int64_t k, int64_t columns, int input_mode, bool use_id = false)
+        : type(type), k(k), columns(columns), input_mode(input_mode), use_id(use_id) {}
+
+    std::string vars() override { return VARS_TO_STR5(type, k, columns, input_mode, use_id); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_REUSED_INPUT"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    double max_nmse_err() override { return 5e-4; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (use_id) { init_mul_mat_id_tensors(ctx, 8); }
+        else { test_case::initialize_tensors(ctx); }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outputs.clear();
+        const auto new_input = [&](int64_t cols) {
+            return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cols, use_id ? (input_mode == 9 ? 3 : 1) : columns, use_id ? columns : 1);
+        };
+        ggml_tensor * ids = use_id ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, columns) : nullptr;
+        if (ids) { ids = ggml_view_2d(ctx, ids, 3, columns, ids->nb[1], 0); }
+        ggml_tensor * input = new_input(k + (input_mode == 2 ? 32 : 0));
+        if (input_mode == 2) {
+            input = ggml_view_3d(ctx, input, k, input->ne[1], input->ne[2], input->nb[1], input->nb[2], 0);
+        }
+        if (input_mode == 8) { input = ggml_rms_norm(ctx, input, 1e-6f); }
+        if (input_mode >= 10) {
+            if (input_mode == 11 || input_mode == 12) {
+                input = ggml_glu(ctx, new_input(2*k), GGML_GLU_OP_SWIGLU, input_mode == 12);
+            } else {
+                ggml_tensor * up = new_input(k);
+                const ggml_glu_op ops[] = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK };
+                input = input_mode == 17 ? ggml_swiglu_oai(ctx, input, up, 1.234f, 7.0f) : input_mode == 18 ? ggml_swiglu_clamp(ctx, input, up, 7.0f) : ggml_glu_split(ctx, input, up, ops[input_mode == 10 ? 0 : input_mode - 12]);
+            }
+            ggml_set_output(input);
+            outputs.push_back(input);
+        }
+
+        std::vector<ggml_tensor *> inputs = { input };
+        if (input_mode == 6 || input_mode == 7) {
+            for (int i = 1; i < (input_mode == 7 ? 4 : 2); ++i) {
+                inputs.push_back(new_input(k));
+            }
+        }
+        ggml_tensor * result = nullptr;
+        for (int i = 0; i < (input_mode == 7 ? 8 : 4); ++i) {
+            ggml_tensor * src = input_mode == 1 ? new_input(k) : inputs[i % inputs.size()];
+            const ggml_type weight_type = input_mode == 3 && i % 2 ? GGML_TYPE_Q8_0 : type;
+            ggml_tensor * weight = ggml_new_tensor_3d(ctx, weight_type, k, 64 + 32*i, use_id ? 8 : 1);
+            ggml_tensor * projection = use_id ? ggml_mul_mat_id(ctx, weight, src, ids) : ggml_mul_mat(ctx, weight, src);
+            if (input_mode == 4) {
+                ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64 + 32*i, use_id ? 8 : columns);
+                projection = use_id ? ggml_add_id(ctx, projection, bias, ids) : ggml_add(ctx, projection, bias);
+            } else if (input_mode == 5) {
+                ggml_tensor * gate = ggml_new_tensor_3d(ctx, weight_type, k, 64 + 32*i, use_id ? 8 : 1);
+                projection = ggml_swiglu_split(ctx, projection, use_id ? ggml_mul_mat_id(ctx, gate, src, ids) : ggml_mul_mat(ctx, gate, src));
+            }
+            ggml_set_output(projection);
+            outputs.push_back(projection);
+            ggml_tensor * next = ggml_silu(ctx, projection);
+            result = result ? ggml_concat(ctx, result, next, 0) : next;
+        }
+        return result;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -9181,6 +9269,14 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int norm_mode : {1, 2, 3, 4}) {
+            for (uint32_t readers : {1u, 3u}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 128, 1, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, readers, false, 0, 0, norm_mode));
+            }
+        }
+    }
+
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11199,6 +11295,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t k : { 256, 1024 }) {
+            for (int64_t columns : { 1, 2, 8, 9 }) {
+                for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7 }) {
+                    test_cases.emplace_back(new test_mul_mat_reused_input(type, k, columns, input_mode));
+                }
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16 }) {
+        for (int64_t columns : { 1, 3, 16 }) {
+            for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }) {
+                test_cases.emplace_back(new test_mul_mat_reused_input(type, 2560, columns, input_mode, true));
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (bool use_id : { false, true }) {
+            for (int input_mode = 10; input_mode <= 18; ++input_mode) {
+                test_cases.emplace_back(new test_mul_mat_reused_input(type, 2560, 3, input_mode, use_id));
+            }
+        }
+    }
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
