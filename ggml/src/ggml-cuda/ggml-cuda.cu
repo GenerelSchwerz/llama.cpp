@@ -5516,10 +5516,12 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
-// match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
-// (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+static bool ggml_cuda_prepared_range(const ggml_tensor * tensor, int device, uintptr_t & begin, uintptr_t & end);
+
+// Match state copies only when no other reader needs the snapshot tail.
+
 static int ggml_cuda_try_gdn_cache_fusion(
-        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
+        const ggml_cgraph * cgraph, int node_idx, int device, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
     if (!ggml_gated_delta_net_validate(gdn) ||
@@ -5562,9 +5564,11 @@ static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_tensor * src = cpy->src[0];
         const ggml_tensor * dst = cpy->src[1];
         const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, count, 1 };
+        const bool final_state = K == 1 && src && src->ne[0] == S_v && src->ne[1] == S_v &&
+            src->ne[2] == H && src->ne[3] == n_seqs;
         return src != nullptr && dst != nullptr && src->op == GGML_OP_VIEW && src->view_src == gdn &&
             src->view_offs == tail_off + first_slot * state_size &&
-            std::equal(expected_ne.begin(), expected_ne.end(), src->ne) && ggml_is_contiguous(src) &&
+            (final_state || std::equal(expected_ne.begin(), expected_ne.end(), src->ne)) && ggml_is_contiguous(src) &&
             dst->op == GGML_OP_VIEW && dst->type == GGML_TYPE_F32 && dst->data != nullptr &&
             std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) &&
             dst->nb[0] == ggml_type_size(GGML_TYPE_F32) && dst->nb[1] == (size_t) ggml_row_size(GGML_TYPE_F32, D) &&
@@ -5581,6 +5585,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
     fused_state_cpy.data        = (float *) dst->data;
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
 
+    std::vector<const ggml_tensor *> copies = {cpy};
     if (reserve) {
         const ggml_tensor * reserve_cpy = nullptr;
         int reserve_cpy_idx = 0;
@@ -5592,9 +5597,41 @@ static int ggml_cuda_try_gdn_cache_fusion(
             reserve_dst->nb[2] != dst->nb[2]) {
             return 0;
         }
+        copies.push_back(reserve_cpy);
         cpy_idx = reserve_cpy_idx;
     }
 
+    // Prepared views retain use counts from the complete graph.
+    int direct_uses = 0;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const auto * reader = cgraph->nodes[j];
+        for (const auto * input : reader->src) {
+            if (input != gdn) { continue; }
+            ++direct_uses;
+            if (reader->op != GGML_OP_VIEW || reader->view_src != gdn) { return 0; }
+            if (reader->view_offs < tail_off && ggml_nbytes(reader) <= tail_off - reader->view_offs) { continue; }
+            if (reader->flags & GGML_TENSOR_FLAG_OUTPUT) { return 0; }
+            const bool copied = std::any_of(copies.begin(), copies.end(), [&](const ggml_tensor * copy) {
+                return copy->src[0] == reader;
+            });
+            if (!copied || ggml_node_get_use_count(cgraph, j) != 1) { return 0; }
+        }
+    }
+    if (direct_uses != ggml_node_get_use_count(cgraph, node_idx)) { return 0; }
+
+    uintptr_t output_begin, output_end;
+    if (!ggml_cuda_prepared_range(gdn, device, output_begin, output_end)) { return 0; }
+    for (const auto * copy : copies) {
+        uintptr_t begin, end;
+        if (!ggml_cuda_prepared_range(copy->src[1], device, begin, end) || begin % sizeof(float) ||
+                (begin < output_end && output_begin < end)) { return 0; }
+        for (const auto * input : gdn->src) {
+            if (!input) { continue; }
+            uintptr_t input_begin, input_end;
+            if (!ggml_cuda_prepared_range(input, device, input_begin, input_end) ||
+                    (begin < input_end && input_begin < end)) { return 0; }
+        }
+    }
     return cpy_idx - node_idx;
 }
 
@@ -9952,7 +9989,7 @@ static int ggml_cuda_try_fuse(
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
-        const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
+        const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cuda_ctx->device, fused_state_cpy);
         if (nodes_to_skip > 0) {
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
@@ -15444,6 +15481,17 @@ static bool ggml_cuda_compute_graph_nodes(ggml_backend_cuda_context *     cuda_c
                 continue;
             }
         }
+        if (fused_nodes && node->op == GGML_OP_GATED_DELTA_NET && !disable_reuse &&
+                cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
+            ggml_cuda_gated_delta_net_fused_cache cache = {};
+            const int skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cuda_ctx->device, cache);
+            if (skip) {
+                ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, cache);
+                *fused_nodes += skip;
+                i += skip;
+                continue;
+            }
+        }
         auto   match_view = ggml_graph_view(cgraph, fused_nodes ? i : 0,
                                             fused_nodes ? ggml_cuda_moe_source_fusion_end(cgraph, i) : cgraph->n_nodes);
         auto * match_graph = &match_view;
@@ -18076,6 +18124,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, GGML_STAGED_INPUT_PROC) == 0) {
         return (void *) ggml_cuda_staged_input_api;
+    }
+    if (strcmp(name, GGML_STAGED_INPUT_SET_SUBMIT_PROC) == 0) {
+        return (void *) ggml_cuda_staged_input_set_submit;
     }
     if (strcmp(name, GGML_BACKEND_MOE_HYBRID_STAGED_PENDING_V1_PROC_NAME) == 0) {
         return (void *) ggml_cuda_staged_input_pending_for_test;

@@ -1076,6 +1076,7 @@ struct ggml_backend_moe_source_core_api_v1 {
                        const struct ggml_backend_moe_cpu_region_service_api_v1 * cpu_api,
                        ggml_backend_moe_cpu_service_v1_t cpu_service,
                        const ggml_backend_moe_cpu_prepared_region_v1_t * cpu_regions, void ** prepared);
+    // Validate graph bindings and region metadata before graph effects, even after preflight.
     enum ggml_status (*compute)(void * session, struct ggml_cgraph * graph, void * const * regions, uint32_t count);
     int32_t (*close)(void * session);
     int32_t (*drain)(void * session);
@@ -1085,11 +1086,22 @@ struct ggml_backend_moe_source_core_api_v1 {
     bool (*set_test_hook)(void * session, ggml_backend_moe_hybrid_test_hook_v1_t hook, void * data);
     enum ggml_status (*preflight)(void * session, const struct ggml_cgraph * graph,
                                  const struct ggml_graph_execution_certificate * certificate, void * const * regions, uint32_t count);
+    int32_t (*bind_program)(void * session, const struct ggml_cgraph * graph,
+                           const struct ggml_graph_execution_certificate * certificate,
+                           void * const * regions, uint32_t count, void ** program);
+    enum ggml_status (*compute_program)(void * session, void * program,
+                                       const struct ggml_graph_execution_certificate * certificate);
 };
 
 typedef const struct ggml_backend_moe_source_core_api_v1 * (*ggml_backend_moe_source_core_v1_t)(void);
 
 GGML_API bool ggml_backend_sched_moe_source_selected_v1(ggml_backend_sched_t sched);
+// Bind after checked preparation. Backing replacement/reset retires the token before release.
+GGML_API int32_t ggml_backend_sched_moe_source_program_bind_v1(ggml_backend_sched_t sched,
+    struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate, uint64_t * program);
+// Execute owned operator metadata. Callers may update bound payload bytes, not storage or topology.
+GGML_API enum ggml_status ggml_backend_sched_moe_source_program_compute_v1(ggml_backend_sched_t sched,
+    uint64_t program, const struct ggml_graph_execution_certificate * certificate);
 // Serialized variants have separate graph plans and share actual backing and the CPU service.
 GGML_API int32_t ggml_backend_sched_moe_source_clone_v1(ggml_backend_sched_t sched, ggml_backend_sched_t * output);
 // Close/drain may overlap admitted compute. Reset/free/fallback require no new calls or concurrent scheduler use.

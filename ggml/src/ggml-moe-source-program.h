@@ -209,6 +209,13 @@ private:
 GGML_MOE_SOURCE_PROGRAM_API size_t ggml_moe_source_operation_group_size(
     const std::vector<ggml_moe_source_operation> & operations, size_t index);
 
+struct ggml_moe_source_public_binding {
+    const ggml_tensor * original = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    void * data = nullptr;
+    size_t bytes = 0;
+};
+
 class GGML_MOE_SOURCE_PROGRAM_API ggml_moe_source_program {
 public:
     ggml_moe_source_program();
@@ -223,12 +230,14 @@ public:
     bool allocate();
     bool matches(const ggml_cgraph * graph) const;
     bool matches(const ggml_cgraph * graph, const ggml_graph_execution_certificate & certificate) const;
+    const ggml_tensor * original_node(size_t index) const;
     ggml_tensor * find(const ggml_tensor * original) const;
     bool closed_cut(const ggml_tensor * const * cut, size_t count,
         const ggml_tensor * const * retained, size_t retained_count) const;
     const std::vector<ggml_moe_source_layer> & layers() const;
     const std::vector<ggml_moe_source_operation> & epilogue() const;
     const std::vector<const ggml_tensor *> & public_outputs() const;
+    const std::vector<ggml_moe_source_public_binding> & public_bindings() const;
     const ggml_graph_execution_certificate & certificate() const;
     size_t storage_bytes() const;
     size_t operation_count() const;

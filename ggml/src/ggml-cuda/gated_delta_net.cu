@@ -111,7 +111,7 @@ gated_delta_net_cuda(const float * q,
         if (reserve_input) {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 state[(K - 1) * state_slot_stride + col * S_v + i] = s_shard[r];
             }
         }

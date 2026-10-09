@@ -213,6 +213,45 @@ static void test_multi_graph(int n_threads, int n_rounds) {
 }
 
 
+static void test_branch_plan(int n_threads) {
+    auto params = ggml_threadpool_params_default(n_threads);
+    auto * pool = ggml_threadpool_new(&params);
+    GGML_ASSERT(pool);
+
+    for (int selected : {0, 1, 0, 1}) {
+        auto * ctx = ggml_init({1024*1024, nullptr, false});
+        GGML_ASSERT(ctx);
+        auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 16);
+        auto * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+        for (int i = 0; i < 32*16; ++i) { static_cast<float *>(table->data)[i] = float(i); }
+        for (int i = 0; i < 4; ++i) { static_cast<int32_t *>(indices->data)[i] = 3*i; }
+        for (int i = 0; i < 32*4; ++i) { static_cast<float *>(input->data)[i] = float(10000 + i); }
+        ggml_tensor * branches[] = {ggml_get_rows(ctx, table, indices), ggml_dup(ctx, input)};
+        auto * graph = ggml_new_graph(ctx);
+        auto * output = ggml_build_forward_select(graph, branches, 2, selected);
+        auto plan = ggml_graph_plan(graph, n_threads, pool);
+        GGML_ASSERT(plan.n_threads == (selected == 0 ? 1 : n_threads));
+        std::vector<uint8_t> work(plan.work_size);
+        plan.work_data = work.data();
+        int callbacks = 0;
+        plan.get_rows_callback = +[](const ggml_tensor *, const ggml_tensor *, void * data) {
+            ++*static_cast<int *>(data);
+        };
+        plan.get_rows_callback_data = &callbacks;
+        GGML_ASSERT(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(callbacks == (selected == 0 ? 1 : 0));
+        for (int i = 0; i < 32*4; ++i) {
+            const float expected = selected == 0 ? float((i/32)*3*32 + i%32) : float(10000 + i);
+            GGML_ASSERT(static_cast<float *>(output->data)[i] == expected);
+        }
+        ggml_free(ctx);
+    }
+
+    ggml_threadpool_free(pool);
+    printf("active branch task planning, exact output and callbacks passed\n");
+}
+
 int main(int argc, char *argv[]) {
 
     int n_threads = std::max(1, std::min(4, (int) std::thread::hardware_concurrency()));
@@ -225,6 +264,8 @@ int main(int argc, char *argv[]) {
     if (argc > 2) {
         n_rounds  = std::atoi(argv[2]);
     }
+
+    test_branch_plan(n_threads);
 
     test_barrier(n_threads, n_rounds);
 

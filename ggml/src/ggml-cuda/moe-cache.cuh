@@ -1380,8 +1380,13 @@ public:
     // Prepared bank indices borrow the original grouped source and resource leases.
     bool prepare_source_transport(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, size_t tile_bytes,
             ggml_cuda_moe_source_transport ** transport, uint32_t * binding_index, bool mapped_copy = false);
+    bool bind_source_transport(ggml_cuda_moe_source_transport * transport, const ggml_cuda_moe_graph_execution & execution);
+    bool source_resource_fingerprint(const ggml_cuda_moe_graph_execution & execution, ggml_cuda_moe_stream_t stream,
+            const ggml_cuda_moe_source_transport * transport, uint64_t * fingerprint) const;
     bool source_transport_matches(const ggml_cuda_moe_source_transport * transport, uint32_t binding_index,
             const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index) const;
+    bool source_transport_matches(const ggml_cuda_moe_source_transport * transport, const uint32_t * binding_indices,
+            const ggml_cuda_moe_grouped_transaction & transaction, const uint32_t * bank_indices, uint32_t count) const;
     bool copy_source_transport(ggml_cuda_moe_source_transport * transport, uint32_t binding_index, const ggml_tensor * tensor,
             void * destination, const void * source, size_t bytes, ggml_cuda_moe_stream_t stream, uint64_t deadline_ns);
     bool validate_source_transport(const ggml_cuda_moe_source_transport * transport, uint32_t binding_index,
@@ -1513,7 +1518,10 @@ private:
             ggml_cuda_moe_stream_t stream,
             uint64_t * fingerprint,
             std::vector<std::shared_ptr<void>> * leases) const;
+    bool source_transport_matches_locked(const ggml_cuda_moe_source_transport * transport, const uint32_t * binding_indices,
+            const ggml_cuda_moe_grouped_transaction & transaction, const uint32_t * bank_indices, uint32_t count) const;
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
+    void end_group_call_locked(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
 
