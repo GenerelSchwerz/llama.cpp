@@ -3561,7 +3561,7 @@ static bool ggml_cuda_prepared_range(const ggml_tensor * tensor, int device, uin
     return true;
 }
 
-struct ggml_cuda_norm_q8_match {
+struct ggml_cuda_mmvq_q8_match {
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
     ggml_tensor * add = nullptr;
@@ -3571,13 +3571,13 @@ struct ggml_cuda_norm_q8_match {
     int image = -1;
 };
 
-static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int i, int device) {
+static ggml_cuda_mmvq_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int i, int device) {
     ggml_tensor * norm = graph->nodes[i];
     if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
             !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
             ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
-    ggml_cuda_norm_q8_match match;
+    ggml_cuda_mmvq_q8_match match;
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -3608,7 +3608,34 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
     return match;
 }
 
-static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph * graph, int device,
+static ggml_cuda_mmvq_q8_match ggml_cuda_match_glu_q8(ggml_cgraph * graph, int i, int device) {
+    ggml_tensor * dst = graph->nodes[i];
+    if (dst->op != GGML_OP_GLU || dst->type != GGML_TYPE_F32 || !(dst->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_is_contiguous(dst) || dst->ne[0] % QK8_1) { return {}; }
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU: case GGML_GLU_OP_GEGLU: case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF: case GGML_GLU_OP_GEGLU_QUICK:
+        case GGML_GLU_OP_SWIGLU_OAI: case GGML_GLU_OP_SWIGLU_CLAMP: break;
+        default: return {};
+    }
+    uintptr_t begin, end;
+    if (!ggml_cuda_prepared_range(dst, device, begin, end) || begin % sizeof(float) ||
+            (end - begin)/sizeof(float) > INT_MAX) { return {}; }
+    for (const ggml_tensor * read : { dst->src[0], dst->src[1] }) {
+        if (!read) { continue; }
+        uintptr_t read_begin, read_end;
+        if (read->type != GGML_TYPE_F32 || read->nb[0] != sizeof(float) || read->nb[1] % sizeof(float) ||
+                !ggml_is_contiguous_1(read) || ggml_nrows(read) != ggml_nrows(dst) ||
+                !ggml_cuda_prepared_range(read, device, read_begin, read_end) || read_begin % sizeof(float) ||
+                (read_end - read_begin)/sizeof(float) > INT_MAX || (begin < read_end && read_begin < end)) { return {}; }
+    }
+    ggml_cuda_mmvq_q8_match match;
+    match.dst = dst;
+    match.last = i;
+    return match;
+}
+
+static std::vector<ggml_cuda_mmvq_q8_match> ggml_cuda_plan_mmvq_q8(ggml_cgraph * graph, int device,
         const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
     for (int i = 0; i < graph->n_nodes; ++i) {
@@ -3617,12 +3644,13 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
         readers[input->view_src ? input->view_src : input].push_back(i);
     }
     if (readers.empty()) { return {}; }
-    std::vector<ggml_cuda_norm_q8_match> emits(graph->n_nodes);
+    std::vector<ggml_cuda_mmvq_q8_match> emits(graph->n_nodes);
     bool moved = false;
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_q8(graph, i, device);
-        if (!match.norm) { continue; }
+        if (!match.dst) { match = ggml_cuda_match_glu_q8(graph, i, device); }
+        if (!match.dst) { continue; }
         const auto can_emit = [&](int node, int prepare) {
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
@@ -4570,9 +4598,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, mmvq_keys, mmvq_sizes, ggml_cuda_mmvq_input_overwritten);
-            std::vector<ggml_cuda_norm_q8_match> norm_emits;
+            std::vector<ggml_cuda_mmvq_q8_match> q8_emits;
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                norm_emits = ggml_cuda_plan_norm_q8(cgraph, cuda_ctx->device, mmvq_keys, mmvq_sizes, reuse);
+                q8_emits = ggml_cuda_plan_mmvq_q8(cgraph, cuda_ctx->device, mmvq_keys, mmvq_sizes, reuse);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> shared_inputs(cuda_ctx->pool(), reuse);
             const auto prepare_group = [&](int group) {
@@ -4651,13 +4679,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (!norm_emits.empty() && norm_emits[i].norm) {
-                    const auto & emit = norm_emits[i];
+                if (!q8_emits.empty() && q8_emits[i].dst) {
+                    const auto & emit = q8_emits[i];
                     const int g = emit.image;
                     const ggml_tensor * input = cgraph->nodes[reuse.groups[g].node]->src[1];
                     shared_inputs[g].alloc(mmvq_sizes[reuse.groups[g].node]);
-                    ggml_cuda_op_rms_norm_q8(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale,
-                        shared_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                    if (emit.norm) {
+                        ggml_cuda_op_rms_norm_q8(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale,
+                            shared_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                    } else {
+                        ggml_cuda_op_glu_q8(*cuda_ctx, emit.dst, shared_inputs[g].get(), input->ne[0],
+                            GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                    }
                     i = emit.last;
                     continue;
                 }

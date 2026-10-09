@@ -7197,6 +7197,18 @@ struct test_mul_mat_reused_input : public test_case {
             input = ggml_view_3d(ctx, input, k, input->ne[1], input->ne[2], input->nb[1], input->nb[2], 0);
         }
         if (input_mode == 8) { input = ggml_rms_norm(ctx, input, 1e-6f); }
+        if (input_mode >= 10) {
+            if (input_mode == 11 || input_mode == 12) {
+                input = ggml_glu(ctx, new_input(2*k), GGML_GLU_OP_SWIGLU, input_mode == 12);
+            } else {
+                ggml_tensor * up = new_input(k);
+                const ggml_glu_op ops[] = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK };
+                input = input_mode == 17 ? ggml_swiglu_oai(ctx, input, up, 1.234f, 7.0f) : input_mode == 18 ? ggml_swiglu_clamp(ctx, input, up, 7.0f) : ggml_glu_split(ctx, input, up, ops[input_mode == 10 ? 0 : input_mode - 12]);
+            }
+            ggml_set_output(input);
+            outputs.push_back(input);
+        }
+
         std::vector<ggml_tensor *> inputs = { input };
         if (input_mode == 6 || input_mode == 7) {
             for (int i = 1; i < (input_mode == 7 ? 4 : 2); ++i) {
@@ -11298,6 +11310,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t columns : { 1, 3, 16 }) {
             for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }) {
                 test_cases.emplace_back(new test_mul_mat_reused_input(type, 2560, columns, input_mode, true));
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (bool use_id : { false, true }) {
+            for (int input_mode = 10; input_mode <= 18; ++input_mode) {
+                test_cases.emplace_back(new test_mul_mat_reused_input(type, 2560, 3, input_mode, use_id));
             }
         }
     }

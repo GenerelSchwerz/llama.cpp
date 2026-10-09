@@ -81,32 +81,7 @@ struct ggml_cuda_norm_store {
     }
 };
 
-struct ggml_cuda_norm_q8_store {
-    block_q8_1 * image;
-    int64_t cols;
-    int64_t padded;
-
-    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float value) const {
-        dst[col] = value;
-        const int64_t index = dst - base + col;
-        const int64_t row = index / cols;
-        const int64_t column = index % cols;
-        const int lane = column % QK8_1;
-        const int64_t block = (row*padded + column)/QK8_1;
-        const float amax = warp_reduce_max<QK8_1>(fabsf(value));
-        const float sum = warp_reduce_sum<QK8_1>(value);
-        const float d = amax/127.0f;
-        image[block].qs[lane] = amax == 0.0f ? 0 : roundf(value/d);
-        if (lane == 0) { image[block].ds = make_half2(d, sum); }
-        if (column/QK8_1 == cols/QK8_1 - 1) {
-            for (int64_t tail = cols/QK8_1; tail < padded/QK8_1; ++tail) {
-                block_q8_1 & zero = image[row*(padded/QK8_1) + tail];
-                zero.qs[lane] = 0;
-                if (lane == 0) { zero.ds = make_half2(0.0f, 0.0f); }
-            }
-        }
-    }
-};
+using ggml_cuda_norm_q8_store = ggml_cuda_q8_1_store;
 
 template <int block_size, bool do_multiply, bool do_add, bool do_scale, typename Write>
 static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
