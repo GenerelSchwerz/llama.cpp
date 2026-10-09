@@ -397,6 +397,46 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
         add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
     }
 
+    if constexpr (do_multiply && !do_add && !do_scale && block_size == 256 && std::is_same_v<Write, ggml_cuda_norm_store> && std::is_same_v<Read, ggml_cuda_norm_load>) {
+        if (ggml_cuda_get_physical_warp_size() == 32 && ncols >= 1024 && ncols % 4 == 0 && uintptr_t(x) % 16 == 0 && uintptr_t(dst) % 16 == 0) {
+            float partial[4] = {};
+            ggml_cuda_pdl_sync();
+            for (int col = 4*tid; col < ncols; col += 1024) {
+                const float4 values = ((const float4 *) x)[col/4];
+                partial[0] += values.x*values.x;
+                partial[1] += values.y*values.y;
+                partial[2] += values.z*values.z;
+                partial[3] += values.w*values.w;
+            }
+#pragma unroll
+            for (int distance = 4; distance > 0; distance >>= 1) {
+#pragma unroll
+                for (int p = 0; p < 4; ++p) { partial[p] += __shfl_xor_sync(0xffffffff, partial[p], distance, 32); }
+            }
+#pragma unroll
+            for (int distance = 2; distance > 0; distance >>= 1) {
+                float next[4];
+#pragma unroll
+                for (int p = 0; p < 4; ++p) { next[p] = partial[p] + partial[p ^ distance]; }
+#pragma unroll
+                for (int p = 0; p < 4; ++p) { partial[p] = next[p]; }
+            }
+            extern __shared__ float original_sums[];
+            if (tid % 8 == 0) { original_sums[tid/8] = partial[0]; }
+            __syncthreads();
+            const float total = warp_reduce_sum<32>(original_sums[tid % 32]);
+            const float scale = rsqrtf(total/ncols + eps);
+            for (int col = 4*tid; col < ncols; col += 1024) {
+                const float4 values = ((const float4 *) x)[col/4];
+                const float4 result = make_float4(scale*values.x*mul[fastmodulo(col, mul_ncols_packed)],
+                    scale*values.y*mul[fastmodulo(col + 1, mul_ncols_packed)], scale*values.z*mul[fastmodulo(col + 2, mul_ncols_packed)],
+                    scale*values.w*mul[fastmodulo(col + 3, mul_ncols_packed)]);
+                ((float4 *) dst)[col/4] = result;
+            }
+            return;
+        }
+    }
+
     float tmp = 0.0f; // partial sum for thread in warp
 
     ggml_cuda_pdl_sync();
@@ -958,7 +998,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-        if (ncols < 1024) {
+        if (ncols < 1024 || (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32 && ncols % 4 == 0 && uintptr_t(x) % 16 == 0 && uintptr_t(dst) % 16 == 0 && stride_row % 4 == 0 && stride_channel % 4 == 0 && stride_sample % 4 == 0)) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
             ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
