@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "moe-weighted-reduction.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -485,6 +486,88 @@ void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, gg
     const int blocks = (binary.affine.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
     const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
     ggml_cuda_kernel_launch(mul_add_kernel, launch, binary, add->src[0] == mul);
+}
+
+static __global__ void moe_shared_combine_kernel(const float * __restrict__ experts, const float * __restrict__ scale,
+        const float * __restrict__ weights, float * __restrict__ routed, int n_embd, int n_expert_used,
+        mul_add_args binary, int unary_input, bool product_first, bool separate_products) {
+    ggml_cuda_pdl_lc();
+    const int token = blockIdx.x;
+    const int col = blockIdx.y*blockDim.x + threadIdx.x;
+    if (col >= n_embd) { return; }
+    const uint32_t pos[GGML_MAX_DIMS] = {uint32_t(col), uint32_t(token), 0, 0};
+    ggml_cuda_pdl_sync();
+    float reduction = 0.0f;
+    if (separate_products) {
+        const uint64_t first = uint64_t(token)*n_expert_used;
+        for (int j = 0; j < n_expert_used; ++j) {
+            const uint64_t row = first + j;
+            float value = experts[row*n_embd + col];
+            if (scale) { value = __fmul_rn(value, scale[row]); }
+            value = __fmul_rn(value, weights[row]);
+            reduction = j ? __fadd_rn(reduction, value) : value;
+        }
+    } else {
+        reduction = ggml_cuda_moe_weighted_sum(experts, scale, weights, n_embd, n_expert_used, token, col);
+    }
+    const int i = token*n_embd + col;
+    routed[i] = reduction;
+    const affine_unary_args & args = binary.affine;
+    float lhs = mul_add_read(args.input[0], binary.repeat[0], pos, binary.repeat_mask[0]);
+    if (!args.output[0]) {
+        const float value = product_first ? __fadd_rn(lhs, reduction) : __fadd_rn(reduction, lhs);
+        affine_unary_store(args.output[1], args.output_type[1], i, value);
+        return;
+    }
+    float rhs = mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]);
+    if (unary_input >= 0) {
+        const float raw = unary_input == 0 ? lhs : rhs;
+        float gate = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(raw) : args.op == GGML_UNARY_OP_SILU ? op_silu(raw) : op_softplus(raw);
+        if (args.output_type[2] == GGML_TYPE_F16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<half>(gate)); }
+        else if (args.output_type[2] == GGML_TYPE_BF16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(gate)); }
+        if (col < args.input[unary_input].ne[0] && token < args.input[unary_input].ne[1]) {
+            affine_unary_store(args.output[2], args.output_type[2], token*args.input[unary_input].ne[0] + col, gate);
+        }
+        if (unary_input == 0) { lhs = gate; } else { rhs = gate; }
+    }
+    float value = affine_unary_store(args.output[0], args.output_type[0], i, __fmul_rn(lhs, rhs));
+    value = product_first ? __fadd_rn(value, reduction) : __fadd_rn(reduction, value);
+    affine_unary_store(args.output[1], args.output_type[1], i, value);
+}
+
+void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale,
+        const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products) {
+    mul_add_args binary{};
+    const bool product_first = add->src[0] != routed;
+    if (mul) {
+        binary = mul_add_get_args(mul, add);
+    } else {
+        const ggml_tensor * shared = add->src[product_first ? 0 : 1];
+        binary.affine.input[0].data = shared->data;
+        binary.affine.input[0].type = shared->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            binary.affine.input[0].ne[d] = shared->ne[d];
+            binary.affine.input[0].nb[d] = shared->ne[d] == 1 ? 0 : shared->nb[d];
+            binary.repeat[0][d] = init_fastdiv_values(shared->ne[d]);
+        }
+        binary.affine.output[1] = add->data;
+        binary.affine.output_type[1] = add->type;
+    }
+    int input = -1;
+    if (unary) {
+        input = mul->src[0] == unary ? 0 : 1;
+        const ggml_tensor * raw = unary->src[0];
+        binary.affine.input[input].data = raw->data;
+        binary.affine.input[input].type = raw->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) { binary.affine.input[input].nb[d] = raw->ne[d] == 1 ? 0 : raw->nb[d]; }
+        binary.affine.output[2] = unary->data;
+        binary.affine.output_type[2] = unary->type;
+        binary.affine.op = ggml_get_unary_op(unary);
+    }
+    const dim3 blocks(routed->ne[1], (routed->ne[0] + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE, 1);
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(moe_shared_combine_kernel, launch, (const float *) experts->data, scale ? (const float *) scale->data : nullptr,
+        (const float *) weights->data, (float *) routed->data, int(routed->ne[0]), int(experts->ne[1]), binary, input, product_first, separate_products);
 }
 
 void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add) {
