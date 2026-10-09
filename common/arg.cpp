@@ -363,6 +363,9 @@ static std::vector<size_t> parse_moe_cache_byte_budgets(const std::string & valu
 }
 
 static void validate_moe_cache_arguments(const common_params & params) {
+    if (!params.moe_profile_save.empty() && (params.moe_hybrid != "on" || params.moe_profile_adaptation == "off")) {
+        throw std::invalid_argument("--moe-profile-save requires --moe-hybrid on and occurrence or occurrence-sync adaptation");
+    }
     if (params.moe_expert_profile.empty() && params.moe_profile_adaptation != "off") {
         throw std::invalid_argument("--moe-profile-adapt requires --moe-expert-profile");
     }
@@ -376,6 +379,11 @@ static void validate_moe_cache_arguments(const common_params & params) {
         params.speculative.draft.n_moe_expert_cache_slots != 0) {
         throw std::invalid_argument("--spec-draft-moe-expert-cache-mib conflicts with a nonzero --spec-draft-moe-expert-cache-size");
     }
+}
+
+static std::string parse_moe_cache_allocation(const std::string & value) {
+    if (value != "auto" && value != "uniform") { throw std::invalid_argument("MoE cache allocation must be auto or uniform"); }
+    return value;
 }
 
 static std::string clean_file_name(const std::string & fname) {
@@ -777,7 +785,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             // if HF repo is a preset repo, we simply run server in router mode with the preset.ini file
             params.models_preset_hf = params.model.hf_repo; // only for showing a warning
             params.models_preset    = hf_cache::finalize_file(plan.preset);
-            params.model = common_params_model{}; // make sure to clear model, so server starts in router mode
+            // clear the model so the server starts in router mode
+            params.model.path.clear();
+            params.model.hf_repo.clear();
+            params.model.docker_repo.clear();
         });
     }
 
@@ -2964,6 +2975,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) value*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
@@ -2986,6 +3007,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_expert_cache_slots = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-cache-allocation"}, "auto|uniform",
+        "cache allocation: auto uses profile priorities when a profile is present; uniform keeps the existing per-layer capacity (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_allocation = parse_moe_cache_allocation(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_ALLOCATION"));
     add_opt(common_arg(
         {"--moe-expert-profile"}, "FILE",
         "expert statistics or ranked profile for this model; overrides global profile settings",
@@ -3024,6 +3052,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_profile_adaptation = value;
         }
     ).set_env("LLAMA_ARG_MOE_PROFILE_ADAPT"));
+    add_opt(common_arg(
+        {"--moe-profile-save"}, "FILE",
+        "save learned full-model profile at safe boundaries and normal shutdown (default: disabled); requires hybrid occurrence adaptation",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) { throw std::invalid_argument("profile save path cannot be empty"); }
+            params.moe_profile_save = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--moe-profile-save-interval"}, "SECONDS",
+        "minimum time between safe-boundary learned profile save attempts, 0 = normal shutdown only (default: 60); server saves only when all slots are idle",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 86400) { throw std::invalid_argument("profile save interval must be in [0,86400]"); }
+            params.moe_profile_save_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--moe-expert-cache-layers"}, "N[,N-M,...]",
         "select the MoE expert layers eligible for caching; absent means all matching expert tensors",
@@ -3480,6 +3524,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("collect data for the output tensor (default: %s)", params.process_output ? "true" : "false"),
         [](common_params & params) {
             params.process_output = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--nextn"},
+        string_format("collect data for MTP/NextN layers (default: %s)", params.load_mtp ? "true" : "false"),
+        [](common_params & params) {
+            params.load_mtp = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
@@ -4469,6 +4520,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
       .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--spec-draft-moe-cache-allocation"}, "auto|uniform",
+        "draft cache allocation policy (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.moe_cache_allocation = parse_moe_cache_allocation(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_CACHE_ALLOCATION"));
+    add_opt(common_arg(
         {"--spec-draft-moe-expert-profile"}, "FILE",
         "expert statistics or ranked profile for the draft context",
         [](common_params & params, const std::string & value) {
@@ -4601,6 +4660,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
+                      "the target verify by rejection sampling (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.probabilistic = false;
+            } else if (value == "probabilistic") {
+                params.speculative.draft.probabilistic = true;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
@@ -4635,7 +4709,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",

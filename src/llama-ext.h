@@ -300,6 +300,19 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 LLAMA_API bool llama_set_mtp_draft_vocab(struct llama_context * ctx, const char * path);
 // Write a model-bound GGUF sidecar. Every end-of-generation token must be selected.
 LLAMA_API bool llama_write_mtp_draft_vocab(const struct llama_model * model, const int32_t * ids, size_t count, const char * path);
+// Marks the entries that a joint decision head (clef) reads, the default is 0
+// See https://github.com/ggml-org/llama.cpp/pull/29831 for details
+// A run of entries with the same value is one span, spans must be separated by entries with value 0
+// An option belongs to the last question before it
+enum llama_decision_order {
+    LLAMA_DECISION_ORDER_NONE            = 0, // not read by the head
+    LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1, // text of a question
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+    LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
+    LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+};
+// The embeddings output has one value per entry: row i is the score of option i
+LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
@@ -347,6 +360,19 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // Initialize opt-in GPU cache placement after synchronized prefill, before generation.
 LLAMA_API bool llama_moe_profile_initialize(struct llama_context * ctx);
 
+// Full-model GGUF learning bytes are borrowed through callback return, after owner locks are released.
+typedef bool (*llama_moe_profile_write_callback)(const uint8_t * data, size_t size, void * user_data);
+// Busy boundaries defer without changing output. timeout_ms must be in [1, 5000].
+extern "C" LLAMA_API bool llama_moe_profile_snapshot(struct llama_context * ctx, uint32_t timeout_ms,
+        llama_moe_profile_write_callback write, void * user_data);
+// Same-model contexts must stay alive through return. Overlapping conflicting histories reject.
+extern "C" LLAMA_API bool llama_moe_profile_snapshot_contexts(struct llama_context * const * contexts, size_t count, uint32_t timeout_ms,
+        llama_moe_profile_write_callback write, void * user_data);
+
 // Explicit profile selection overrides global profile settings and is copied during construction.
 extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_profile(
         struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation);
+
+// Allocation is auto or uniform. A null profile keeps normal profile selection.
+extern "C" LLAMA_API struct llama_context * llama_init_from_model_with_moe_cache_policy(
+        struct llama_model * model, struct llama_context_params params, const char * path, const char * adaptation, const char * allocation);

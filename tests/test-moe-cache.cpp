@@ -3,6 +3,10 @@
 #include "test-moe-cache.h"
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--prefill-policy-only") == 0) {
+        test_moe_prefill_partition_policy();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--routed-bank-only") == 0) {
         test_candidate_routed_matrix();
         return 0;
@@ -97,6 +101,26 @@ int main(int argc, char ** argv) {
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
     test_moe_cache_proc_api();
+    if (argc == 2 && strcmp(argv[1], "--paired-prefill-graph-bench") == 0) {
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        test_paired_prefill_graph(device, true);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--paired-prefill-sources-only") == 0) {
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        test_paired_prefill_sources(device);
+        test_paired_prefill_owner(device);
+        test_paired_prefill_graph(device);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--bounded-prefill-only") == 0) {
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        test_active_grouped_bounded_prefill_waves(device);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--pageable-aux-only") == 0) {
         test_pageable_auxiliaries();
         return 0;
@@ -153,6 +177,7 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_grouped_graph_replay_lifecycle(dev);
+        test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
         test_grouped_graph_replay_lifecycle(dev, 393216, 2);
         test_grouped_graph_replay_lifecycle(dev, 524288, 1);
         test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);
@@ -175,6 +200,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     test_speculative_grouped_intent_splits();
+    test_moe_prefill_partition_policy();
     test_candidate_graph_coverage_ledger();
     test_candidate_graph_inventory_reuse();
     test_mmid_capabilities();

@@ -47,6 +47,32 @@ struct ggml_cuda_moe_graph_span {
     uintptr_t end;
 };
 
+// Execute uses existing CPU workers. Result storage stays borrowed through stream completion.
+struct ggml_cuda_moe_prefill_cpu_partition {
+    const uint8_t * experts = nullptr;
+    uint32_t n_experts = 0;
+    void * context = nullptr;
+    bool (*execute)(void * context) = nullptr;
+    bool (*canceled)(void * context) = nullptr;
+    const void * output = nullptr;
+    size_t output_bytes = 0;
+    size_t output_route_stride = 0;
+};
+
+// Maps come from prepare_source_group and stay borrowed through the source dispatch.
+struct ggml_cuda_moe_prefill_source_binding {
+    const ggml_tensor * original = nullptr;
+    const int32_t * slot_for_expert = nullptr;
+    const int32_t * expert_for_slot = nullptr;
+    uint32_t expert_capacity = 0;
+    uint32_t slot_capacity = 0;
+    uint64_t resource_identity = 0;
+    uint64_t residency_token = 0;
+    bool measure_resources = false;
+};
+
+bool ggml_cuda_moe_tensor_storage(const ggml_tensor * tensor, int device, bool & unavailable);
+
 static inline bool ggml_cuda_moe_graph_span_bounds(
         const void * nodes,
         int32_t n_nodes,
@@ -1150,7 +1176,8 @@ public:
     ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
-    int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+    int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot,
+            const uint32_t * capacities = nullptr, uint32_t n_capacities = 0);
     bool initialize_profile(const ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles,
             ggml_cuda_moe_stream_t stream, uint64_t * copied_bytes, uint32_t flags = 0);
     bool initialize_statistics(const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics,
@@ -1268,14 +1295,24 @@ public:
             ggml_cuda_moe_stream_t stream,
             const int32_t * unique_experts,
             uint32_t n_unique_experts);
-    ggml_cuda_moe_grouped_decode_result execute_bounded_prefill_mmq(
+    size_t prefill_staging_capacity_bytes() const;
+    ggml_cuda_moe_grouped_decode_result execute_bounded_prefill(
             ggml_backend_cuda_context & context,
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
             const int32_t * unique_experts,
-            uint32_t n_unique_experts);
+            uint32_t n_unique_experts,
+            const char * ids_host,
+            size_t ids_bytes,
+            size_t ids_row_stride,
+            const int64_t * expert_rows,
+            const ggml_cuda_moe_graph_binding * paired_binding = nullptr,
+            ggml_tensor * paired_node = nullptr,
+            ggml_tensor * paired_output = nullptr,
+            const ggml_cuda_moe_prefill_cpu_partition * cpu_partition = nullptr,
+            const ggml_cuda_moe_prefill_source_binding * source_binding = nullptr);
     ggml_cuda_moe_grouped_decode_result prepare_host_staged_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
@@ -1329,6 +1366,13 @@ public:
             const ggml_backend_moe_source_owner_v1 * source_owner = nullptr,
             ggml_backend_moe_hybrid_test_hook_v1_t hook = nullptr, void * hook_data = nullptr);
     bool complete_source_adaptation(bool wait, uint64_t deadline_ns);
+    bool snapshot_source_learning(const ggml_backend_moe_source_identity_v1 * sources, uint32_t count,
+            uint32_t flags, uint64_t deadline_ns, ggml_backend_moe_learning_snapshot_callback_v1_t callback, void * data);
+    bool restore_source_learning(const ggml_backend_moe_source_learning_v1 * records, uint32_t count,
+            uint32_t flags, uint64_t deadline_ns);
+    bool snapshot_source_profile(const ggml_cuda_moe_grouped_transaction & transaction,
+            std::vector<uint64_t> & counts, std::vector<double> & heat,
+            std::vector<int32_t> & ranks, uint64_t & observations);
     bool apply_source_profile(ggml_cuda_moe_graph_group_dispatch & group, const int32_t * experts,
             uint32_t count, int32_t * host_slots, int32_t * host_owners,
             ggml_cuda_moe_source_transport * transport, const uint32_t * bindings, uint32_t n_bindings,
@@ -1379,7 +1423,7 @@ public:
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
             const float ** source) const;
-    bool finish_prefill_add_id(
+    bool finish_prefill_auxiliary(
             const ggml_cuda_moe_graph_execution & execution,
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream,
@@ -1448,6 +1492,7 @@ private:
             uint64_t * pending_declines) const;
     bool set_prefill_resident_budget_for_test(size_t byte_budget);
     bool set_prefill_staging_lane_bytes_for_test(size_t byte_budget);
+    ggml_cuda_moe_stream_t prefill_copy_stream_for_test() const;
     bool set_original_auxiliary_budget_for_test(size_t byte_budget);
     size_t original_auxiliary_bytes_for_test() const;
     void fail_device_resource_allocation_for_test(uint32_t stage);
@@ -1589,6 +1634,9 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v1(
 int32_t ggml_backend_cuda_moe_candidate_replace_v2(
     ggml_backend_t backend,
     const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+
+int32_t ggml_backend_cuda_moe_candidate_replace_capacities_v1(ggml_backend_t backend,
+    const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot, const uint32_t * capacities, uint32_t n_capacities);
 
 // Create a cache for one device.
 //   slot_size_bytes : size of one expert weight slab (uniform across slots)
@@ -1753,6 +1801,11 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
 extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v2(ggml_backend_t backend,
     const ggml_backend_moe_source_statistics_v1 * statistics, const double * const * scores,
     uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
+extern "C" bool ggml_backend_cuda_moe_learning_snapshot_v1(ggml_backend_t backend,
+    const ggml_backend_moe_source_identity_v1 * sources, uint32_t count, uint32_t flags, uint64_t deadline_ns,
+    ggml_backend_moe_learning_snapshot_callback_v1_t callback, void * data);
+extern "C" bool ggml_backend_cuda_moe_learning_restore_v1(ggml_backend_t backend,
+    const ggml_backend_moe_source_learning_v1 * records, uint32_t count, uint32_t flags, uint64_t deadline_ns);
 extern "C" bool ggml_backend_cuda_moe_statistics_initialize_v1(ggml_backend_t backend,
     const ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 extern "C" bool ggml_backend_cuda_moe_profile_initialize_v1(ggml_backend_t backend,

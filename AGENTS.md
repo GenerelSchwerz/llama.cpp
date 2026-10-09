@@ -8,11 +8,27 @@ For this fork, this section overrides only the restrictions on agent-written com
 
 Repository skills may impose stricter rules for their workflows.
 
+## Generic features and upstream maintenance
+
+This fork should inherit future llama.cpp model, operator, backend and server improvements with minimal local reconciliation. Design every feature and optimization around existing upstream contracts before adding fork-specific machinery.
+
+- Derive behavior from GGUF metadata, tensor shapes/types/strides, graph dependencies and backend capabilities. Model names, fixed expert counts, architecture allowlists and per-model admission helpers must not define hybrid support. Current models are validation samples, not a support list.
+- Reuse upstream graph construction, operator dispatch, arithmetic kernels, CPU workers, sampling, KV state and server sessions. Keep fork extensions small and localized; do not copy an executor, duplicate an upstream implementation or add a parallel policy owner when an existing interface can express the behavior.
+- Preserve original tensors, quantization formats, auxiliary readers and upstream precision/layout semantics. Fast paths may have checked structural or hardware conditions, but all other supported cases must remain first-class in the same generic pipeline. Required hybrid execution must report an explicit failure instead of silently using an ordinary executor.
+- Keep one canonical residency and resource owner per device. Preserve request isolation, source/copy/reader lifetimes, cancellation, partial host pinning, multiple devices and MTP when changing scheduling or storage. Keep model statistics, hardware budget/split tuning and online adaptation separate.
+- Before diverging from upstream, inspect its current implementation and document why the existing contract is insufficient, the smallest necessary extension and how a later upstream implementation can replace it. Avoid private copies of upstream structures, redundant bookkeeping and model-specific configuration controls.
+- Merge upstream changes semantically: preserve upstream fixes and new model/operator behavior while reconciling fork hooks. Do not resolve conflicts by discarding one side wholesale, copying a donor checkout or restoring obsolete assumptions to make a build pass. Record deliberate exclusions with source evidence.
+- Validate shared contracts across different graph structures and formats, plus synthetic cases for unavailable models. Compare matched prefill and decode controls with actual routes, resident bytes, MTP work and resources; a component speedup or changed output is not proof of an end-to-end gain. Investigate regressions before promoting the combined implementation.
+- Keep the generic publication free of the standalone reference engines and private research ports. Reference results belong in separate evidence artifacts; public code must use maintainable generic contracts.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+
+> [!NOTE]
+> Upstream submission restrictions apply to ggml-org/llama.cpp. In this fork, the Fork Automation Policy and Generic features and upstream maintenance requirements above remain applicable, together with the quality and review requirements below.
 
 ---
 

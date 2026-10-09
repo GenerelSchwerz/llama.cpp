@@ -1,8 +1,12 @@
 #include "ggml.h"
+#include "ggml-cpp.h"
 #include "gguf.h"
 
 #include "build-info.h"
 #include "common.h"
+
+#include "../src/llama-ext.h"
+
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -48,6 +52,9 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -937,6 +944,78 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
     }
 }
 
+class common_moe_profile_file_lock {
+public:
+    explicit common_moe_profile_file_lock(const std::filesystem::path & path) {
+#if defined(_WIN32)
+        handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &position) != 0;
+        }
+#else
+        int flags = O_CREAT | O_RDWR | O_NONBLOCK;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        descriptor = open(path.c_str(), flags, 0600);
+        struct stat info = {};
+        if (descriptor >= 0 && fstat(descriptor, &info) == 0 && S_ISREG(info.st_mode)) { locked = flock(descriptor, LOCK_EX | LOCK_NB) == 0; }
+#endif
+    }
+    ~common_moe_profile_file_lock() {
+#if defined(_WIN32)
+        if (locked) { (void) UnlockFileEx(handle, 0, 1, 0, &position); }
+        if (handle != INVALID_HANDLE_VALUE) { (void) CloseHandle(handle); }
+#else
+        if (descriptor >= 0) { (void) close(descriptor); }
+#endif
+    }
+    common_moe_profile_file_lock(const common_moe_profile_file_lock &) = delete;
+    common_moe_profile_file_lock & operator=(const common_moe_profile_file_lock &) = delete;
+    bool acquired() const { return locked; }
+private:
+    bool locked = false;
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    OVERLAPPED position = {};
+#else
+    int descriptor = -1;
+#endif
+};
+
+bool common_moe_profile_write(const std::filesystem::path & path, const uint8_t * data, size_t size) {
+    if (path.empty() || !data || size < 24 || size > 256 * 1024 * 1024 || std::memcmp(data, "GGUF", 4)) { return false; }
+    try {
+        std::error_code error;
+        if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path(), error); }
+        if (error) { return false; }
+        auto lock_path = path; lock_path += ".lock";
+        common_moe_profile_file_lock writer(lock_path);
+        if (!writer.acquired()) { return false; }
+        fs_write_atomic(path, std::string(reinterpret_cast<const char *>(data), size));
+        return true;
+    } catch (...) { return false; }
+}
+
+bool common_moe_profile_save(llama_context * ctx, const std::filesystem::path & path, uint32_t timeout_ms) {
+    try { return common_moe_profile_save(std::vector<llama_context *>{ctx}, path, timeout_ms); }
+    catch (...) { return false; }
+}
+
+bool common_moe_profile_save(const std::vector<llama_context *> & contexts, const std::filesystem::path & path, uint32_t timeout_ms) {
+    if (contexts.empty() || path.empty()) { return false; }
+    try {
+        auto destination = path;
+        return llama_moe_profile_snapshot_contexts(contexts.data(), contexts.size(), timeout_ms, [](const uint8_t * data, size_t size, void * user_data) {
+            return common_moe_profile_write(*static_cast<const std::filesystem::path *>(user_data), data, size);
+        }, &destination);
+    } catch (...) { return false; }
+}
+
 bool fs_is_directory(const std::string & path) {
     std::filesystem::path dir(path);
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
@@ -1055,62 +1134,17 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
     return cache_directory / std::filesystem::u8path(filename);
 }
 
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
-    std::vector<common_file_info> files;
-    if (path.empty()) return files;
-
-    std::filesystem::path dir(path);
-    if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
-        return files;
-    }
-
-    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
-        try {
-            // Only include regular files (skip directories)
-            const auto & p = entry.path();
-            if (std::filesystem::is_regular_file(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.is_dir = false;
-                try {
-                    info.size = static_cast<size_t>(std::filesystem::file_size(p));
-                } catch (const std::filesystem::filesystem_error &) {
-                    info.size = 0;
-                }
-                files.push_back(std::move(info));
-            } else if (include_directories && std::filesystem::is_directory(p)) {
-                common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.size   = 0; // Directories have no size
-                info.is_dir = true;
-                files.push_back(std::move(info));
-            }
-        } catch (const std::filesystem::filesystem_error &) {
-            // skip entries we cannot inspect
-            continue;
-        }
-    }
-
-    return files;
-}
-
-std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode) {
-#ifdef _WIN32
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, NULL, 0);
-    if (!wlen) { return std::ifstream(); }
-    std::vector<wchar_t> wfname(wlen);
-    (void)MultiByteToWideChar(CP_UTF8, 0, fname.c_str(), -1, wfname.data(), wlen);
-    return std::ifstream(wfname.data(), mode);
-#else
-    return std::ifstream(fname, mode);
-#endif
-}
-
 //
 // TTY utils
 //
+
+bool common_is_tty(FILE * file) {
+#if defined(_WIN32)
+    return _isatty(_fileno(file));
+#else
+    return isatty(fileno(file));
+#endif
+}
 
 bool tty_can_use_colors() {
     // Check NO_COLOR environment variable (https://no-color.org/)
@@ -1129,10 +1163,21 @@ bool tty_can_use_colors() {
 
     // Check if stdout and stderr are connected to a terminal
     // We check both because log messages can go to either
-    bool stdout_is_tty = isatty(fileno(stdout));
-    bool stderr_is_tty = isatty(fileno(stderr));
+    return common_is_tty(stdout) || common_is_tty(stderr);
+}
 
-    return stdout_is_tty || stderr_is_tty;
+bool tty_enable_ansi() {
+#if defined(_WIN32)
+    // a Windows console renders ANSI sequences only in virtual terminal mode, pipes and files take them as is
+    for (DWORD id : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+        HANDLE h    = GetStdHandle(id);
+        DWORD  mode = 0;
+        if (GetConsoleMode(h, &mode) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            return false;
+        }
+    }
+#endif
+    return true;
 }
 
 //
@@ -1241,7 +1286,79 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    std::filesystem::path profile_save_path;
+    int64_t profile_save_interval_us = 0;
+    int64_t profile_save_attempt_us = 0;
 };
+
+static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
+    { COMMON_DECISION_TYPE_OPENJEV,        "openjev"       },
+    { COMMON_DECISION_TYPE_LEV,            "lev"           },
+    { COMMON_DECISION_TYPE_KEV,            "kev"           },
+    { COMMON_DECISION_TYPE_NIMBLE,         "nimble"        },
+    { COMMON_DECISION_TYPE_LAYA,           "laya"          },
+    { COMMON_DECISION_TYPE_CLEF,           "clef"          },
+    { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
+    { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
+    { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
+};
+
+static common_decision_type common_decision_type_from_string(const std::string & str) {
+    for (const auto & pair : COMMON_DECISION_TYPE_NAMES) {
+        if (pair.second == str) {
+            return pair.first;
+        }
+    }
+    return COMMON_DECISION_TYPE_UNKNOWN;
+}
+
+common_decision_type common_get_decision_type(const struct llama_model * model) {
+    char buf[64];
+    if (llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    const std::string key = std::string(buf) + ".decision.type";
+    if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    return common_decision_type_from_string(buf);
+}
+
+common_decision_type common_get_decision_type(const std::string & fname) {
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // missing or unreadable file
+    }
+
+    std::string arch;
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    if (arch_id < 0) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // no architecture in the metadata
+    }
+    if (gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+    }
+    arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    if (arch.empty()) {
+        return COMMON_DECISION_TYPE_UNKNOWN;
+    }
+
+    const std::string key = arch + ".decision.type";
+    const int64_t type_id = gguf_find_key(gguf_ctx.get(), key.c_str());
+    if (type_id < 0) {
+        return COMMON_DECISION_TYPE_NONE;
+    }
+    if (gguf_get_kv_type(gguf_ctx.get(), type_id) != GGUF_TYPE_STRING) {
+        return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+    }
+    return common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
+}
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
@@ -1305,6 +1422,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_rs_seq = params.speculative.need_n_rs_seq();
     }
 
+    // these decision models return a score for each token via the embeddings output
+    // TODO: maybe improve this in the future
+    const auto decision_type = common_get_decision_type(model);
+    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
+        decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
+        params.embedding    = true;
+        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+
+        cparams.embeddings            = true;
+        cparams.pooling_type          = LLAMA_POOLING_TYPE_NONE;
+        cparams.n_outputs_max         = cparams.n_batch;
+        cparams.n_outputs_max_per_seq = 1;
+
+        LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
+    }
+
+    // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
+    // (server.cpp does this check for --embedding, but before the model is loaded)
+    if (cparams.embeddings && cparams.n_batch > cparams.n_ubatch) {
+        LOG_WRN("embeddings enabled: setting n_batch = n_ubatch = %u\n", cparams.n_ubatch);
+        cparams.n_batch = cparams.n_ubatch;
+        params.n_batch  = params.n_ubatch;
+    }
+
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         llama_adapter_lora_ptr lora;
@@ -1348,8 +1489,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    llama_context * lctx = params.moe_expert_profile.empty() ? llama_init_from_model(model, cparams) :
-        llama_init_from_model_with_moe_profile(model, cparams, params.moe_expert_profile.c_str(), params.moe_profile_adaptation.c_str());
+    llama_context * lctx = llama_init_from_model_with_moe_cache_policy(model, cparams,
+        params.moe_expert_profile.empty() ? nullptr : params.moe_expert_profile.c_str(),
+        params.moe_expert_profile.empty() ? nullptr : params.moe_profile_adaptation.c_str(), params.moe_cache_allocation.c_str());
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
@@ -1374,6 +1516,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+    if (!params.moe_profile_save.empty()) {
+        pimpl->profile_save_path = std::filesystem::u8path(params.moe_profile_save);
+        pimpl->profile_save_interval_us = int64_t(params.moe_profile_save_interval) * 1'000'000;
+        pimpl->profile_save_attempt_us = ggml_time_us();
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1395,6 +1542,27 @@ void common_init_result::reset_samplers() {
     for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
         llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
     }
+}
+
+bool common_init_result::save_moe_profile(bool force, llama_context * auxiliary) {
+    if (pimpl->profile_save_path.empty() || !pimpl->context) { return true; }
+    const int64_t now = ggml_time_us();
+    if (!force && (!pimpl->profile_save_interval_us || now - pimpl->profile_save_attempt_us < pimpl->profile_save_interval_us)) {
+        return true;
+    }
+    pimpl->profile_save_attempt_us = now;
+    bool saved = false;
+    try {
+        std::vector<llama_context *> contexts{pimpl->context.get()};
+        if (auxiliary && auxiliary != contexts.front() && llama_get_model(auxiliary) == llama_get_model(contexts.front())) { contexts.push_back(auxiliary); }
+        saved = common_moe_profile_save(contexts, pimpl->profile_save_path, force ? 5000 : 100);
+    } catch (...) { saved = false; }
+    if (!saved) {
+        COM_WRN("%s: learned profile save deferred or failed; previous file retained\n", __func__);
+        return false;
+    }
+    COM_INF("%s: learned full-model profile saved\n", __func__);
+    return true;
 }
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
@@ -1700,7 +1868,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     mparams.moe_early_router_max_rows = mparams.load_mtp ?
             uint32_t(std::max<int64_t>(1, int64_t(common_speculative_n_max(&params.speculative)) + 1)) : 1;
 
@@ -1752,6 +1920,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.moe_cache_size = params.moe_cache_size;
 
     return cparams;
 }
@@ -2268,6 +2438,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
         }
+        if (t.decision_order != 0) {
+            llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
+        }
     }
 
     return res;
@@ -2412,40 +2585,36 @@ void common_prompt_checkpoint::update_dft(
     }
 }
 
-void common_prompt_checkpoint::load_tgt(
+bool common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     if (data_tgt.empty()) {
-        return;
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
-    if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
-    }
+    return n == data_tgt.size();
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     if (data_dft.empty()) {
-        return;
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
-    }
+    return n == data_dft.size();
 }
 
 void common_prompt_checkpoint::clear_tgt() {

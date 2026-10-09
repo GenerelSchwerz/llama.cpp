@@ -1027,7 +1027,7 @@ struct ggml_cuda_fattn_launch_layout {
 
 static bool ggml_cuda_fattn_make_layout(int id, const ggml_tensor * KQV, fattn_kernel_t fattn_kernel,
         int DV, int ncols1, int ncols2, int nwarps, size_t nbytes_shared, int nbatch_fa,
-        bool stream_k, bool use_sparse, int warp_size, ggml_cuda_fattn_launch_layout & plan) {
+        bool stream_k, bool use_sparse, int warp_size, bool async_kv_preload, ggml_cuda_fattn_launch_layout & plan) {
     const auto * Q = KQV->src[0];
     const auto * K = KQV->src[1];
     const auto * mask = KQV->src[3];
@@ -1088,10 +1088,13 @@ static bool ggml_cuda_fattn_make_layout(int id, const ggml_tensor * KQV, fattn_k
 
     dim3 blocks_num;
     if (stream_k) {
-        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
+        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (int64_t(ntiles_dst) + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100LL * ntiles_dst / (int64_t(max_blocks)*tiles_nwaves);
 
+            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) { return false; }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                 return true;
             }
@@ -1198,7 +1201,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -1226,7 +1229,7 @@ void launch_fattn(
 
     ggml_cuda_fattn_launch_layout plan;
     const bool planned = ggml_cuda_fattn_make_layout(ctx.device, dst, fattn_kernel, DV, ncols1, ncols2, nwarps,
-        nbytes_shared, nbatch_fa, stream_k, use_sparse, warp_size, plan);
+        nbytes_shared, nbatch_fa, stream_k, use_sparse, warp_size, async_kv_preload, plan);
     if (ggml_cuda_fattn_query) {
         ggml_cuda_fattn_query->failed |= !planned || ggml_cuda_fattn_query->visited;
         ggml_cuda_fattn_query->visited = true;

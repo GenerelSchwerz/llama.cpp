@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -336,6 +337,8 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
     std::string mtp_draft_vocab; // optional model-bound GGUF vocabulary selection; empty = unrestricted
 
+    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -347,6 +350,7 @@ struct common_params_speculative_draft {
     std::vector<size_t> moe_expert_cache_byte_budgets;
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
+    std::string moe_cache_allocation = "auto";
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -557,9 +561,12 @@ struct common_params {
     std::vector<size_t> moe_expert_cache_byte_budgets;
     std::string moe_expert_profile;
     std::string moe_profile_adaptation = "off";
+    std::string moe_cache_allocation = "auto";
     bool moe_early_router = false;
     std::string moe_hybrid; // empty preserves the process environment
     std::string moe_gpu_miss_fraction;
+    std::string moe_profile_save;
+    int32_t moe_profile_save_interval = 60;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -626,11 +633,14 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -764,10 +774,11 @@ struct common_params {
     int32_t i_chunk     =  0; // start processing from this chunk
     int8_t  imat_dat    =  0; // whether the legacy imatrix.dat format should be output (gguf <= 0 < dat)
 
-    bool process_output  = false; // collect data for the output tensor
-    bool compute_ppl     = true;  // whether to compute perplexity
-    bool show_statistics = false; // show imatrix statistics per tensor
-    bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
+    bool process_output         = false; // collect data for the output tensor
+    bool compute_ppl            = true;  // whether to compute perplexity
+    bool show_statistics        = false; // show imatrix statistics per tensor
+    bool activation_statistics  = false; // generate data to calculate activation based statistics
+    bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params
     int n_pca_batch = 100;
@@ -971,18 +982,12 @@ std::filesystem::path fs_get_cache_directory();
 std::filesystem::path fs_get_cache_file(const std::string & filename);
 std::filesystem::path fs_get_config_directory();
 
-struct common_file_info {
-    std::string path;
-    std::string name;
-    size_t      size = 0; // in bytes
-    bool        is_dir = false;
-};
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
-
-// fs open, also handle UTF8 on Windows
-std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
-
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
+
+// A busy destination defers. The OS releases its writer lock on process exit.
+bool common_moe_profile_write(const std::filesystem::path & path, const uint8_t * data, size_t size);
+bool common_moe_profile_save(llama_context * ctx, const std::filesystem::path & path, uint32_t timeout_ms = 5000);
+bool common_moe_profile_save(const std::vector<llama_context *> & contexts, const std::filesystem::path & path, uint32_t timeout_ms = 5000);
 
 //
 // TTY utils
@@ -990,12 +995,37 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
 
 // Auto-detect if colors can be enabled based on terminal and environment
 bool tty_can_use_colors();
+bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot render ANSI sequences
+
+// Check if the given file is attached to a terminal
+bool common_is_tty(FILE * file);
 
 //
 // Model utils
 //
 
 struct common_sampler;
+
+// typed decision models, see "<arch>.decision.type" in the model metadata
+enum common_decision_type {
+    COMMON_DECISION_TYPE_NONE,    // not a decision model
+    COMMON_DECISION_TYPE_OPENJEV, // logits of one label token per option, read at the last prompt token
+    COMMON_DECISION_TYPE_LEV,     // same as openjev, noul is read from a rating scale
+    COMMON_DECISION_TYPE_KEV,     // dot product of the hidden states of the last token and of one end token per option
+    COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
+    COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
+    COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
+    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
+    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
+    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
+};
+
+common_decision_type common_get_decision_type(const struct llama_model * model);
+
+// same as above, but reads a GGUF file; it does not load the model
+// returns COMMON_DECISION_TYPE_UNKNOWN if the file is missing, unreadable, or invalid
+common_decision_type common_get_decision_type(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1007,6 +1037,9 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+
+    // Call between completed requests/windows, before releasing auxiliary contexts.
+    bool save_moe_profile(bool force = false, llama_context * auxiliary = nullptr);
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
@@ -1101,6 +1134,7 @@ struct common_batch {
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
+        int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1328,12 +1362,13 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // return false if the state could not be restored
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

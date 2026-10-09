@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -75,6 +76,7 @@ struct llama_speculative_grouped_intent_test_access {
 
 using llama_mtp_execution_policy = llama_speculative_execution_policy;
 using llama_mtp_grouped_intent_test_access = llama_speculative_grouped_intent_test_access;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -118,6 +120,10 @@ struct llama_moe_profile_source_statistics {
     uint64_t observations = 0;
     std::vector<uint64_t> counts;
     std::vector<double> scores = {};
+    std::vector<double> heat = {};
+    std::vector<float> usage = {};
+    std::vector<int32_t> prior = {};
+    uint64_t windows = 0;
 };
 
 struct llama_moe_profile_statistics {
@@ -127,6 +133,14 @@ struct llama_moe_profile_statistics {
 
 llama_moe_profile_statistics llama_moe_profile_statistics_parse(
         const uint8_t * data, size_t bytes, const std::vector<llama_moe_source_group> & sources);
+
+std::vector<uint8_t> llama_moe_profile_statistics_serialize(
+        const llama_moe_profile_statistics & statistics, const std::vector<llama_moe_source_group> & sources);
+
+llama_moe_profile_statistics llama_moe_profile_learning_baseline(const std::vector<llama_moe_source_group> & sources,
+        const llama_moe_profile_statistics & initial, const std::vector<ggml_backend_moe_static_profile_v1> & profiles);
+bool llama_moe_profile_learning_overlay(llama_moe_profile_statistics & snapshot, std::vector<uint8_t> & covered,
+        const ggml_backend_moe_source_learning_v1 * records, uint32_t count);
 
 struct llama_context {
     struct sched_reserve_plan {
@@ -143,7 +157,8 @@ struct llama_context {
             const llama_model & model,
                   llama_context_params params,
                   const char * profile_path = nullptr,
-                  const char * profile_adaptation = nullptr);
+                  const char * profile_adaptation = nullptr,
+                  const char * cache_allocation = "auto");
 
     ~llama_context();
 
@@ -374,6 +389,9 @@ public:
     bool initialize_moe_profile();
     bool initialize_moe_profile(const std::vector<ggml_backend_moe_static_profile_v1> & profiles);
     bool initialize_moe_statistics(const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr);
+    bool restore_moe_learning();
+    bool snapshot_moe_learning(std::vector<uint8_t> & bytes, uint32_t timeout_ms);
+    static bool snapshot_moe_learning_contexts(const std::vector<llama_context *> & contexts, std::vector<uint8_t> & bytes, uint32_t timeout_ms);
     bool initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
         const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr);
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
@@ -411,6 +429,7 @@ private:
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
     void refresh_moe_candidates();
+    void plan_moe_profile_capacities(enum llama_context_type ctx_type, const uint8_t * profile_data, size_t profile_bytes);
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -421,6 +440,9 @@ private:
                                    bool   is_reserve = false) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -447,6 +469,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -521,6 +544,21 @@ private:
 
     std::unique_ptr<llama_draft_vocab> mtp_draft_vocab;
     bool mtp_draft_vocab_locked = false;
+    // state of sched_copy_experts, reset before each graph compute
+    struct copy_experts_info {
+        const ggml_tensor *  ids = nullptr;
+        std::vector<int32_t> ids_data;
+        std::vector<bool>    used;
+
+        void reset() {
+            ids = nullptr;
+            ids_data.clear();
+            used.clear();
+        }
+    };
+
+    copy_experts_info copy_experts;
+
     ggml_backend_t backend_cpu = nullptr;
     bool ple_prefetch = false;
     std::vector<ggml_backend_ptr> backends;
@@ -572,6 +610,7 @@ private:
     std::vector<ggml_backend_moe_source_statistics_v1> moe_statistics;
     std::vector<const double *> moe_statistics_scores;
     bool moe_profile_failed = false;
+    std::unordered_map<const ggml_tensor *, uint32_t> moe_profile_capacities;
     uint32_t moe_hybrid_profile_adapt = 0;
     bool moe_hybrid_required = false;
     bool moe_hybrid_allow_runtime_allocations = false;

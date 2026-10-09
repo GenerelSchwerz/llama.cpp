@@ -340,6 +340,10 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    // K2 Horizon MoVA
+    struct ggml_tensor * attn_v_gate   = nullptr;
+    struct ggml_tensor * attn_v_gate_b = nullptr;
+    struct ggml_tensor * attn_v_exps   = nullptr;
 
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
@@ -716,6 +720,7 @@ struct llama_model {
     struct ggml_tensor * cls_out   = nullptr;
     struct ggml_tensor * cls_out_b = nullptr;
     struct ggml_tensor * cls_norm  = nullptr;
+    struct ggml_tensor * cls_norm_b = nullptr;
 
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
@@ -817,6 +822,8 @@ struct llama_model {
     bool moe_expert_cache_enabled() const;
     uint32_t moe_early_router_max_rows() const;
     const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & moe_expert_cache_memory() const;
+    const std::vector<llama_moe_cache_memory> & moe_expert_cache_group_memory(enum llama_context_type ctx_type) const;
+    ggml_backend_dev_t moe_expert_cache_group_owner(size_t group_index) const;
     std::map<ggml_backend_buffer_type_t, size_t> moe_expert_cache_memory_breakdown(enum llama_context_type ctx_type) const;
     std::map<ggml_backend_dev_t, size_t> moe_expert_cache_host_staging(enum llama_context_type ctx_type) const;
     void build_moe_sources();
@@ -911,6 +918,13 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // helper: tensor flags for a file that holds the trunk, the NextN layers, or both
+    struct nextn_flags_t {
+        int trunk; // TENSOR_NOT_REQUIRED when the file holds only the NextN layers
+        int mtp;   // TENSOR_NOT_REQUIRED when the file holds only the trunk, TENSOR_SKIP when MTP is not loaded
+    };
+    nextn_flags_t nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe = LLM_TENSOR_ATTN_NORM) const;
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

@@ -128,15 +128,35 @@ struct ggml_cuda_mmid_resources {
 };
 
 bool ggml_cuda_mmid_pool_reserve(size_t & bytes, size_t count, size_t element_bytes);
-bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources);
+bool ggml_cuda_mmid_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmid_resources & resources,
+    ggml_cuda_mmid_mapping mapping = GGML_CUDA_MMID_MAPPING_DIRECT);
 bool ggml_cuda_mmid_execution_compute(ggml_backend_cuda_context & context, ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
 
 bool ggml_cuda_mmid_execution_valid(const ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
+bool ggml_cuda_mmid_shape_valid(const ggml_tensor * dst);
+
+struct ggml_cuda_mmid_prefill_prepared;
+ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare(ggml_backend_cuda_context & context,
+    ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride);
+// Ownership and original IDs are copied. CPU result storage stays borrowed until stream completion.
+// Disable GPU grouping when an existing mapped consumer supplies the GPU result.
+ggml_cuda_mmid_prefill_prepared * ggml_cuda_mmid_prefill_prepare_partition(ggml_backend_cuda_context & context,
+    ggml_tensor * dst, const char * ids_host, size_t ids_bytes, size_t ids_row_stride,
+    const uint8_t * cpu_experts, uint32_t n_experts, bool gpu_grouping = true);
+bool ggml_cuda_mmid_prefill_launch_range(ggml_backend_cuda_context & context,
+    const ggml_cuda_mmid_prefill_prepared * prepared, const void * resident, const void * staging,
+    const int32_t * source_map, uint32_t n_slots, uint32_t n_staged, int32_t expert_begin, int32_t expert_count);
+bool ggml_cuda_mmid_prefill_finish(ggml_backend_cuda_context & context, const ggml_cuda_mmid_prefill_prepared * prepared);
+bool ggml_cuda_mmid_prefill_join_cpu(ggml_backend_cuda_context & context, const ggml_cuda_mmid_prefill_prepared * prepared,
+    const void * cpu_output, size_t cpu_bytes, size_t cpu_route_stride);
+void ggml_cuda_mmid_prefill_free(ggml_cuda_mmid_prefill_prepared * prepared);
 bool ggml_cuda_mmid_execution_compute(ggml_backend_t backend, ggml_tensor * dst, const ggml_cuda_mmid_execution & execution);
 bool ggml_cuda_mmid_pool_compute_for_test(ggml_backend_t backend, ggml_tensor * dst,
     const ggml_cuda_mmid_execution & execution, void * workspace, size_t bytes, size_t * peak);
 bool ggml_cuda_mmid_vector_compute_for_test(ggml_backend_t backend, ggml_tensor * dst);
 cudaStream_t ggml_cuda_mmid_execution_stream_for_test(ggml_backend_t backend);
+bool ggml_cuda_mmq_mmid_pair_compute_for_test(ggml_backend_t backend, const ggml_tensor * up,
+    const ggml_tensor * gate, ggml_tensor * glu, uint32_t resident_slots, uint32_t staging_slots, uint32_t * waves);
 
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type);
 ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query);

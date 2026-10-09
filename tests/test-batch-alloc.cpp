@@ -99,6 +99,15 @@ struct batch_builder {
         const llama_pos pos[GGML_MROPE_SECTIONS] = { p, 0, 0, 0 };
         return add_embd(pos, seq_ids, output);
     }
+
+    int32_t add_tok(llama_token id, llama_pos p, llama_seq_id seq_id, bool output) {
+        const int32_t idx = b.add_token(seq_id);
+        GGML_ASSERT(idx >= 0);
+        GGML_ASSERT(b.set_token_id(idx, id));
+        GGML_ASSERT(b.set_token_pos(idx, &p));
+        GGML_ASSERT(b.set_output(idx, output));
+        return idx;
+    }
 };
 
 static void check_server_ubatch(
@@ -465,6 +474,125 @@ static void test_content_types(testing & t) {
     });
 }
 
+static void test_mixed(testing & t) {
+    llama_vocab vocab;
+
+    t.test("rejected_unless_allowed", [&](testing & t) {
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, true);
+
+        llama_batch_allocr ba_default(1);
+        t.assert_true("rejected by default", !ba_default.init(bb.b, vocab, false));
+
+        llama_batch_allocr ba_mixed(1, true);
+        t.assert_true("accepted when allowed", ba_mixed.init(bb.b, vocab, false));
+    });
+
+    t.test("layout_and_split", [&](testing & t) {
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, false);
+        bb.add(2, {0}, false);
+        bb.add_tok(5, 3, 0, true);
+
+        llama_batch_allocr ba(1, true);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        const llama_batch & batch = ba.get_batch();
+        t.assert_true(batch.token != nullptr && batch.embd != nullptr);
+
+        const llama_token exp_tok[4]  = { 3, 0, 0, 5 };
+        const float       exp_embd[8] = { 0, 0, 100, 101, 200, 201, 0, 0 };
+        for (int i = 0; i < 4; ++i) {
+            t.assert_equal(exp_tok[i], batch.token[i]);
+        }
+        for (int i = 0; i < 8; ++i) {
+            t.assert_equal(exp_embd[i], batch.embd[i]);
+        }
+
+        llama_ubatch ub0 = ba.split_simple(3);
+        t.assert_equal(3u, ub0.n_tokens);
+        t.assert_true(ub0.is_mixed());
+        const int8_t exp_is_embd[3] = { 0, 1, 1 };
+        for (int i = 0; i < 3; ++i) {
+            t.assert_equal(exp_is_embd[i], ub0.type[i]);
+            t.assert_equal((llama_pos) i, ub0.pos[i]);
+        }
+        t.assert_equal(3, ub0.token[0]);
+        t.assert_equal(0.0f, ub0.embd[0]);
+        t.assert_equal(100.0f, ub0.embd[2]);
+
+        // token rows only: a plain token ubatch
+        llama_ubatch ub1 = ba.split_simple(3);
+        t.assert_equal(1u, ub1.n_tokens);
+        t.assert_true(!ub1.is_mixed());
+        t.assert_true(ub1.embd == nullptr);
+        t.assert_equal(5, ub1.token[0]);
+        t.assert_equal((llama_pos) 3, ub1.pos[0]);
+
+        t.assert_equal(0u, ba.split_simple(3).n_tokens);
+    });
+
+    t.test("rejects_entry_with_both", [&](testing & t) {
+        // token + embd on one entry is the MTP layout
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 10);
+        bb.add_tok(3, 0, 0, false);
+        bb.add(1, {0}, false);
+        const int32_t idx = bb.add_tok(4, 2, 0, true);
+        const auto r = bb.row(idx, bb.n_embd);
+        t.assert_true(bb.b.set_token_embd(idx, { r.data(), 1, bb.n_embd }));
+
+        llama_batch_allocr ba(1, true);
+        t.assert_true(!ba.init(bb.b, vocab, false));
+    });
+
+    t.test("mrope_pos_expanded", [&](testing & t) {
+        const uint32_t n_pos = 4;
+        batch_builder bb(2, nullptr, 4, n_pos, /*n_vocab*/ 10);
+
+        bb.add_tok(3, 10, 0, false);
+        const llama_pos pos1[n_pos] = { 11, 5, 7, 0 };
+        bb.add_embd(pos1, {0}, true);
+
+        llama_batch_allocr ba(n_pos, true);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        llama_ubatch ub = ba.split_simple(2);
+        const llama_pos expected[8] = { 10, 11, 10, 5, 10, 7, 0, 0 };
+        for (int i = 0; i < 8; ++i) {
+            t.assert_equal(expected[i], ub.pos[i]);
+        }
+    });
+
+    t.test("mrope_rule_follows_first_entry", [&](testing & t) {
+        const uint32_t n_pos = 4;
+
+        mock_memory mem;
+        mem.ranges[0] = {0, 9};
+
+        llama_batch_allocr ba(n_pos, true);
+
+        // token first: must start after the memory
+        {
+            batch_builder bb(2, &mem, 4, n_pos, /*n_vocab*/ 10);
+            bb.add_tok(3, 9, 0, false);
+            const llama_pos pos[n_pos] = { 10, 1, 1, 0 };
+            bb.add_embd(pos, {0}, true);
+            t.assert_true("token overlapping the memory is rejected", !ba.init(bb.b, vocab, false));
+        }
+
+        // embd first: can overlap the memory
+        {
+            batch_builder bb(2, &mem, 4, n_pos, /*n_vocab*/ 10);
+            const llama_pos pos[n_pos] = { 9, 1, 1, 0 };
+            bb.add_embd(pos, {0}, false);
+            bb.add_tok(3, 10, 0, true);
+            t.assert_true("embd overlapping the memory is allowed", ba.init(bb.b, vocab, false));
+        }
+    });
+}
+
 static void test_split(testing & t) {
     llama_vocab vocab;
 
@@ -631,8 +759,8 @@ static void test_split(testing & t) {
     t.test("server_homogeneous_decode", [&](testing & t) {
         for (uint32_t n_rows : {2u, 4u}) {
             for (bool unified : {true, false}) {
-                batch_builder bb;
                 mock_memory mem;
+                batch_builder bb(2, &mem, 8);
                 for (uint32_t row = 0; row < n_rows; ++row) {
                     const llama_pos pos = 10 + row;
                     mem.ranges[row] = {0, pos - 1};
@@ -640,7 +768,7 @@ static void test_split(testing & t) {
                 }
 
                 llama_batch_allocr ba(1);
-                t.assert_true(ba.init(bb.make(), vocab, &mem, bb.n_embd, 8, false));
+                t.assert_true(ba.init(bb.b, vocab, false));
                 const llama_ubatch ub = unified ? ba.split_simple(4) : ba.split_equal(4, true, 0);
                 if (n_rows == 2) {
                     check_server_ubatch(t, ub, {0, 1}, {10, 11}, 1, 2, {0, 1}, !unified);
@@ -653,7 +781,7 @@ static void test_split(testing & t) {
     });
 
     t.test("server_mixed_decode_prompt_ub4_boundary", [&](testing & t) {
-        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) -> const llama_batch_ext & {
             mem.ranges[0] = {0, 9};
             mem.ranges[1] = {0, 19};
             bb.add(10, {0}, true);
@@ -661,77 +789,77 @@ static void test_split(testing & t) {
             bb.add(0, {2}, false);
             bb.add(1, {2}, false);
             bb.add(2, {2}, true);
-            return bb.make();
+            return bb.b;
         };
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_simple(4), {0, 1, 2, 2}, {10, 20, 0, 1}, 1, 4, {0, 1, 2}, false);
             check_server_ubatch(t, ba.split_simple(4), {2}, {2}, 1, 1, {2}, false);
         }
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_equal(4, true, 0), {0, 1, 2}, {10, 20, 0}, 1, 3, {0, 1, 2}, true);
             check_server_ubatch(t, ba.split_equal(4, true, 0), {2, 2}, {1, 2}, 2, 1, {2}, true);
         }
     });
 
     t.test("server_repeated_ids", [&](testing & t) {
-        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) -> const llama_batch_ext & {
             mem.ranges[2] = {0, 29};
             bb.add(30, {2}, false);
             bb.add(31, {2}, false);
             bb.add(32, {2}, true);
-            return bb.make();
+            return bb.b;
         };
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_simple(3), {2, 2, 2}, {30, 31, 32}, 1, 3, {2}, false);
         }
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_equal(3, true, 0), {2, 2, 2}, {30, 31, 32}, 3, 1, {2}, true);
         }
     });
 
     t.test("server_noncontiguous_slot_ids", [&](testing & t) {
-        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) -> const llama_batch_ext & {
             for (llama_seq_id seq : {0, 2, 3}) {
                 const llama_pos pos = 10 + seq;
                 mem.ranges[seq] = {0, pos - 1};
                 bb.add(pos, {seq}, true);
             }
-            return bb.make();
+            return bb.b;
         };
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_simple(4), {0, 2, 3}, {10, 12, 13}, 1, 3, {0, 2, 3}, false);
         }
 
         {
-            batch_builder bb;
             mock_memory mem;
+            batch_builder bb(2, &mem, 8);
             llama_batch_allocr ba(1);
-            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, false));
             check_server_ubatch(t, ba.split_equal(4, true, 0), {0}, {10}, 1, 1, {0}, true);
             check_server_ubatch(t, ba.split_equal(4, true, 0), {2, 3}, {12, 13}, 1, 2, {2, 3}, true);
         }
@@ -1202,6 +1330,7 @@ int main(int argc, char ** argv) {
 
     t.test("init",           test_init);
     t.test("content_types",  test_content_types);
+    t.test("mixed",          test_mixed);
     t.test("compat",         test_compat);
     t.test("split",          test_split);
     t.test("keep_tail",      test_keep_tail);

@@ -99,6 +99,16 @@ void ggml_cuda_op_gdn_post(ggml_backend_cuda_context & ctx, ggml_tensor * add, g
 void ggml_cuda_op_gdn_packed_post(ggml_backend_cuda_context & ctx, const ggml_tensor * packed, const ggml_tensor * bias,
         const ggml_tensor * scale, ggml_tensor * gate, ggml_tensor * beta, int64_t lanes);
 
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add);
+void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add);
+
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1);
+
+constexpr int GGML_CUDA_ORDERED_MUL_ADD_MAX = 128;
+void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count);
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post, ggml_tensor * tail = nullptr);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
@@ -137,3 +147,21 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 }
 
 void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last);
+
+struct ggml_cuda_scaled_unary_args {
+    const ggml_tensor * first;
+    const ggml_tensor * unary;
+    const ggml_tensor * last;
+};
+
+void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args);
+
+struct ggml_cuda_affine_unary_ops {
+    ggml_tensor * mul;
+    ggml_tensor * add;
+    ggml_tensor * unary;
+    ggml_tensor * post;
+    ggml_tensor * tail = nullptr;
+};
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops);

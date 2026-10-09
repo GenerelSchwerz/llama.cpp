@@ -12,7 +12,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const char * quantized = nullptr,
-    const ggml_cuda_mmid_execution * execution = nullptr);
+    const ggml_cuda_mmid_execution * execution = nullptr, const int64_t * quantized_ne = nullptr);
 
 bool ggml_cuda_mmvq_input_bytes(const ggml_tensor * src1, size_t & bytes);
 

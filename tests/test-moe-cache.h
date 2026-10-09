@@ -1,5 +1,7 @@
 #pragma once
 
+void test_moe_prefill_partition_policy();
+
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/mmid.cuh"
 #include "ggml-backend-impl.h"
@@ -60,6 +62,9 @@ void test_speculative_required_grouped_backend_capability(int device);
 struct ggml_cuda_moe_grouped_context_test_access {
     static bool set_prefill_staging_lane_bytes(ggml_cuda_moe_grouped_context & context, size_t bytes) {
         return context.set_prefill_staging_lane_bytes_for_test(bytes);
+    }
+    static cudaStream_t prefill_copy_stream(const ggml_cuda_moe_grouped_context & context) {
+        return context.prefill_copy_stream_for_test();
     }
     static bool set_original_auxiliary_budget(ggml_cuda_moe_grouped_context & context, size_t bytes) {
         return context.set_original_auxiliary_budget_for_test(bytes);
@@ -584,7 +589,8 @@ active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_ff = 0,
         bool mapped_host_biases = false,
         bool lookup_route = false,
-        int router_variant = -1);
+        int router_variant = -1,
+        bool allocate_nodes = true);
 
 active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         ggml_backend_t backend,
@@ -702,6 +708,10 @@ void test_active_grouped_lookup_routes(int device);
 void test_active_grouped_legacy_phase_telemetry(int device);
 
 void test_active_grouped_multirow_graph_modes(int device);
+void test_active_grouped_bounded_prefill_waves(int device);
+void test_paired_prefill_sources(int device);
+void test_paired_prefill_owner(int device);
+void test_paired_prefill_graph(int device, bool benchmark = false);
 
 std::vector<float> active_grouped_tensor_sentinel(ggml_tensor * tensor);
 

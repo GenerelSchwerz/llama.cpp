@@ -307,9 +307,11 @@ ggml_backend_buffer_type_t file_mmap_cached_buffer_type() {
         /* .iface   = */ {
             /* .get_name         = */ file_mmap_cached_buffer_type_name,
             /* .alloc_buffer     = */ file_mmap_cached_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ nullptr,
             /* .get_alignment    = */ file_mmap_cached_buffer_type_get_alignment,
             /* .get_max_size     = */ nullptr,
             /* .get_alloc_size   = */ file_mmap_cached_buffer_type_get_alloc_size,
+            /* .get_alloc_size_n = */ nullptr,
             /* .is_host          = */ file_mmap_cached_buffer_type_is_host,
         },
         /* .device  = */ nullptr,
@@ -337,7 +339,8 @@ active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_ff,
         bool mapped_host_biases,
         bool lookup_route,
-        int router_variant) {
+        int router_variant,
+        bool allocate_nodes) {
     CHECK(n_rows >= 1 && n_used >= 1 && n_used <= n_experts);
     CHECK(layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ||
         layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ||
@@ -651,12 +654,14 @@ active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     } else {
         CHECK(shared_bank_index == shared_banks->banks.size());
     }
-    result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
-    CHECK((shared_banks != nullptr || result.weight_buffer != nullptr) && result.node_buffer != nullptr);
+    if (allocate_nodes) {
+        result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
+    }
+    CHECK((shared_banks != nullptr || result.weight_buffer != nullptr) && (!allocate_nodes || result.node_buffer != nullptr));
     if (result.weight_buffer != nullptr) {
         ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
-    if (result.router_rows != nullptr) {
+    if (allocate_nodes && result.router_rows != nullptr) {
         std::vector<int32_t> rows(n_rows);
         std::iota(rows.begin(), rows.end(), 0);
         ggml_backend_tensor_set(result.router_rows, rows.data(), 0, ggml_nbytes(result.router_rows));
@@ -729,10 +734,13 @@ int32_t active_grouped_route(
         uint32_t row,
         uint32_t route) {
     CHECK(route_variant < 3 && row < graph.n_rows && route < graph.n_used);
-    if (graph.n_experts == 8 && (graph.n_used == 1 || graph.n_used == 2)) {
+    if (graph.n_experts == 8 && graph.n_rows <= 4 && (graph.n_used == 1 || graph.n_used == 2)) {
         return active_grouped_route_variants[route_variant][row][route];
     }
-    CHECK((graph.n_experts == 128 || graph.n_experts == 256) && graph.n_used == 8);
+    CHECK(graph.n_experts > 0 && graph.n_used > 0 && graph.n_used <= graph.n_experts);
+    if ((graph.n_experts != 128 && graph.n_experts != 256) || graph.n_used != 8) {
+        return (11 * route_variant + 7 * row + route) % graph.n_experts;
+    }
     if (graph.n_experts == 256) {
         return (64 * route_variant + 8 * row + route) % graph.n_experts;
     }

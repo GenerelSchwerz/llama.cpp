@@ -4,7 +4,7 @@ The source executor runs resident experts on CUDA and assigns cache misses to CU
 
 Complete gated SiLU/GELU and ungated squared-ReLU bodies can use the existing ggml CPU arithmetic and owned CUDA matrix/activation operations when the native arithmetic is unavailable. CPU intermediates stay on the CPU until the body result is published. Other body layouts retain checked projection execution or the existing capability fallback. Two cache-enabled source contexts use independent workspaces; uncached heads and ordinary execution retain the existing shared phase-workspace contract. Prepared source variants include output count and use the declared decode capacity, including MTP catch-up batches without outputs.
 
-This is an explicit experimental mode. Normal execution remains the default. Supported prompt turns use the existing cached prefill path; sequential prompt rows are not treated as independent decode rows.
+This is an explicit experimental mode. Normal execution remains the default. Hybrid prompt turns require the source prefill owner, including when CPU prefill sharing is off. Unsupported required prefill fails explicitly; it does not fall back to ordinary cached prefill. Sequential prompt rows are not treated as independent decode rows.
 
 ## Build
 
@@ -46,6 +46,8 @@ Legacy environment activation remains supported. `GGML_MOE_HYBRID=required` defa
 
 Advanced `GGML_MOE_SOURCE_SHARED_OVERLAP=0` disables shared overlap. `GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=0` requests strict allocation-free CPU admission, which can reject OpenMP/NUMA builds. Both overrides accept only 0 or 1; these are optional diagnostic controls.
 
+CPU-assisted prefill is off by default. `GGML_MOE_SOURCE_CPU_PREFILL=1` enables experimental CPU sharing inside hybrid prefill; unset or `0` keeps its GPU partition. This controls prefill only, separately from decode CPU misses and `--moe-gpu-miss-fraction`. CPU sharing can slow prefill and remains opt-in pending measured benefit gating.
+
 Look for `provider=source-core`, complete copy/GPU/CPU/publication counts and zero failures in the server log. A flag alone does not prove effective execution.
 
 [CUDA 12.3+](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/lazy-loading.html) normally enables CUDA module lazy loading by default. On older compatible installations, `CUDA_MODULE_LOADING=LAZY` can request it explicitly. This is independent of the `--lazy-mode on` model-loading option.
@@ -61,6 +63,20 @@ Add a supported MTP draft model with the normal speculative options:
 `--backend-sampling` is a separate optional target sampling choice. `--moe-source-graph-capacity` reserves reusable source shapes from actual capacity; it is opt-in, may change outputs and does not apply to normal full-GPU execution. It is not fixed to four shapes. Keep context, microbatch, sampling, head precision, graph-capacity setting and profile/adaptation identical in comparisons. See [optional draft vocabulary policy](moe-draft-vocab.md).
 
 ## Profiles and adaptation
+
+### Profile-aware allocation
+
+The default `--moe-cache-allocation auto` keeps the existing allocation without a profile. With a profile and generic source execution, it distributes fixed capacities across routed groups using actual storage costs and profile priorities, within the existing per-device cache budget. Each group retains a positive execution floor. Statistics profiles rank by expected benefit per storage byte; STRP files retain their global pair order.
+
+Use `--moe-cache-allocation uniform` to keep the existing common capacity even with a profile. Draft and MTP contexts have the separate `--spec-draft-moe-cache-allocation auto|uniform` option.
+
+```sh
+--moe-hybrid on --moe-expert-cache-size 64 --moe-expert-profile calibration.gguf
+```
+
+The slot option establishes the original storage budget; profile allocation can give individual groups more or fewer than 64 slots. Fixed and shared allocation costs remain reserved. Capacities are selected during context construction and stay fixed during generation; online adaptation changes cached identities within them. This does not resize caches during requests or change the compute kernels. Look for `moe-cache-capacity` and effective grouped payload counters in the logs.
+
+Without generic source execution, allocation stays uniform. A backend that cannot publish group capacities rejects profile allocation; select `uniform` to retain its previous behavior.
 
 Keep three decisions separate:
 

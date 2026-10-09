@@ -1,3 +1,4 @@
+#include "ggml-backend-moe-certificates.h"
 #include "moe-fidelity-config.h"
 // Note: porting this file to C++ is a work in progress
 
@@ -54,6 +55,138 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t 
     return buft->iface.alloc_buffer(buft, size);
 }
 
+// shared planning logic for allocating a list of tensors into one or more buffers of the given type
+struct ggml_backend_buft_alloc_buffer_n_plan_item {
+    size_t size;  // total bytes for this buffer
+    int    first; // first tensor index (inclusive)
+    int    last;  // last tensor index (exclusive)
+};
+
+using ggml_backend_buft_alloc_buffer_n_plan_t = std::vector<ggml_backend_buft_alloc_buffer_n_plan_item>;
+
+static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_plan(
+        ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
+    ggml_backend_buft_alloc_buffer_n_plan_t plan;
+
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    const size_t max_size  = ggml_backend_buft_get_max_size(buft);
+
+    size_t cur_buf_size = 0;
+    int    first        = 0;
+
+    for (int i = 0; i < n_tensors; i++) {
+        size_t this_size = 0;
+        struct ggml_tensor * t = tensors[i];
+        if (t->data == NULL && t->view_src == NULL) {
+            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+        }
+
+        // flush the current buffer if adding this tensor would exceed max_size
+        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+            plan.push_back({ cur_buf_size, first, i });
+            cur_buf_size = this_size;
+            first        = i;
+        } else {
+            cur_buf_size += this_size;
+        }
+    }
+
+    if (cur_buf_size > 0) {
+        plan.push_back({ cur_buf_size, first, n_tensors });
+    }
+
+    return plan;
+}
+
+// default implementation of alloc_buffer_n
+// allocates tensors from a list into one or more buffers of the given type
+static ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n_default(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
+    const ggml_backend_buft_alloc_buffer_n_plan_t plan = ggml_backend_buft_alloc_buffer_n_plan(buft, tensors, n_tensors);
+
+    std::vector<ggml_backend_buffer_t> buffers;
+    buffers.reserve(plan.size());
+
+    for (const ggml_backend_buft_alloc_buffer_n_plan_item & item : plan) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, item.size);
+        if (buffer == NULL) {
+            GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), item.size);
+            for (ggml_backend_buffer_t b : buffers) {
+                ggml_backend_buffer_free(b);
+            }
+            return NULL;
+        }
+
+        struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+
+        // allocate tensors in the current buffer
+        struct ggml_tensor * t_failed = NULL;
+        for (int j = item.first; j < item.last; j++) {
+            struct ggml_tensor * t = tensors[j];
+            if (t->data == NULL) {
+                if (t->view_src == NULL) {
+                    if (ggml_tallocr_alloc(&tallocr, t) != GGML_STATUS_SUCCESS) {
+                        t_failed = t;
+                        break;
+                    }
+                } else if (t->buffer == NULL) {
+                    if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                        t_failed = t;
+                        break;
+                    }
+                }
+            } else {
+                if (t->view_src != NULL && t->buffer == NULL) {
+                    // view of a pre-allocated tensor
+                    if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                        t_failed = t;
+                        break;
+                    }
+                }
+            }
+        }
+        if (t_failed != NULL) {
+            GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t_failed->name);
+            for (ggml_backend_buffer_t b : buffers) {
+                ggml_backend_buffer_free(b);
+            }
+            ggml_backend_buffer_free(buffer);
+            return NULL;
+        }
+
+        buffers.push_back(buffer);
+    }
+
+    if (buffers.empty()) {
+        return NULL;
+    }
+
+    if (buffers.size() == 1) {
+        return buffers[0];
+    }
+
+    return ggml_backend_multi_buffer_alloc_buffer(buffers.data(), buffers.size());
+}
+
+// default implementation of get_alloc_size_n
+// returns the total size that alloc_buffer_n_default would allocate for the given tensors
+static size_t ggml_backend_buft_get_alloc_size_n_default(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
+    const ggml_backend_buft_alloc_buffer_n_plan_t plan = ggml_backend_buft_alloc_buffer_n_plan(buft, tensors, n_tensors);
+
+    size_t total = 0;
+    for (const ggml_backend_buft_alloc_buffer_n_plan_item & item : plan) {
+        total += item.size;
+    }
+    return total;
+}
+
+ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
+    GGML_ASSERT(buft);
+    if (buft->iface.alloc_buffer_n) {
+        return buft->iface.alloc_buffer_n(buft, tensors, n_tensors);
+    }
+    return ggml_backend_buft_alloc_buffer_n_default(buft, tensors, n_tensors);
+}
+
 size_t ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->iface.get_alignment(buft);
@@ -85,6 +218,14 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
         return size;
     }
     return ggml_nbytes(tensor);
+}
+
+size_t ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
+    GGML_ASSERT(buft);
+    if (buft->iface.get_alloc_size_n) {
+        return buft->iface.get_alloc_size_n(buft, tensors, n_tensors);
+    }
+    return ggml_backend_buft_get_alloc_size_n_default(buft, tensors, n_tensors);
 }
 
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
@@ -795,12 +936,21 @@ struct ggml_backend_sched_split {
 
 struct ggml_backend_sched_hybrid_region {
     uint32_t split_index;
+    uint32_t copy_index;
+    uint64_t source_graph_uid;
+    uint64_t split_graph_uid;
     uint64_t allocator_generation;
     std::vector<ggml_backend_moe_cpu_prepared_region_v1_t> cpu;
     void * device;
     std::vector<std::pair<const ggml_tensor *, ggml_tensor>> witnesses;
 
-    bool matches() const {
+    bool matches_binding(uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) const {
+        return source_graph_uid == source_uid && split_graph_uid == split_uid &&
+            allocator_generation == generation && copy_index == copy;
+    }
+
+    bool matches(uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) const {
+        if (!matches_binding(source_uid, split_uid, generation, copy)) { return false; }
         for (const auto & witness : witnesses) {
             if (!ggml_moe_source_tensor_matches(*witness.first, witness.second)) { return false; }
         }
@@ -842,10 +992,11 @@ struct ggml_backend_sched_hybrid {
         for (auto & session : split_sessions) { visit(session.get()); }
     }
 
-    ggml_backend_sched_hybrid * find_split(uint32_t split_index) {
+    ggml_backend_sched_hybrid * find_split(uint32_t split_index, uint64_t source_uid, uint64_t split_uid, uint64_t generation, uint32_t copy) {
         ggml_backend_sched_hybrid * found = nullptr;
         each_session([&](ggml_backend_sched_hybrid * session) {
-            if (!session->regions.empty() && session->regions.front().split_index == split_index) { found = session; }
+            if (!session->regions.empty() && session->regions.front().split_index == split_index &&
+                    session->regions.front().matches_binding(source_uid, split_uid, generation, copy)) { found = session; }
         });
         return found;
     }
@@ -1030,6 +1181,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_copy_callback callback_copy;
+    void * callback_copy_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1582,11 +1736,12 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
     }
     if (n_regions >= selected->max_regions) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
     auto * root = selected;
-    if (selected->source_api) {
-        if (auto * found = selected->find_split(region->split_index)) { selected = found; }
-    }
     uint64_t allocator_generation = 0, shrink_generation = 0;
     ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    if (selected->source_api) {
+        if (auto * found = selected->find_split(region->split_index, region->source_graph_uid,
+                region->split_graph_uid, allocator_generation, sched->cur_copy)) { selected = found; }
+    }
     if (region->split_graph_uid != split.graph.uid || sched->backends[split.backend_id] != selected->backend ||
             region->allocator_generation != allocator_generation ||
             region->first_node > region->last_node || region->first_node < uint32_t(split.i_start) ||
@@ -1667,7 +1822,9 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
         }
     }
     std::unique_ptr<ggml_backend_sched_hybrid> pending;
-    if (root->source_api && selected == root && !root->regions.empty() && root->regions.front().split_index != region->split_index) {
+    if (root->source_api && selected == root && !root->regions.empty() &&
+            (root->regions.front().split_index != region->split_index || !root->regions.front().matches_binding(
+                region->source_graph_uid, region->split_graph_uid, allocator_generation, sched->cur_copy))) {
         root->split_sessions.reserve(root->split_sessions.size() + 1);
         const auto status = ggml_backend_sched_moe_hybrid_create(&root->config, root->source_cpu, pending);
         if (status) { return status; }
@@ -1682,6 +1839,9 @@ int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
         ~preparation_guard() { if (!published) { state.release(region); } }
     } guard{state, prepared};
     prepared.split_index = region->split_index;
+    prepared.copy_index = sched->cur_copy;
+    prepared.source_graph_uid = region->source_graph_uid;
+    prepared.split_graph_uid = region->split_graph_uid;
     prepared.allocator_generation = allocator_generation;
     prepared.cpu.resize(uint64_t(region->n_cpu_queries) + region->n_cpu_batch_queries);
     prepared.witnesses.reserve(region->query->n_body_nodes * (GGML_MAX_SRC + 1));
@@ -2707,56 +2867,6 @@ static void ggml_backend_sched_input_ranges(const struct ggml_tensor * input, st
     }
 }
 
-static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_graph_execution_certificate * certificate) {
-    static_assert(sizeof(struct ggml_graph_execution_certificate) == 96, "unexpected graph execution certificate size");
-
-    if (certificate == nullptr ||
-            certificate->magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
-            certificate->abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
-            certificate->struct_size != sizeof(*certificate) ||
-            (certificate->flags & ~GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0 ||
-            certificate->domain < GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
-            certificate->domain > GGML_GRAPH_EXECUTION_DOMAIN_MTP ||
-            certificate->row_semantics < GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
-            certificate->row_semantics > GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE ||
-            certificate->n_rows == 0 || certificate->n_sequences == 0 ||
-            certificate->owner_namespace == 0 || certificate->owner_generation == 0 ||
-            certificate->source_graph_uid != 0 || certificate->split_graph_uid != 0) {
-        return false;
-    }
-
-    for (size_t i = 0; i < sizeof(certificate->reserved)/sizeof(certificate->reserved[0]); ++i) {
-        if (certificate->reserved[i] != 0) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool ggml_backend_sched_hybrid_certificate_supported(
-        const ggml_graph_execution_certificate & certificate, bool source) {
-    const bool main = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
-    const bool required = certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
-    if (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL) {
-        return main || (source && required && certificate.n_sequences <= certificate.n_rows);
-    }
-    if (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT) {
-        return certificate.n_sequences == certificate.n_rows && (source || certificate.n_rows == 1) &&
-            (main ? certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE : source && required);
-    }
-    return main && required && certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
-        certificate.n_rows > 1 && certificate.n_sequences < certificate.n_rows;
-}
-
-static struct ggml_graph_execution_certificate ggml_backend_sched_split_certificate(
-        uint64_t source_graph_uid, uint64_t split_graph_uid, struct ggml_graph_execution_certificate certificate) {
-    if (certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) { return {}; }
-    certificate.source_graph_uid = source_graph_uid;
-    certificate.split_graph_uid = split_graph_uid;
-    return certificate;
-}
-
 static enum ggml_status ggml_backend_sched_hybrid_dispatch_prepare(
         ggml_backend_sched_t sched, int split_id, uint64_t source_graph_uid,
         const struct ggml_graph_execution_certificate & certificate, ggml_backend_sched_hybrid ** output) {
@@ -2771,21 +2881,25 @@ static enum ggml_status ggml_backend_sched_hybrid_dispatch_prepare(
             certificate.row_semantics, certificate.n_rows, certificate.n_sequences, certificate.flags);
         return GGML_STATUS_FAILED;
     }
-    auto * selected = sched->hybrids[sched->splits[split_id].backend_id];
-    if (selected && selected->source_api) { selected = selected->find_split(split_id); }
-    if (selected) { selected->dispatch.clear(); }
     uint64_t allocator_generation = 0, shrink_generation = 0;
     ggml_backend_sched_get_buffer_state(sched, &allocator_generation, &shrink_generation);
+    auto * selected = sched->hybrids[sched->splits[split_id].backend_id];
+    if (selected && selected->source_api) {
+        selected = selected->find_split(split_id, source_graph_uid, sched->splits[split_id].graph.uid, allocator_generation, sched->cur_copy);
+    }
+    if (selected) { selected->dispatch.clear(); }
     bool valid = true;
     for (int i = 0; i < sched->n_backends; ++i) {
         auto * root = sched->hybrids[i];
         if (!root) { continue; }
         root->each_session([&](ggml_backend_sched_hybrid * entry) {
             for (const auto & region : entry->regions) {
-                if (region.allocator_generation != allocator_generation || !region.matches()) {
-                    GGML_LOG_ERROR("%s: hybrid region storage witness rejected: graph_uid=%llu split=%d region_split=%u generation=%llu expected_generation=%llu\n",
+                if (region.split_index >= uint32_t(sched->n_splits) || !region.matches(source_graph_uid,
+                        sched->splits[region.split_index].graph.uid, allocator_generation, sched->cur_copy)) {
+                    GGML_LOG_ERROR("%s: hybrid region storage witness rejected: graph_uid=%llu split=%d region_split=%u generation=%llu expected_generation=%llu copy=%u expected_copy=%d\n",
                         __func__, (unsigned long long) source_graph_uid, split_id, region.split_index,
-                        (unsigned long long) region.allocator_generation, (unsigned long long) allocator_generation);
+                        (unsigned long long) region.allocator_generation, (unsigned long long) allocator_generation,
+                        region.copy_index, sched->cur_copy);
                     valid = false; return;
                 }
                 if (region.split_index == uint32_t(split_id)) {
@@ -2814,6 +2928,139 @@ static enum ggml_status ggml_backend_sched_dispatch_split(
         ggml_backend_graph_compute_async(backend, graph);
     graph->execution_certificate = {};
     return status;
+}
+
+struct ggml_backend_sched_expert_copy_state {
+    const ggml_tensor * ids = nullptr;
+    int64_t n_expert = 0;
+    std::vector<int32_t> ids_data;
+    std::vector<ggml_bitset_t> used;
+};
+
+static bool ggml_backend_sched_copy_selected_experts(
+        ggml_backend_t input_backend, ggml_backend_t backend, const ggml_tensor * src,
+        ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_expert_copy_state & st) {
+    if (graph->n_nodes == 0) { return false; }
+    const ggml_tensor * node = graph->nodes[0];
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) { return false; }
+    const ggml_tensor * ids = node->src[2];
+    if (ggml_nelements(ids) == 0) { return true; }
+    const int64_t n_expert = src->ne[2];
+    const size_t expert_size = src->nb[2];
+    ggml_backend_synchronize(input_backend);
+    if (ids != st.ids || n_expert != st.n_expert) {
+        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+        st.used.assign(ggml_bitset_size(n_expert), 0);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                ggml_bitset_set(st.used.data(), id);
+            }
+        }
+        st.ids = ids;
+        st.n_expert = n_expert;
+    }
+    for (int64_t first = 0; first < n_expert;) {
+        if (!ggml_bitset_get(st.used.data(), first)) { ++first; continue; }
+        int64_t last = first;
+        while (last + 1 < n_expert && ggml_bitset_get(st.used.data(), last + 1)) { ++last; }
+        const size_t offset = first*expert_size;
+        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t size = (last + 1 - first)*expert_size + padding;
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *)src->data + offset, offset, size);
+        first = last + 1;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+    return t->buffer != NULL &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(t->buffer);
+}
+
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool source_input_batch, bool & source_input_pending, ggml_backend_sched_expert_copy_state & expert_copy) {
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+    ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    auto * input_cpy_buffer = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+    const bool source_async_input = source_input_batch && split_backend->iface.set_tensor_async &&
+        input->buffer && ggml_backend_buffer_is_host(input->buffer) && input_cpy_buffer &&
+        input_cpy_buffer->buft == ggml_backend_get_default_buffer_type(split_backend);
+    auto copy_input = [&]() {
+        if (source_async_input) {
+            GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
+            if (input == input_cpy) { return; }
+            const size_t bytes = ggml_nbytes(input);
+            if (bytes) {
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, bytes);
+                source_input_pending = true;
+            }
+        } else {
+            if (source_input_pending) {
+                ggml_backend_synchronize(split_backend);
+                source_input_pending = false;
+            }
+            ggml_backend_tensor_copy(input, input_cpy);
+        }
+    };
+
+    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else if (!source_input_batch) {
+            ggml_backend_synchronize(split_backend);
+        }
+        copy_input();
+        return;
+    }
+
+    // wait for the split backend to finish using the input before overwriting it
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+    } else if (!source_input_batch) {
+        ggml_backend_synchronize(split_backend);
+    }
+
+    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
+    if (sched->callback_copy == nullptr && ggml_backend_sched_is_host_weight(input) &&
+            ggml_backend_sched_copy_selected_experts(input_backend, split_backend, input, input_cpy, &split->graph, expert_copy)) {
+        return;
+    }
+
+    ggml_backend_buffer_t src_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+    ggml_backend_sched_ranges ranges;
+    ggml_backend_sched_input_ranges(input, &ranges);
+    const bool ranged = ranges.n > 1 && src_buffer && ggml_backend_buffer_is_host(src_buffer);
+
+    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+    if (ranged || !split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        ggml_backend_synchronize(input_backend);
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else if (ranged || !source_async_input) {
+            ggml_backend_synchronize(split_backend);
+            source_input_pending = false;
+        }
+        if (ranged) {
+            ggml_backend_tensor_set_2d_async(split_backend, input_cpy, input->data, 0,
+                ranges.used, ranges.n, ranges.stride, ranges.stride);
+            ggml_backend_synchronize(split_backend);
+            source_input_pending = false;
+        } else {
+            copy_input();
+        }
+    }
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(
@@ -2884,9 +3131,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
     }
 
-    ggml_tensor * prev_ids_tensor = nullptr;
-    std::vector<int32_t> ids;
-    std::vector<ggml_bitset_t> used_ids;
+    ggml_backend_sched_expert_copy_state expert_copy;
 
     int prev_backend_id = -1;
 
@@ -2919,167 +3164,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(
             ggml_backend_synchronize(split_backend);
         }
         bool source_input_pending = false;
-        const auto source_input_buft = source_input_batch ? ggml_backend_get_default_buffer_type(split_backend) : nullptr;
 
         // copy the input tensors to the split backend
+        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
-            struct ggml_tensor * input = split->inputs[input_id];
-            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-            auto * input_cpy_buffer = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
-            const bool source_async_input = source_input_batch && split_backend->iface.set_tensor_async &&
-                input->buffer && ggml_backend_buffer_is_host(input->buffer) && input_cpy_buffer &&
-                input_cpy_buffer->buft == source_input_buft;
-            auto copy_input = [&]() {
-                if (source_async_input) {
-                    GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
-                    if (input == input_cpy) { return; }
-                    const size_t bytes = ggml_nbytes(input);
-                    if (bytes) {
-                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, bytes);
-                        source_input_pending = true;
-                    }
-                } else {
-                    if (source_input_pending) {
-                        ggml_backend_synchronize(split_backend);
-                        source_input_pending = false;
-                    }
-                    ggml_backend_tensor_copy(input, input_cpy);
-                }
-            };
-
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // complete user input copies before dispatch or return so the user can overwrite the data
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else if (!source_input_batch) {
-                    ggml_backend_synchronize(split_backend);
-                }
-                copy_input();
-            } else {
-                // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else if (!source_input_batch) {
-                    ggml_backend_synchronize(split_backend);
-                }
-
-                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
-
-                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
-                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
-
-                    ggml_backend_synchronize(input_backend);
-
-                    // get the ids
-                    ggml_tensor * ids_tensor = node->src[2];
-                    ggml_backend_t ids_backend = split_backend;
-
-                    if (ggml_nelements(ids_tensor) == 0) {
-                        continue;
-                    }
-
-                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
-                    // in that case, we use the original ids tensor
-                    for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
-                            ids_tensor = split->inputs[i];
-                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
-                            break;
-                        }
-                    }
-
-                    if (ids_tensor != prev_ids_tensor) {
-                        ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
-
-                        // find the used experts
-                        used_ids.clear();
-                        used_ids.resize(ggml_bitset_size(n_expert));
-                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
-                                ggml_bitset_set(used_ids.data(), id);
-                            }
-                        }
-
-                        prev_ids_tensor = ids_tensor;
-                    }
-
-                    // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
-
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
-                    };
-
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
-                        }
-
-                        if (id == last_id + 1) {
-                            last_id = id;
-                            continue;
-                        }
-
-                        copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
-                    }
-                    copy_experts(first_id, last_id);
-                } else {
-                    // ggml_backend_tensor_copy moves ggml_nbytes(), which for a window over several streams is the span the ranges are cut from, gaps and all
-                    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
-                    struct ggml_backend_sched_ranges rg;
-                    ggml_backend_sched_input_ranges(input, &rg);
-                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf);
-
-                    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
-                    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (ranged || !split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else if (ranged || !source_async_input) {
-                            ggml_backend_synchronize(split_backend);
-                            source_input_pending = false;
-                        }
-                        if (ranged) {
-                            // blocking like the copy it replaces: the split backend is idle here, so the ranges go on its own stream and the host waits for them
-                            ggml_backend_tensor_set_2d_async(split_backend, input_cpy, input->data, 0, rg.used, rg.n, rg.stride, rg.stride);
-                            ggml_backend_synchronize(split_backend);
-                            source_input_pending = false;
-                        } else {
-                            copy_input();
-                        }
-                    }
-                }
+            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], source_input_batch, source_input_pending, expert_copy);
+            }
+        }
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], source_input_batch, source_input_pending, expert_copy);
             }
         }
         if (source_input_pending) {
@@ -3568,6 +3663,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy = callback;
+    sched->callback_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
@@ -4300,12 +4401,14 @@ static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft
 ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type = {
         /* .iface   = */ {
-            /* .get_name         = */ ggml_backend_cpu_buffer_type_get_name,
-            /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
-            /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_name            = */ ggml_backend_cpu_buffer_type_get_name,
+            /* .alloc_buffer        = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_cpu_buffer_type_get_alignment,
+            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,
@@ -4323,12 +4426,14 @@ static const char * ggml_backend_cpu_buffer_from_ptr_type_get_name(ggml_backend_
 static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type = {
         /* .iface   = */ {
-            /* .get_name         = */ ggml_backend_cpu_buffer_from_ptr_type_get_name,
-            /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
-            /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_name            = */ ggml_backend_cpu_buffer_from_ptr_type_get_name,
+            /* .alloc_buffer        = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_cpu_buffer_type_get_alignment,
+            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,
