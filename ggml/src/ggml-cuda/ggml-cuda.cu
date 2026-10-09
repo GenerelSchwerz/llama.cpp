@@ -3503,6 +3503,169 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+static bool ggml_cuda_prepared_bytes(const ggml_tensor * tensor, size_t & bytes) {
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (tensor->ne[d] <= 0) { return false; }
+    }
+    const size_t block = ggml_blck_size(tensor->type);
+    bytes = ggml_type_size(tensor->type);
+    int first = 0;
+    if (block > 1) {
+        if (!tensor->nb[0] || uint64_t(tensor->ne[0]) > SIZE_MAX/tensor->nb[0] || tensor->ne[0] % block) {
+            return false;
+        }
+        bytes = size_t(tensor->ne[0])*tensor->nb[0]/block;
+        first = 1;
+    }
+    for (int d = first; d < GGML_MAX_DIMS; ++d) {
+        const uint64_t count = tensor->ne[d] - 1;
+        if (count && tensor->nb[d] > (SIZE_MAX - bytes)/count) { return false; }
+        bytes += size_t(count)*tensor->nb[d];
+    }
+    return bytes && bytes == ggml_nbytes(tensor);
+}
+
+static bool ggml_cuda_prepared_range(const ggml_tensor * tensor, int device, uintptr_t & begin, uintptr_t & end) {
+    if (!tensor->buffer || !tensor->data || tensor->buffer->buft != ggml_backend_cuda_buffer_type(device)) {
+        return false;
+    }
+    const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const size_t size = ggml_backend_buffer_get_size(tensor->buffer);
+    size_t bytes;
+    if (!ggml_cuda_prepared_bytes(tensor, bytes)) { return false; }
+    begin = (uintptr_t) tensor->data;
+    if (begin < base || begin - base > size || bytes > size - (begin - base) || begin > UINTPTR_MAX - bytes) {
+        return false;
+    }
+    if (tensor->view_src) {
+        const ggml_tensor * root = tensor->view_src;
+        const uintptr_t root_begin = (uintptr_t) root->data;
+        size_t root_bytes;
+        if (!ggml_cuda_prepared_bytes(root, root_bytes)) { return false; }
+        if (root->view_src || root->buffer != tensor->buffer || !root->data || root_begin < base || root_begin - base > size ||
+                root_bytes > size - (root_begin - base) || tensor->view_offs > root_bytes || bytes > root_bytes - tensor->view_offs ||
+                root_begin > UINTPTR_MAX - tensor->view_offs || begin != root_begin + tensor->view_offs) {
+            return false;
+        }
+    }
+    end = begin + bytes;
+    return true;
+}
+
+
+static bool ggml_cuda_can_emit_glu_mmq_id(const ggml_tensor * dst, int device) {
+    if (dst->op != GGML_OP_GLU || dst->type != GGML_TYPE_F32 || !(dst->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_is_contiguous(dst) || dst->ne[0] % QK8_1) { return false; }
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU: case GGML_GLU_OP_GEGLU: case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF: case GGML_GLU_OP_GEGLU_QUICK:
+        case GGML_GLU_OP_SWIGLU_OAI: case GGML_GLU_OP_SWIGLU_CLAMP: break;
+        default: return false;
+    }
+    uintptr_t begin, end;
+    if (!ggml_cuda_prepared_range(dst, device, begin, end) || begin % sizeof(float) ||
+            (end - begin)/sizeof(float) > INT_MAX) { return false; }
+    for (const ggml_tensor * read : { dst->src[0], dst->src[1] }) {
+        if (!read) { continue; }
+        uintptr_t read_begin, read_end;
+        if (read->type != GGML_TYPE_F32 || read->nb[0] != sizeof(float) || read->nb[1] % sizeof(float) ||
+                !ggml_is_contiguous_1(read) || ggml_nrows(read) != ggml_nrows(dst) ||
+                !ggml_cuda_prepared_range(read, device, read_begin, read_end) || read_begin % sizeof(float) ||
+                (read_end - read_begin)/sizeof(float) > INT_MAX || (begin < read_end && read_begin < end)) { return false; }
+    }
+    return true;
+}
+
+struct ggml_cuda_glu_mmq_id_emit { int image = -1, route = -1, reader = -1; };
+
+static std::vector<ggml_cuda_glu_mmq_id_emit> ggml_cuda_plan_glu_mmq_id(ggml_cgraph * graph, int device,
+        const ggml_cuda_stream_context & streams, const std::vector<int> & keys, const std::vector<size_t> & route_sizes,
+        const std::vector<size_t> & image_sizes, ggml_cuda_reuse_plan & routes, ggml_cuda_reuse_plan & reuse,
+        std::vector<bool> & inverse) {
+    if (keys.empty() || !streams.concurrent_events.empty()) { return {}; }
+    size_t route_budget = 0, image_budget = 0;
+    for (const auto & group : routes.groups) {
+        if (group.size > SIZE_MAX - route_budget) { return {}; }
+        route_budget += group.size;
+    }
+    for (const auto & group : reuse.groups) {
+        if (group.size > SIZE_MAX - image_budget) { return {}; }
+        image_budget += group.size;
+    }
+    std::unordered_map<const ggml_tensor *, int> indices;
+    for (int i = 0; i < graph->n_nodes; ++i) { indices[graph->nodes[i]] = i; }
+    std::vector<ggml_cuda_glu_mmq_id_emit> emits(graph->n_nodes);
+    inverse.resize(routes.groups.size(), false);
+    bool moved = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * dst = graph->nodes[i];
+        if (!ggml_cuda_can_emit_glu_mmq_id(dst, device)) { continue; }
+        for (int j = i + 1; j < graph->n_nodes; ++j) {
+            if (keys[j] < 0 || keys[j] > 3) { continue; }
+            const ggml_tensor * reader = graph->nodes[j], * input = reader->src[1], * ids = reader->src[2];
+            const ggml_tensor * root = input->view_src ? input->view_src : input;
+            const int group_width = keys[j] == int(MMQ_Q8_1_DS_LAYOUT_D2S6) ? 64 : 32;
+            uintptr_t begin, end, ids_begin, ids_end;
+            if (root != dst || input->data != dst->data || !ggml_is_contiguous(input) ||
+                    ggml_nbytes(input) != ggml_nbytes(dst) || input->ne[0] % group_width ||
+                    input->ne[1] <= 0 || input->ne[1] > INT_MAX || ids->ne[0] <= 0 || ids->ne[0] > INT_MAX ||
+                    !ggml_cuda_prepared_range(input, device, begin, end) ||
+                    !ggml_cuda_prepared_range(ids, device, ids_begin, ids_end) ||
+                    (begin < ids_end && ids_begin < end)) { continue; }
+            const ggml_tensor * id_root = ids->view_src ? ids->view_src : ids;
+            const auto found = indices.find(id_root);
+            if (found == indices.end() ? id_root->op != GGML_OP_NONE : found->second >= i) { continue; }
+            int image = reuse.nodes.empty() ? -1 : reuse.nodes[j];
+            int route = routes.nodes.empty() ? -1 : routes.nodes[j];
+            const int prepare = image < 0 ? j : reuse.groups[image].prepare;
+            bool safe = prepare > i;
+            for (int k = i; safe && k <= prepare; ++k) {
+                safe = !ggml_cuda_mmq_id_input_overwritten(graph->nodes[k], ids) &&
+                    (k == i || !ggml_cuda_mmq_id_input_overwritten(graph->nodes[k], input));
+            }
+            if (!safe) { continue; }
+            const size_t rows = size_t(input->ne[2])*size_t(ids->ne[0]);
+            if (rows > (SIZE_MAX - 255)/sizeof(int32_t)) { continue; }
+            const size_t extra = input->ne[1] == 1 && ids->ne[0] > 1 ? 0 : GGML_PAD(rows*sizeof(int32_t), 256);
+            const size_t add_route = route < 0 ? GGML_PAD(route_sizes[j], 256) : 0;
+            const size_t add_image = image < 0 ? GGML_PAD(image_sizes[j], 256) : 0;
+            const bool add_inverse = route < 0 || !inverse[route];
+            if (add_route > SIZE_MAX - route_budget || (add_inverse && extra > SIZE_MAX - route_budget - add_route) ||
+                    add_image > SIZE_MAX - image_budget) { continue; }
+            if (routes.nodes.empty()) { routes.nodes.assign(graph->n_nodes, -1); routes.starts.assign(graph->n_nodes, -1); }
+            if (reuse.nodes.empty()) { reuse.nodes.assign(graph->n_nodes, -1); reuse.starts.assign(graph->n_nodes, -1); }
+            if (route < 0) {
+                route = int(routes.groups.size());
+                routes.groups.push_back({j, i, j, -1, false, add_route});
+                inverse.push_back(false);
+                routes.nodes[j] = route;
+                route_budget += add_route;
+            }
+            if (image < 0) {
+                image = int(reuse.groups.size());
+                reuse.groups.push_back({j, i, j, -1, true, add_image});
+                reuse.nodes[j] = image;
+                image_budget += add_image;
+            }
+            auto & map = routes.groups[route];
+            auto & buffer = reuse.groups[image];
+            map.prepare = std::min(map.prepare, i);
+            map.after = false;
+            map.last = std::max(map.last, buffer.last);
+            if (!inverse[route]) { map.size += extra; route_budget += extra; inverse[route] = true; }
+            buffer.prepare = i;
+            buffer.after = true;
+            emits[i] = {image, route, j};
+            moved = true;
+            break;
+        }
+    }
+    if (!moved) { return {}; }
+    routes.pack();
+    reuse.pack();
+    return emits;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4386,15 +4549,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             ggml_cuda_reuse_plan routes(cgraph, stream_ctx, route_keys, route_sizes, ggml_cuda_mmq_id_input_overwritten);
+            const auto emission_keys = mmq_keys;
             for (size_t i = 0; i < mmq_keys.size(); ++i) {
                 if (routes.nodes.empty() || routes.nodes[i] < 0) { mmq_keys[i] = -1; }
             }
             ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, mmq_keys, mmq_sizes, ggml_cuda_mmq_id_input_overwritten, true);
+            std::vector<bool> route_inverse;
+            const auto emits = ggml_cuda_plan_glu_mmq_id(cgraph, cuda_ctx->device, stream_ctx,
+                emission_keys, route_sizes, mmq_sizes, routes, reuse, route_inverse);
+            for (const auto & emit : emits) {
+                if (emit.reader >= 0) { mmq_keys[emit.reader] = emission_keys[emit.reader]; }
+            }
             ggml_cuda_reuse_inputs<ggml_cuda_mmq_id_input> route_inputs(cuda_ctx->pool(), routes);
             ggml_cuda_reuse_inputs<ggml_cuda_mmq_id_input> shared_inputs(cuda_ctx->pool(), reuse);
             const auto prepare_route = [&](int group) {
                 if (route_inputs[group].ids_src1.get()) { return; }
-                ggml_cuda_prepare_mmq_id_routes(*cuda_ctx, cgraph->nodes[routes.groups[group].node], route_inputs[group], MMQ_ID_INPUT_GUARD);
+                ggml_cuda_prepare_mmq_id_routes(*cuda_ctx, cgraph->nodes[routes.groups[group].node], route_inputs[group], MMQ_ID_INPUT_GUARD, !route_inverse.empty() && route_inverse[group]);
             };
             const auto prepare_group = [&](int group) {
                 if (shared_inputs[group].quantized.get()) { return; }
@@ -4521,6 +4691,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (!emits.empty() && emits[i].image >= 0) {
+                    const auto & emit = emits[i];
+                    prepare_route(emit.route);
+                    auto & mapped = route_inputs[emit.route];
+                    auto & image = shared_inputs[emit.image];
+                    const ggml_tensor * reader = cgraph->nodes[emit.reader];
+                    image.routes = &mapped;
+                    image.quantized.alloc(reuse.groups[emit.image].size);
+                    const int32_t * inverse = mapped.inverse.get() ? mapped.inverse.get() : mapped.ids_src1.get();
+                    ggml_cuda_op_glu_mmq_id(*cuda_ctx, node, reader->src[1], int(reader->src[2]->ne[0]), inverse,
+                        image.quantized.get(), mmq_keys[emit.reader]);
+                    continue;
+                }
                 bool ok;
                 if (group >= 0 && shared_inputs[group].quantized.get()) {
                     ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node, &shared_inputs[group]);

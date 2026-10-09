@@ -144,7 +144,7 @@ size_t ggml_cuda_mmq_id_input_size(const ggml_tensor * node, const int cc) {
 }
 
 void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
-        ggml_cuda_mmq_id_input & input, size_t guard) {
+        ggml_cuda_mmq_id_input & input, size_t guard, bool inverse) {
     const ggml_tensor * src1 = node->src[1];
     const ggml_tensor * ids = node->src[2];
     const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2], ne02 = node->src[0]->ne[2];
@@ -158,8 +158,9 @@ void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml
     const int si1 = ids->nb[1]/ggml_element_size(ids);
     const int sis1 = src1->nb[2]/src1->nb[1];
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    if (inverse && !dedup_bcast) { input.inverse.alloc(ne_get_rows); }
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, input.ids_src1.ptr, input.ids_dst.ptr, input.expert_bounds.ptr,
-        ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, ctx.stream());
+        ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, ctx.stream(), input.inverse.get());
     CUDA_CHECK(cudaGetLastError());
 }
 

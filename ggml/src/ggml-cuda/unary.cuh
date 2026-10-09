@@ -121,3 +121,5 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+void ggml_cuda_op_glu_mmq_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * input, int used, const int32_t * inverse, void * image, int layout);

@@ -5390,11 +5390,22 @@ struct test_mul_mat_id_fusion : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k + (reuse_case == 6 ? 8 : 0), this->b ? 1 : n_used, n);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k + (reuse_case == 6 ? 8 : 0), reuse_case == 18 ? n_used/2 : this->b ? 1 : n_used, n);
         if (reuse_case == 6) {
             b = ggml_view_3d(ctx, b, k, b->ne[1], n, b->nb[1], b->nb[2], 0);
         }
         ggml_set_name(b, "b");
+        if (reuse_case >= 9) {
+            if (reuse_case == 10 || reuse_case == 11) {
+                b = ggml_glu(ctx, ggml_new_tensor_3d(ctx, type_b, 2*k, b->ne[1], n), GGML_GLU_OP_SWIGLU, reuse_case == 11);
+            } else {
+                ggml_tensor * up = ggml_new_tensor_3d(ctx, type_b, k, b->ne[1], n);
+                const ggml_glu_op ops[] = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK };
+                b = reuse_case == 16 ? ggml_swiglu_oai(ctx, b, up, 1.234f, 7.0f) : reuse_case == 17 ? ggml_swiglu_clamp(ctx, b, up, 7.0f) : ggml_glu_split(ctx, b, up, ops[reuse_case == 9 || reuse_case == 18 ? 0 : reuse_case - 11]);
+            }
+            ggml_set_output(b);
+            ggml_build_forward_expand(gf, b);
+        }
         ggml_tensor * inputs[] = {b, nullptr, nullptr, nullptr};
         if (reuse_case == 8) {
             for (int i = 1; i < 4; ++i) { inputs[i] = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n); }
@@ -10485,6 +10496,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q8_0}) {
+        for (bool broadcast : {false, true}) {
+            for (int mode = 9; mode <= 18; ++mode) {
+                if (mode == 18 && broadcast) { continue; }
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 4, broadcast, 64, 33, 256, 2, false, mode, GGML_PREC_Q8));
+            }
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 4, broadcast, 64, 33, 256, 1, false, 9, GGML_PREC_Q8));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16}) {
         for (int64_t n : {1, 9, 32, 129}) {
             for (bool broadcast : {false, true}) {

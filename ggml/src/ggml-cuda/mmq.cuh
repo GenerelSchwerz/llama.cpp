@@ -1622,15 +1622,16 @@ struct ggml_cuda_mmq_id_input {
     ggml_cuda_pool_alloc<int32_t> ids_src1;
     ggml_cuda_pool_alloc<int32_t> ids_dst;
     ggml_cuda_pool_alloc<int32_t> expert_bounds;
+    ggml_cuda_pool_alloc<int32_t> inverse;
     ggml_cuda_pool_alloc<char> quantized;
     ggml_cuda_pool_alloc<float> scale;
 
-    explicit ggml_cuda_mmq_id_input(ggml_cuda_pool & pool) : ids_src1(pool), ids_dst(pool), expert_bounds(pool), quantized(pool), scale(pool) {}
+    explicit ggml_cuda_mmq_id_input(ggml_cuda_pool & pool) : ids_src1(pool), ids_dst(pool), expert_bounds(pool), inverse(pool), quantized(pool), scale(pool) {}
 };
 
 ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
 size_t ggml_cuda_mmq_id_input_size(const ggml_tensor * node, int cc);
-void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_cuda_mmq_id_input & input, size_t guard = 0);
+void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_cuda_mmq_id_input & input, size_t guard = 0, bool inverse = false);
 void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node, size_t size, ggml_cuda_mmq_id_input & input, const ggml_cuda_mmq_id_input * routes = nullptr);
 
 void ggml_cuda_mul_mat_q(
