@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -731,5 +732,75 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const half *)src->data, (half *)sqr_node->data, k, stream);
     } else {
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
+    }
+}
+
+
+template <ggml_glu_op Op>
+static __device__ __forceinline__ float ggml_cuda_glu_q8_value(float gate, float up, float alpha, float limit) {
+    if constexpr (Op == GGML_GLU_OP_REGLU) { return op_relu(gate)*up; }
+    else if constexpr (Op == GGML_GLU_OP_GEGLU) { return op_gelu(gate)*up; }
+    else if constexpr (Op == GGML_GLU_OP_SWIGLU) { return op_silu(gate)*up; }
+    else if constexpr (Op == GGML_GLU_OP_GEGLU_ERF) { return op_gelu_erf(gate)*up; }
+    else if constexpr (Op == GGML_GLU_OP_GEGLU_QUICK) { return op_gelu_quick(gate)*up; }
+    else if constexpr (Op == GGML_GLU_OP_SWIGLU_OAI) { return ggml_cuda_op_swiglu_oai_single(gate, up, alpha, limit); }
+    else { return ggml_cuda_op_swiglu_clamp_single(gate, up, limit); }
+}
+
+
+template <ggml_glu_op Op, typename Store>
+static __global__ void glu_mmq_f32(const float * gate, const float * up, float * dst, int64_t elements,
+        int64_t columns, int64_t gate_stride, int64_t up_stride, float alpha, float limit, Store store) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = 4*(int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+    if (i >= elements) { return; }
+    const int64_t j0 = (i/columns)*gate_stride + i%columns;
+    const int64_t j1 = gate_stride == up_stride ? j0 : (i/columns)*up_stride + i%columns;
+    ggml_cuda_pdl_sync();
+    const float4 value = make_float4(
+        ggml_cuda_glu_q8_value<Op>(gate[j0], up[j1], alpha, limit),
+        ggml_cuda_glu_q8_value<Op>(gate[j0 + 1], up[j1 + 1], alpha, limit),
+        ggml_cuda_glu_q8_value<Op>(gate[j0 + 2], up[j1 + 2], alpha, limit),
+        ggml_cuda_glu_q8_value<Op>(gate[j0 + 3], up[j1 + 3], alpha, limit));
+    store(dst, dst, int(i), value);
+}
+
+template <ggml_glu_op Op, typename Store>
+static void ggml_cuda_glu_mmq_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, Store store) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const int64_t width = dst->ne[0];
+    const bool swapped = ggml_get_op_params_i32(dst, 1);
+    const float * gate = (const float *) a->data + (!b && swapped ? width : 0);
+    const float * up = b ? (const float *) b->data : (const float *) a->data + (swapped ? 0 : width);
+    const int64_t elements = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params params(dim3((elements + 4*CUDA_GLU_BLOCK_SIZE - 1)/(4*CUDA_GLU_BLOCK_SIZE)), CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(glu_mmq_f32<Op, Store>, params, gate, up, (float *) dst->data, elements, width,
+        a->nb[1]/sizeof(float), (b ? b->nb[1] : a->nb[1])/sizeof(float),
+        ggml_get_op_params_f32(dst, 2), ggml_get_op_params_f32(dst, 3), store);
+}
+
+template <typename Store>
+static void ggml_cuda_glu_mmq_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, Store store) {
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_REGLU>(ctx, dst, store); break;
+        case GGML_GLU_OP_GEGLU: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_GEGLU>(ctx, dst, store); break;
+        case GGML_GLU_OP_SWIGLU: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_SWIGLU>(ctx, dst, store); break;
+        case GGML_GLU_OP_GEGLU_ERF: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_GEGLU_ERF>(ctx, dst, store); break;
+        case GGML_GLU_OP_GEGLU_QUICK: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_GEGLU_QUICK>(ctx, dst, store); break;
+        case GGML_GLU_OP_SWIGLU_OAI: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_SWIGLU_OAI>(ctx, dst, store); break;
+        case GGML_GLU_OP_SWIGLU_CLAMP: ggml_cuda_glu_mmq_launch<GGML_GLU_OP_SWIGLU_CLAMP>(ctx, dst, store); break;
+        default: GGML_ABORT("unsupported GLU image producer");
+    }
+}
+
+void ggml_cuda_op_glu_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        void * image, int64_t columns, int64_t padded, int64_t rows, int layout) {
+    switch (layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_glu_mmq_dispatch(ctx, dst, ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_D4>{(block_q8_1_mmq *) image, columns, padded, rows}); break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_glu_mmq_dispatch(ctx, dst, ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_DS4>{(block_q8_1_mmq *) image, columns, padded, rows}); break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_glu_mmq_dispatch(ctx, dst, ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_D2S6>{(block_q8_1_mmq *) image, columns, padded, rows}); break;
+        case 3: ggml_cuda_glu_mmq_dispatch(ctx, dst, ggml_cuda_norm_mxfp4_store{(block_fp4_mmq *) image, columns, padded, rows}); break;
+        default: GGML_ABORT("unsupported MMQ image layout");
     }
 }
