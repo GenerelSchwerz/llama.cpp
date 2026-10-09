@@ -27,6 +27,9 @@ This fork should inherit future llama.cpp model, operator, backend and server im
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+> [!NOTE]
+> Upstream submission restrictions apply to ggml-org/llama.cpp. In this fork, the Fork Automation Policy and Generic features and upstream maintenance requirements above remain applicable, together with the quality and review requirements below.
+
 ---
 
 ## Guidelines for Contributors

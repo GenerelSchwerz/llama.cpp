@@ -1803,7 +1803,7 @@ struct ggml_cuda_mmq_input {
 size_t ggml_cuda_mmq_input_size(const ggml_tensor * node, int cc);
 
 void ggml_cuda_quantize_mmq_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
-        size_t size, ggml_cuda_mmq_input & input);
+        size_t size, ggml_cuda_mmq_input & input, const ggml_tensor * logical_src1 = nullptr);
 
 // MMQ can read a full tile past the last routed row.
 static constexpr size_t MMQ_ID_INPUT_GUARD = 128;
@@ -1827,7 +1827,7 @@ void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mmq_input * input = nullptr, const ggml_cuda_mmq_id_input * routed_input = nullptr, const ggml_cuda_mmid_execution * execution = nullptr);
+        const ggml_cuda_mmq_input * input = nullptr, const ggml_cuda_mmq_id_input * routed_input = nullptr, const ggml_cuda_mmid_execution * execution = nullptr, const int64_t * quantized_ne = nullptr);
 
 void ggml_cuda_mul_mat_q_mapped(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,

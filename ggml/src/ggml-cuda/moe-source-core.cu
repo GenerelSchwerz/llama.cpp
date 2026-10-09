@@ -171,6 +171,11 @@ static __device__ void release(source_flag * flag) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*value).store(1, cuda::memory_order_release);
 }
 
+static __global__ void publish_result(const source_runtime * runtime, source_runtime * result, source_flag * complete) {
+    *result = *runtime;
+    release(complete);
+}
+
 static __global__ void decide_phase(source_runtime * runtime, const source_control * control, cudaGraphConditionalHandle handle, bool initialize) {
     const bool stopped = control && acquire(&control->stop);
     if (initialize) {
@@ -480,6 +485,7 @@ struct core_session {
     uint8_t * host = nullptr, * alias = nullptr, * cancel_alias = nullptr;
     size_t device_bytes = 0, pinned_bytes = 0;
     size_t runtime_offset = 0, host_runtime_offset = 0;
+    size_t host_completion_offset = SIZE_MAX;
     size_t scratch_offset = 0, quant_offset = 0, selected_offset = 0, cpu_device_offset = 0;
     size_t pool_offset = 0, pool_bytes = 0, image_bytes = 0, cublas_offset = 0, cublas_bytes = 0;
     cudaStream_t stream = nullptr, io = nullptr;
@@ -582,6 +588,7 @@ struct core_session {
     uint8_t * data() const { return arena ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(arena)) : nullptr; }
     source_runtime * runtime() const { return reinterpret_cast<source_runtime *>(data() + runtime_offset); }
     source_runtime * result() const { return reinterpret_cast<source_runtime *>(host + host_runtime_offset); }
+    source_flag * completion() const { return reinterpret_cast<source_flag *>(host + host_completion_offset); }
     source_control * control(uint32_t i, bool mapped = false) const {
         return reinterpret_cast<source_control *>((mapped ? alias : host) + layers[i].control_offset);
     }
@@ -596,9 +603,45 @@ struct core_session {
         for (;;) {
             const auto status = cudaStreamQuery(target);
             if (status == cudaSuccess) { return true; }
-            if (status != cudaErrorNotReady || now_ns() >= expiry) { return false; }
-            std::this_thread::yield();
+            if (status != cudaErrorNotReady) { return false; }
+            const auto now = now_ns();
+            if (now >= expiry) { return false; }
+            // Keep completion checks prompt without flooding the CUDA driver.
+            const auto next_probe = std::min<uint64_t>(expiry, now + 10'000ull);
+            do { std::this_thread::yield(); } while (now_ns() < next_probe);
         }
+    }
+
+    bool copy_result() {
+#ifdef GGML_MOE_SOURCE_GRAPH
+        if (alias && host_completion_offset != SIZE_MAX) {
+            publish_result<<<1, 1, 0, stream>>>(runtime(), reinterpret_cast<source_runtime *>(alias + host_runtime_offset),
+                reinterpret_cast<source_flag *>(alias + host_completion_offset));
+            return cudaGetLastError() == cudaSuccess;
+        }
+#endif
+        return cudaMemcpyAsync(result(), runtime(), sizeof(source_runtime), cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+    }
+
+    bool wait_result(uint64_t expiry) const {
+        if (!alias || host_completion_offset == SIZE_MAX) { return wait_stream(stream, expiry); }
+        uint64_t last_probe = now_ns();
+        uint32_t spins = 0;
+        while (!completion()->load()) {
+            if (canceled.load(std::memory_order_acquire)) { return false; }
+            std::this_thread::yield();
+            if ((++spins & 1023u) != 0) { continue; }
+            const uint64_t now = now_ns();
+            if (now >= expiry) { return false; }
+            if (now - last_probe >= 2'000'000ull) {
+                last_probe = now;
+                const auto status = progress();
+                if (status == ggml_moe_caller_progress::failed ||
+                        (status == ggml_moe_caller_progress::complete && !completion()->load())) { return false; }
+            }
+        }
+        // The result signal does not release stream or graph ownership.
+        return wait_stream(stream, expiry);
     }
 
     bool stop() {
@@ -1531,6 +1574,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             image_bytes > SIZE_MAX - GGML_PAD(pool_bytes, 256)) { return false; }
     pool_bytes = GGML_PAD(pool_bytes, 256) + image_bytes;
     if (!reserve(pinned_bytes, sizeof(source_runtime), host_runtime_offset) ||
+            (!prefill && !reserve(pinned_bytes, sizeof(source_flag), host_completion_offset)) ||
             !reserve(device_bytes, sizeof(source_runtime), runtime_offset) ||
             !reserve(device_bytes, scratch_bytes, scratch_offset) ||
             !reserve(device_bytes, quant_bytes, quant_offset) ||
@@ -1544,6 +1588,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(config.backend), device_bytes);
     if (!arena || cudaHostAlloc(&host, pinned_bytes, cudaHostAllocMapped) != cudaSuccess) { return false; }
     memset(host, 0, pinned_bytes);
+    if (host_completion_offset != SIZE_MAX) { new (completion()) source_flag(); }
     for (uint32_t i = 0; i < layers.size(); ++i) {
         new (control(i)) source_control();
         if (layers[i].overlap_probe_offset != SIZE_MAX) { new (host + layers[i].overlap_probe_offset) source_flag(); }
@@ -2200,7 +2245,7 @@ bool core_session::capture_program() {
         return (segmented ? capture(graph, stream, dependencies, emit) :
             phase(graph, stream, dependencies, runtime(), nullptr, emit, handle)) &&
             capture(graph, stream, dependencies, [&] {
-                return cudaMemcpyAsync(result(), runtime(), sizeof(source_runtime), cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                return copy_result();
             });
     };
 #if defined(GGML_CUDA_MOE_DEVICE_TAIL)
@@ -2255,7 +2300,7 @@ bool core_session::capture_program() {
                     });
                 }, false, true) || !make([&](cudaGraph_t graph, std::vector<cudaGraphNode_t> & dependencies) {
                     return capture(graph, stream, dependencies, [&] {
-                        return cudaMemcpyAsync(result(), runtime(), sizeof(source_runtime), cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                        return copy_result();
                     });
                 }, false, true)) { return false; }
             auto * handles = reinterpret_cast<ggml_cuda_moe_source_tail_dispatch *>(host + host_tail_offset);
@@ -2645,6 +2690,7 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
     }
     *result() = {};
     result()->epoch = epoch;
+    if (host_completion_offset != SIZE_MAX) { completion()->store(0); }
     if (ok && segmented) { ok = cudaMemcpyAsync(runtime(), result(), sizeof(source_runtime), cudaMemcpyHostToDevice, stream) == cudaSuccess; }
     ggml_moe_caller_sample sample;
     if (ok) {
@@ -2663,6 +2709,7 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
                 (unsigned long long) sample.observation_ns);
         }
     }
+    if (ok) { ok = wait_result(deadline); }
     if (ok && config.profile_adaptation) {
         ok = wait_stream(stream, deadline) && wait_stream(io, deadline) &&
             !canceled.load(std::memory_order_acquire) && result()->epoch == epoch &&

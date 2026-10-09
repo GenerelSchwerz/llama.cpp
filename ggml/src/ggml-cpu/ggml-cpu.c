@@ -1376,7 +1376,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont && !kernel.prepared) {
+    if (!params->use_ref && src1_cont && !kernel.prepared) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1455,7 +1455,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (kernel.convert_input && !kernel.prepared) {
+    if (!params->use_ref && kernel.convert_input && !kernel.prepared) {
         const void* wdata = (!kernel.convert_input) ? src1->data : params->wdata;
         const size_t row_size = kernel.row_bytes;
 

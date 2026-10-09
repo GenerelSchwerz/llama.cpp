@@ -307,9 +307,11 @@ ggml_backend_buffer_type_t file_mmap_cached_buffer_type() {
         /* .iface   = */ {
             /* .get_name         = */ file_mmap_cached_buffer_type_name,
             /* .alloc_buffer     = */ file_mmap_cached_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ nullptr,
             /* .get_alignment    = */ file_mmap_cached_buffer_type_get_alignment,
             /* .get_max_size     = */ nullptr,
             /* .get_alloc_size   = */ file_mmap_cached_buffer_type_get_alloc_size,
+            /* .get_alloc_size_n = */ nullptr,
             /* .is_host          = */ file_mmap_cached_buffer_type_is_host,
         },
         /* .device  = */ nullptr,

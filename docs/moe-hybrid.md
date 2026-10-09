@@ -4,7 +4,7 @@ The source executor runs resident experts on CUDA and assigns cache misses to CU
 
 Complete gated SiLU/GELU and ungated squared-ReLU bodies can use the existing ggml CPU arithmetic and owned CUDA matrix/activation operations when the native arithmetic is unavailable. CPU intermediates stay on the CPU until the body result is published. Other body layouts retain checked projection execution or the existing capability fallback. Two cache-enabled source contexts use independent workspaces; uncached heads and ordinary execution retain the existing shared phase-workspace contract. Prepared source variants include output count and use the declared decode capacity, including MTP catch-up batches without outputs.
 
-This is an explicit experimental mode. Normal execution remains the default. Supported prompt turns use the existing cached prefill path; sequential prompt rows are not treated as independent decode rows.
+This is an explicit experimental mode. Normal execution remains the default. Hybrid prompt turns require the source prefill owner, including when CPU prefill sharing is off. Unsupported required prefill fails explicitly; it does not fall back to ordinary cached prefill. Sequential prompt rows are not treated as independent decode rows.
 
 ## Build
 
@@ -45,6 +45,8 @@ Configuration is selected at process startup, before model/context preparation; 
 Legacy environment activation remains supported. `GGML_MOE_HYBRID=required` defaults to the source executor; explicit older executor selection remains available. CLI activation and miss fraction override their legacy environment settings. The older `fidelity` plus `reference-conversion` activation remains compatible; do not combine source mode with a different legacy pipeline.
 
 Advanced `GGML_MOE_SOURCE_SHARED_OVERLAP=0` disables shared overlap. `GGML_MOE_HYBRID_ALLOW_RUNTIME_ALLOCATIONS=0` requests strict allocation-free CPU admission, which can reject OpenMP/NUMA builds. Both overrides accept only 0 or 1; these are optional diagnostic controls.
+
+CPU-assisted prefill is off by default. `GGML_MOE_SOURCE_CPU_PREFILL=1` enables experimental CPU sharing inside hybrid prefill; unset or `0` keeps its GPU partition. This controls prefill only, separately from decode CPU misses and `--moe-gpu-miss-fraction`. CPU sharing can slow prefill and remains opt-in pending measured benefit gating.
 
 Look for `provider=source-core`, complete copy/GPU/CPU/publication counts and zero failures in the server log. A flag alone does not prove effective execution.
 

@@ -90,3 +90,8 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream, bool skip_unused = false);
+
+void quantize_mmq_nvfp4_compact_cuda(
+        const float * x, void * vy, float * scale, bool use_aligned_float8,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, int64_t scale_ne2, int64_t scale_ne3, cudaStream_t stream);

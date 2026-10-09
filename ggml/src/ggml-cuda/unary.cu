@@ -134,24 +134,67 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+template <float (*op)(float), typename T>
+static __global__ void unary_op_kernel_strided(const T * x, T * dst, const int k,const int64_t ne00,const int64_t ne01,const int64_t ne02,const size_t nb00,const size_t nb01,const size_t nb02,const size_t nb03) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    int64_t rem = i;
+    const int64_t i0 = rem % ne00; rem /= ne00;
+    const int64_t i1 = rem % ne01; rem /= ne01;
+    const int64_t i2 = rem % ne02;
+    const int64_t i3 = rem / ne02;
+    const size_t src_byte_offset = i0 * nb00 + i1 * nb01 + i2 * nb02 + i3 * nb03;
+    const T * src_ptr = (const T *)((const char *)x + src_byte_offset);
+
+    ggml_cuda_pdl_sync();
+    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(*src_ptr)));
+}
+
+template <float (*op)(float), typename T>
+static void unary_cuda_strided(const T * x, T * dst, const int k,const int64_t ne00,const int64_t ne01,const int64_t ne02,const size_t nb00,const size_t nb01,const size_t nb02,const size_t nb03, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_op_kernel_strided<op, T>, launch_params, x, dst, k, ne00,ne01,ne02,nb00,nb01,nb02,nb03);
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const void * src0_d = src0->data;
     void * dst_d = dst->data;
-    cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
+    cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
 
-    if (src0->type == GGML_TYPE_F16) {
-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
-    } else if (src0->type == GGML_TYPE_BF16) {
-        unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+    if (ggml_is_contiguous(src0)) {
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        } else if (src0->type == GGML_TYPE_BF16) {
+            unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        }
     } else {
-        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda_strided<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        } else if (src0->type == GGML_TYPE_BF16) {
+            unary_cuda_strided<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        } else {
+            unary_cuda_strided<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        }
     }
 }
 
@@ -198,6 +241,495 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
 }
+
+struct affine_unary_tensor {
+    const void * data;
+    ggml_type type;
+    uint32_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+};
+
+
+struct affine_unary_args {
+    affine_unary_tensor input[3];
+    void * output[4];
+    ggml_type output_type[4];
+    uint32_t ne[GGML_MAX_DIMS];
+    int count;
+    ggml_unary_op op;
+    float scale;
+    float bias;
+};
+
+
+static __device__ __forceinline__ float affine_unary_read(const affine_unary_tensor & tensor, const uint32_t * pos) {
+    size_t offset = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        offset += size_t(pos[d] % tensor.ne[d])*tensor.nb[d];
+    }
+    const char * ptr = (const char *) tensor.data + offset;
+    if (tensor.type == GGML_TYPE_F16) {
+        return ggml_cuda_cast<float>(*(const half *) ptr);
+    }
+    if (tensor.type == GGML_TYPE_BF16) {
+        return ggml_cuda_cast<float>(*(const nv_bfloat16 *) ptr);
+    }
+    return *(const float *) ptr;
+}
+
+
+static __device__ __forceinline__ float affine_unary_store(void * dst, ggml_type type, int i, float value) {
+    if (type == GGML_TYPE_F16) {
+        const half rounded = ggml_cuda_cast<half>(value);
+        ((half *) dst)[i] = rounded;
+        return ggml_cuda_cast<float>(rounded);
+    }
+    if (type == GGML_TYPE_BF16) {
+        const nv_bfloat16 rounded = ggml_cuda_cast<nv_bfloat16>(value);
+        ((nv_bfloat16 *) dst)[i] = rounded;
+        return ggml_cuda_cast<float>(rounded);
+    }
+    ((float *) dst)[i] = value;
+    return value;
+}
+
+
+struct affine_unary_load {
+    __device__ __forceinline__ float operator()(const affine_unary_tensor & tensor, const uint32_t * pos, int) const {
+        return affine_unary_read(tensor, pos);
+    }
+};
+
+
+struct affine_unary_convert_load {
+    const void * data;
+    ggml_type type;
+    float * raw;
+    __device__ __forceinline__ float operator()(const affine_unary_tensor &, const uint32_t *, int i) const {
+        const float value = type == GGML_TYPE_F16 ? ggml_cuda_cast<float>(((const half *) data)[i]) : ggml_cuda_cast<float>(((const nv_bfloat16 *) data)[i]);
+        raw[i] = value;
+        return value;
+    }
+};
+
+
+static __device__ __forceinline__ void affine_unary_apply(affine_unary_args args, float value, const uint32_t * pos, int i) {
+    value = __fmul_rn(value, affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], i, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], i, value);
+    if (args.output[3]) {
+        affine_unary_store(args.output[3], args.output_type[3], i, args.scale*value + args.bias);
+    }
+}
+
+
+template <typename Load>
+static __device__ __forceinline__ void affine_unary_impl(affine_unary_args args, Load load) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) {
+        return;
+    }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    ggml_cuda_pdl_sync();
+    float value = __fmul_rn(load(args.input[0], pos, i), affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], i, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], i, value);
+    if (args.output[3]) {
+        affine_unary_store(args.output[3], args.output_type[3], i, args.scale*value + args.bias);
+    }
+}
+
+
+static __global__ void affine_unary_kernel(affine_unary_args args) {
+    affine_unary_impl(args, affine_unary_load{});
+}
+
+
+static __global__ void affine_unary_convert_kernel(affine_unary_args args, const void * src, ggml_type type, float * raw) {
+    affine_unary_impl(args, affine_unary_convert_load{src, type, raw});
+}
+
+
+static __global__ void affine_unary_window_convert_kernel(affine_unary_args args, const void * src, ggml_type type, float * raw, int count, int columns, int offset) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= count) { return; }
+    ggml_cuda_pdl_sync();
+    const affine_unary_convert_load load{src, type, raw};
+    const float value = load(args.input[0], nullptr, i);
+    const int column = i % columns;
+    if (column < offset || uint32_t(column - offset) >= args.ne[0]) { return; }
+    const int j = (i/columns)*args.ne[0] + column - offset;
+    uint32_t remaining = j;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    affine_unary_apply(args, value, pos, j);
+}
+
+
+static __global__ void affine_unary_tail_kernel(affine_unary_args args, void * tail, ggml_type tail_type, float scale, float bias,
+        const void * src, ggml_type src_type, float * raw, int count, int columns, int offset) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= count) { return; }
+    ggml_cuda_pdl_sync();
+    float value = 0.0f;
+    int j = i;
+    if (raw) {
+        const affine_unary_convert_load load{src, src_type, raw};
+        value = load(args.input[0], nullptr, i);
+        const int column = i % columns;
+        if (column < offset || uint32_t(column - offset) >= args.ne[0]) { return; }
+        j = (i/columns)*args.ne[0] + column - offset;
+    }
+    uint32_t remaining = j;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    if (!raw) { value = affine_unary_read(args.input[0], pos); }
+    value = __fmul_rn(value, affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], j, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], j, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], j, value);
+    value = affine_unary_store(args.output[3], args.output_type[3], j, args.scale*value + args.bias);
+    affine_unary_store(tail, tail_type, j, scale*value + bias);
+}
+
+
+static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
+    affine_unary_args args{};
+    const ggml_tensor * input[] = { mul->src[0], mul->src[1], add->src[1] };
+    const ggml_tensor * output[] = { mul, add, unary, post };
+    for (int j = 0; j < 3; ++j) {
+        args.input[j].data = input[j]->data;
+        args.input[j].type = input[j]->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = input[j]->ne[d];
+            args.input[j].nb[d] = input[j]->nb[d];
+        }
+    }
+    for (int j = 0; j < 4; ++j) {
+        if (output[j]) {
+            args.output[j] = output[j]->data;
+            args.output_type[j] = output[j]->type;
+        }
+        args.ne[j] = mul->ne[j];
+    }
+    args.count = ggml_nelements(mul);
+    args.op = ggml_get_unary_op(unary);
+    if (post) {
+        memcpy(&args.scale, post->op_params, sizeof(float));
+        memcpy(&args.bias, (const char *) post->op_params + sizeof(float), sizeof(float));
+    }
+    return args;
+}
+
+
+struct mul_add_args {
+    affine_unary_args affine;
+    uint3 ne[GGML_MAX_DIMS];
+    uint3 repeat[3][GGML_MAX_DIMS];
+    uint32_t repeat_mask[3];
+};
+
+
+static __device__ __forceinline__ float mul_add_read(const affine_unary_tensor & tensor, const uint3 * repeat, const uint32_t * pos, uint32_t repeat_mask) {
+    size_t offset = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint32_t index = repeat_mask & (1u << d) ? fastmodulo(pos[d], repeat[d]) : pos[d];
+        offset += size_t(index)*tensor.nb[d];
+    }
+    const char * ptr = (const char *) tensor.data + offset;
+    if (tensor.type == GGML_TYPE_F16) { return ggml_cuda_cast<float>(*(const half *) ptr); }
+    if (tensor.type == GGML_TYPE_BF16) { return ggml_cuda_cast<float>(*(const nv_bfloat16 *) ptr); }
+    return *(const float *) ptr;
+}
+
+
+static __global__ void mul_add_kernel(mul_add_args binary, bool product_first) {
+    const affine_unary_args & args = binary.affine;
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) { return; }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint2 part = fast_div_modulo(remaining, binary.ne[d]);
+        remaining = part.x;
+        pos[d] = part.y;
+    }
+    ggml_cuda_pdl_sync();
+    float value = __fmul_rn(mul_add_read(args.input[0], binary.repeat[0], pos, 0), mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    const float base = mul_add_read(args.input[2], binary.repeat[2], pos, binary.repeat_mask[2]);
+    value = product_first ? __fadd_rn(value, base) : __fadd_rn(base, value);
+    affine_unary_store(args.output[1], args.output_type[1], i, value);
+}
+
+
+static __global__ void repeat_mul_add_kernel(mul_add_args binary, int repeated_input, bool product_first) {
+    const affine_unary_args & args = binary.affine;
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) { return; }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint2 part = fast_div_modulo(remaining, binary.ne[d]);
+        remaining = part.x;
+        pos[d] = part.y;
+    }
+    ggml_cuda_pdl_sync();
+    float lhs = mul_add_read(args.input[0], binary.repeat[0], pos, binary.repeat_mask[0]);
+    float rhs = mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]);
+    if (repeated_input == 0) { lhs = affine_unary_store(args.output[2], args.output_type[2], i, lhs); }
+    else { rhs = affine_unary_store(args.output[2], args.output_type[2], i, rhs); }
+    float value = __fmul_rn(lhs, rhs);
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    const float base = mul_add_read(args.input[2], binary.repeat[2], pos, binary.repeat_mask[2]);
+    value = product_first ? __fadd_rn(value, base) : __fadd_rn(base, value);
+    affine_unary_store(args.output[1], args.output_type[1], i, value);
+}
+
+
+static mul_add_args mul_add_get_args(ggml_tensor * mul, ggml_tensor * add, ggml_tensor * repeat = nullptr) {
+    mul_add_args binary{};
+    affine_unary_args & args = binary.affine;
+    const bool product_first = add->src[0] == mul;
+    const ggml_tensor * reads[] = {mul->src[0], mul->src[1], add->src[product_first ? 1 : 0]};
+    if (repeat) { reads[mul->src[0] == repeat ? 0 : 1] = repeat->src[0]; }
+    for (int j = 0; j < 3; ++j) {
+        args.input[j].data = reads[j]->data;
+        args.input[j].type = reads[j]->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = reads[j]->ne[d];
+            args.input[j].nb[d] = reads[j]->ne[d] == 1 ? 0 : reads[j]->nb[d];
+            binary.repeat[j][d] = init_fastdiv_values(reads[j]->ne[d]);
+            if (reads[j]->ne[d] != 1 && reads[j]->ne[d] != mul->ne[d]) { binary.repeat_mask[j] |= 1u << d; }
+        }
+    }
+    args.output[0] = mul->data;
+    args.output[1] = add->data;
+    args.output_type[0] = mul->type;
+    args.output_type[1] = add->type;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) { binary.ne[d] = init_fastdiv_values(mul->ne[d]); }
+    args.count = ggml_nelements(mul);
+    if (repeat) {
+        args.output[2] = repeat->data;
+        args.output_type[2] = repeat->type;
+    }
+    return binary;
+}
+
+
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
+    const auto binary = mul_add_get_args(mul, add);
+    const int blocks = (binary.affine.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_add_kernel, launch, binary, add->src[0] == mul);
+}
+
+
+void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add) {
+    const auto binary = mul_add_get_args(mul, add, repeat);
+    const int blocks = (binary.affine.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(repeat_mul_add_kernel, launch, binary, mul->src[0] == repeat ? 0 : 1, add->src[0] == mul);
+}
+
+
+static __global__ void repeat_add_kernel(mul_add_args binary) {
+    const affine_unary_args & args = binary.affine;
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) { return; }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint2 part = fast_div_modulo(remaining, binary.ne[d]);
+        remaining = part.x;
+        pos[d] = part.y;
+    }
+    ggml_cuda_pdl_sync();
+    float lhs = mul_add_read(args.input[0], binary.repeat[0], pos, binary.repeat_mask[0]);
+    float rhs = mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]);
+    if (args.output[1]) { lhs = affine_unary_store(args.output[1], args.output_type[1], i, lhs); }
+    if (args.output[2]) { rhs = affine_unary_store(args.output[2], args.output_type[2], i, rhs); }
+    affine_unary_store(args.output[0], args.output_type[0], i, lhs + rhs);
+}
+
+
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1) {
+    mul_add_args binary{};
+    affine_unary_args & args = binary.affine;
+    const ggml_tensor * repeats[] = {repeat0, repeat1};
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * read = repeats[j] ? repeats[j]->src[0] : add->src[j];
+        args.input[j].data = read->data;
+        args.input[j].type = read->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = read->ne[d];
+            args.input[j].nb[d] = read->ne[d] == 1 ? 0 : read->nb[d];
+            binary.repeat[j][d] = init_fastdiv_values(read->ne[d]);
+            if (read->ne[d] != 1 && read->ne[d] != add->ne[d]) { binary.repeat_mask[j] |= 1u << d; }
+        }
+        if (repeats[j] && (j == 0 || repeat1 != repeat0)) {
+            args.output[j + 1] = repeats[j]->data;
+            args.output_type[j + 1] = repeats[j]->type;
+        }
+    }
+    args.output[0] = add->data;
+    args.output_type[0] = add->type;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) { binary.ne[d] = init_fastdiv_values(add->ne[d]); }
+    args.count = ggml_nelements(add);
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(repeat_add_kernel, launch, binary);
+}
+
+
+struct ordered_mul_add_args {
+    const char * input[2];
+    size_t row_stride[2];
+    size_t stream_stride[2];
+    float * products[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    float * sums[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    bool product_first[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    uint3 columns;
+    uint3 coefficient_rows;
+    int elements;
+    int count;
+};
+
+
+static __global__ void ordered_mul_add_kernel(ordered_mul_add_args args) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.elements) { return; }
+    const uint2 pos = fast_div_modulo(i, args.columns);
+    const size_t x_row = size_t(pos.x)*args.row_stride[0] + size_t(pos.y)*sizeof(float);
+    const size_t w_row = size_t(fastmodulo(pos.x, args.coefficient_rows))*args.row_stride[1];
+    ggml_cuda_pdl_sync();
+    float sum = 0.0f;
+    for (int j = 0; j < args.count; ++j) {
+        const float x = *(const float *) (args.input[0] + x_row + size_t(j)*args.stream_stride[0]);
+        const float w = *(const float *) (args.input[1] + w_row + size_t(j)*args.stream_stride[1]);
+        const float product = __fmul_rn(x, w);
+        args.products[j][i] = product;
+        if (j == 0) { sum = product; }
+        else {
+            sum = args.product_first[j] ? __fadd_rn(product, sum) : __fadd_rn(sum, product);
+            args.sums[j][i] = sum;
+        }
+    }
+}
+
+
+void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count) {
+    ordered_mul_add_args args{};
+    for (int k = 0; k < 2; ++k) {
+        const ggml_tensor * first = products[0]->src[k];
+        args.input[k] = (const char *) first->data;
+        args.row_stride[k] = first->nb[1];
+        args.stream_stride[k] = products[1]->src[k]->view_offs - first->view_offs;
+    }
+    for (int j = 0; j < count; ++j) {
+        args.products[j] = (float *) products[j]->data;
+        args.sums[j] = (float *) sums[j]->data;
+        args.product_first[j] = j && sums[j]->src[0] == products[j];
+    }
+    args.columns = init_fastdiv_values(products[0]->ne[0]);
+    args.coefficient_rows = init_fastdiv_values(products[0]->src[1]->ne[1]);
+    args.elements = ggml_nelements(products[0]);
+    args.count = count;
+    const int blocks = (args.elements + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ordered_mul_add_kernel, launch, args);
+}
+
+
+static void affine_unary_tail_cuda(ggml_backend_cuda_context & ctx, affine_unary_args args, ggml_tensor * tail,
+        const void * src = nullptr, ggml_type src_type = GGML_TYPE_F32, ggml_tensor * mm = nullptr, int offset = 0) {
+    GGML_ASSERT(args.output[3] && tail && (tail->type == GGML_TYPE_F32 || tail->type == GGML_TYPE_BF16));
+    float scale, bias;
+    memcpy(&scale, tail->op_params, sizeof(float));
+    memcpy(&bias, (const char *) tail->op_params + sizeof(float), sizeof(float));
+    const int count = mm ? ggml_nelements(mm) : args.count;
+    const int blocks = (count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_tail_kernel, launch, args, tail->data, tail->type, scale, bias,
+            src, src_type, mm ? (float *) mm->data : nullptr, count, mm ? (int) mm->ne[0] : 0, offset);
+}
+
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post, ggml_tensor * tail) {
+    const auto args = affine_unary_get_args(mul, add, unary, post);
+    if (tail) {
+        affine_unary_tail_cuda(ctx, args, tail);
+        return;
+    }
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_kernel, launch, args);
+}
+
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops) {
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
+    GGML_ASSERT(mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm));
+    const auto args = affine_unary_get_args(ops.mul, ops.add, ops.unary, ops.post);
+    if (ops.tail) {
+        const ggml_tensor * input = ops.mul->src[0];
+        GGML_ASSERT(input == mm || (input->op == GGML_OP_VIEW && input->view_src == mm && input->type == GGML_TYPE_F32 &&
+                input->nb[0] == sizeof(float) && input->view_offs % sizeof(float) == 0 && input->ne[0] > 0 && input->ne[0] <= mm->ne[0] &&
+                input->view_offs/sizeof(float) <= uint64_t(mm->ne[0] - input->ne[0])));
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            GGML_ASSERT(input->ne[d] == mm->ne[d] && input->nb[d] == mm->nb[d]);
+        }
+        GGML_ASSERT(ggml_nelements(mm) > 0 && ggml_nelements(mm) <= INT_MAX - CUDA_NEG_BLOCK_SIZE && args.count == ggml_nelements(input));
+        affine_unary_tail_cuda(ctx, args, ops.tail, src, type, mm, input == mm ? 0 : (int) (input->view_offs/sizeof(float)));
+        return;
+    }
+    if (ops.mul->src[0] != mm) {
+        const ggml_tensor * input = ops.mul->src[0];
+        GGML_ASSERT(input->op == GGML_OP_VIEW && input->view_src == mm && input->type == GGML_TYPE_F32 &&
+                input->nb[0] == sizeof(float) && input->view_offs % sizeof(float) == 0 && input->ne[0] <= mm->ne[0] &&
+                input->view_offs/sizeof(float) <= uint64_t(mm->ne[0] - input->ne[0]));
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            GGML_ASSERT(input->ne[d] == mm->ne[d] && input->nb[d] == mm->nb[d]);
+        }
+        GGML_ASSERT(ggml_nelements(mm) > 0 && ggml_nelements(mm) <= INT_MAX - CUDA_NEG_BLOCK_SIZE && args.count == ggml_nelements(input));
+        const int count = ggml_nelements(mm);
+        const int blocks = (count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+        const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+        ggml_cuda_kernel_launch(affine_unary_window_convert_kernel, launch, args, src, type, (float *) mm->data, count, (int) mm->ne[0], (int) (input->view_offs/sizeof(float)));
+        return;
+    }
+    GGML_ASSERT(args.count == ggml_nelements(mm));
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_convert_kernel, launch, args, src, type, (float *) mm->data);
+}
+
 
 void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_hardsigmoid>(ctx, dst);
@@ -547,8 +1079,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_is_contiguous(src0));
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
 
     const float alpha_n = ggml_get_op_params_f32(dst, 1);
@@ -558,6 +1090,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (src0->type == GGML_TYPE_F16) {
         xielu_cuda((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
+    } else if (src0->type == GGML_TYPE_BF16) {
+        xielu_cuda((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
     } else {
         xielu_cuda((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
     }
@@ -803,18 +1337,35 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     }
 }
 
-/* fused scale and activation */
+template <typename T>
+struct ggml_cuda_scaled_unary_load {
+    const T * data;
+    __device__ __forceinline__ T operator()(int i) const { return data[i]; }
+};
 
-template <float (*op)(float), typename T, bool before, bool after>
-static __global__ void scaled_unary_kernel(const T * x, T * pre_dst, T * unary_dst, T * dst, int k, float scale0, float bias0, float scale1, float bias1) {
+
+template <typename T>
+struct ggml_cuda_scaled_unary_convert_load {
+    const T * data;
+    float * raw;
+    __device__ __forceinline__ float operator()(int i) const {
+        const float value = ggml_cuda_cast<float>(data[i]);
+        raw[i] = value;
+        return value;
+    }
+};
+
+
+template <float (*op)(float), typename T, typename Load>
+static __device__ __forceinline__ void scaled_unary_impl(Load x, T * pre_dst, T * unary_dst, T * dst, int k, float scale0, float bias0, float scale1, float bias1, bool before, bool after) {
     ggml_cuda_pdl_lc();
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
     if (i >= k) {
         return;
     }
     ggml_cuda_pdl_sync();
-    float value = ggml_cuda_cast<float>(x[i]);
-    if constexpr (before) {
+    float value = ggml_cuda_cast<float>(x(i));
+    if (before) {
         const T pre = ggml_cuda_cast<T>(scale0 * value + bias0);
         pre_dst[i] = pre;
         value = ggml_cuda_cast<float>(pre);
@@ -822,13 +1373,27 @@ static __global__ void scaled_unary_kernel(const T * x, T * pre_dst, T * unary_d
     const T unary = ggml_cuda_cast<T>(op(value));
     unary_dst[i] = unary;
     value = ggml_cuda_cast<float>(unary);
-    if constexpr (after) {
+    if (after) {
         value = scale1 * value + bias1;
     }
-    if constexpr (after) {
+    if (after) {
         dst[i] = ggml_cuda_cast<T>(value);
     }
 }
+
+
+/* fused scale and activation */
+
+template <float (*op)(float), typename T, bool before, bool after>
+static __global__ void scaled_unary_kernel(const T * x, T * pre_dst, T * unary_dst, T * dst, int k, float scale0, float bias0, float scale1, float bias1) {
+    scaled_unary_impl<op, T>(ggml_cuda_scaled_unary_load<T>{x}, pre_dst, unary_dst, dst, k, scale0, bias0, scale1, bias1, before, after);
+}
+
+template <float (*op)(float), typename T>
+static __global__ void scaled_unary_convert_kernel(const void * x, float * raw, float * pre_dst, float * unary_dst, float * dst, int k, float scale0, float bias0, float scale1, float bias1, bool before, bool after) {
+    scaled_unary_impl<op, float>(ggml_cuda_scaled_unary_convert_load<T>{(const T *) x, raw}, pre_dst, unary_dst, dst, k, scale0, bias0, scale1, bias1, before, after);
+}
+
 
 template <float (*op)(float), typename T>
 static void scaled_unary_cuda(const ggml_tensor * first, const ggml_tensor * unary, const ggml_tensor * last, bool before, bool after, cudaStream_t stream) {
@@ -873,4 +1438,32 @@ void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * fi
         default:
             GGML_ABORT("Unsupported scaled unary op");
     }
+}
+
+template <float (*op)(float), typename T>
+static void scaled_unary_convert_cuda(ggml_backend_cuda_context & ctx, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args) {
+    const bool before = args.first->op == GGML_OP_SCALE;
+    const bool after = args.last->op == GGML_OP_SCALE;
+    const int k = ggml_nelements(mm);
+    const ggml_cuda_kernel_launch_params launch((k + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(scaled_unary_convert_kernel<op, T>, launch, src, (float *) mm->data,
+            before ? (float *) args.first->data : nullptr, (float *) args.unary->data, (float *) args.last->data, k,
+            before ? ggml_get_op_params_f32(args.first, 0) : 1.0f, before ? ggml_get_op_params_f32(args.first, 1) : 0.0f,
+            after ? ggml_get_op_params_f32(args.last, 0) : 1.0f, after ? ggml_get_op_params_f32(args.last, 1) : 0.0f, before, after);
+}
+
+
+void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args) {
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
+    GGML_ASSERT(mm->type == GGML_TYPE_F32 && args.first->type == GGML_TYPE_F32 && args.unary->type == GGML_TYPE_F32 && args.last->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mm) && ggml_are_same_shape(mm, args.last));
+    const auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        switch (ggml_get_unary_op(args.unary)) {
+            case GGML_UNARY_OP_SILU: scaled_unary_convert_cuda<op_silu, T>(ctx, src, mm, args); break;
+            case GGML_UNARY_OP_SIGMOID: scaled_unary_convert_cuda<op_sigmoid, T>(ctx, src, mm, args); break;
+            default: GGML_ABORT("Unsupported scaled unary op");
+        }
+    };
+    if (type == GGML_TYPE_F16) { launch(half{}); } else { launch(nv_bfloat16{}); }
 }
