@@ -3595,6 +3595,33 @@ static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, in
     return match;
 }
 
+static ggml_cuda_norm_mmq_match ggml_cuda_match_glu_mmq(ggml_cgraph * graph, int i, int device) {
+    ggml_tensor * dst = graph->nodes[i];
+    if (dst->op != GGML_OP_GLU || dst->type != GGML_TYPE_F32 || !(dst->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_is_contiguous(dst) || dst->ne[0] % QK8_1) { return {}; }
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU: case GGML_GLU_OP_GEGLU: case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF: case GGML_GLU_OP_GEGLU_QUICK:
+        case GGML_GLU_OP_SWIGLU_OAI: case GGML_GLU_OP_SWIGLU_CLAMP: break;
+        default: return {};
+    }
+    uintptr_t begin, end;
+    if (!ggml_cuda_prepared_range(dst, device, begin, end) || begin % sizeof(float) ||
+            (end - begin)/sizeof(float) > INT_MAX) { return {}; }
+    for (const ggml_tensor * read : { dst->src[0], dst->src[1] }) {
+        if (!read) { continue; }
+        uintptr_t read_begin, read_end;
+        if (read->type != GGML_TYPE_F32 || read->nb[0] != sizeof(float) || read->nb[1] % sizeof(float) ||
+                !ggml_is_contiguous_1(read) || ggml_nrows(read) != ggml_nrows(dst) ||
+                !ggml_cuda_prepared_range(read, device, read_begin, read_end) || read_begin % sizeof(float) ||
+                (read_end - read_begin)/sizeof(float) > INT_MAX || (begin < read_end && read_begin < end)) { return {}; }
+    }
+    ggml_cuda_norm_mmq_match match;
+    match.dst = dst;
+    match.last = i;
+    return match;
+}
+
 static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph * graph, int device,
         const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
@@ -3609,10 +3636,11 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_mmq(graph, i, device);
-        if (!match.norm) { continue; }
+        if (!match.dst) { match = ggml_cuda_match_glu_mmq(graph, i, device); }
+        if (!match.dst) { continue; }
         const auto norm_group_invalid = [&](int node) {
             const int group = keys[node] == int(MMQ_Q8_1_DS_LAYOUT_D2S6) ? 64 : 32;
-            return match.norm->ne[0] % group || graph->nodes[node]->src[1]->ne[0] % group;
+            return match.dst->ne[0] % group || graph->nodes[node]->src[1]->ne[0] % group;
         };
         const auto can_emit = [&](int node, int prepare) {
             const ggml_tensor * input = graph->nodes[node]->src[1];
@@ -4647,14 +4675,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (!norm_emits.empty() && norm_emits[i].norm) {
+                if (!norm_emits.empty() && norm_emits[i].dst) {
                     const auto & emit = norm_emits[i];
                     const int g = emit.image;
                     const int reader = reuse.groups[g].node;
                     const ggml_tensor * input = cgraph->nodes[reader]->src[1];
                     shared_inputs[g].quantized.alloc(reuse.groups[g].size);
-                    ggml_cuda_op_rms_norm_mmq(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale,
-                        shared_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                    if (emit.norm) {
+                        ggml_cuda_op_rms_norm_mmq(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale,
+                            shared_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                    } else {
+                        ggml_cuda_op_glu_mmq(*cuda_ctx, emit.dst, shared_inputs[g].quantized.get(), input->ne[0],
+                            GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                    }
                     i = emit.last;
                     continue;
                 }

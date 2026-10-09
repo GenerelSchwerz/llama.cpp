@@ -7195,6 +7195,17 @@ struct test_mul_mat_shared_mmq_input : public test_case {
         }
         if (input_mode >= 8) {
             outputs.clear();
+            if (input_mode >= 16) {
+                if (input_mode == 17 || input_mode == 18) {
+                    input = ggml_glu(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, columns), GGML_GLU_OP_SWIGLU, input_mode == 18);
+                } else {
+                    ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns);
+                    const ggml_glu_op ops[] = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK };
+                    input = input_mode == 23 ? ggml_swiglu_oai(ctx, input, up, 1.234f, 7.0f) : input_mode == 24 ? ggml_swiglu_clamp(ctx, input, up, 7.0f) : ggml_glu_split(ctx, input, up, ops[input_mode == 16 ? 0 : input_mode - 18]);
+                }
+                ggml_set_output(input);
+                outputs.push_back(input);
+            }
             ggml_tensor * inputs[] = { input, nullptr, nullptr, nullptr };
             if (input_mode == 14 || input_mode == 15) {
                 for (int i = 1; i < (input_mode == 14 ? 2 : 4); ++i) { inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns); }
@@ -11330,6 +11341,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K}) {
         for (int64_t columns : {9, 32}) {
             for (int mode : {14, 15}) { test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, columns, false, mode)); }
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q8_0}) {
+        for (int mode = 16; mode <= 24; ++mode) {
+            test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, 33, false, mode));
         }
     }
 
