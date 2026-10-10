@@ -70,6 +70,8 @@ struct ggml_cuda_rms_gate_images {
     void * bf16 = nullptr;
     void * q8 = nullptr;
     void * mmq = nullptr;
+    int64_t q8_cols = 1;
+    int64_t q8_padded = 0;
     int layout = -1;
     int64_t rows = 1;
     int64_t cols = 1;

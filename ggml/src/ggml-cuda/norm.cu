@@ -158,6 +158,46 @@ struct ggml_cuda_norm_emit_q8_store {
     }
 };
 
+struct ggml_cuda_norm_q8_vec_store {
+    block_q8_1 * image;
+    uint3 cols;
+    int64_t padded;
+
+    __device__ __forceinline__ void emit(int64_t index, float4 value) const {
+        const uint2 rc = fast_div_modulo(uint32_t(index), cols);
+        const int64_t row = rc.x;
+        const int64_t column = rc.y;
+        const int lane = column % QK8_1;
+        const int64_t block = (row*padded + column)/QK8_1;
+        float amax = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)), fmaxf(fabsf(value.z), fabsf(value.w)));
+        float4 sum = value;
+        const unsigned mask = __activemask();
+#pragma unroll
+        for (int offset = QK8_1/8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset, QK8_1/4));
+            sum.x += __shfl_xor_sync(mask, sum.x, offset, QK8_1/4);
+            sum.y += __shfl_xor_sync(mask, sum.y, offset, QK8_1/4);
+            sum.z += __shfl_xor_sync(mask, sum.z, offset, QK8_1/4);
+            sum.w += __shfl_xor_sync(mask, sum.w, offset, QK8_1/4);
+        }
+        const float d = amax/127.0f;
+        char4 q;
+        q.x = amax == 0.0f ? 0 : roundf(value.x/d);
+        q.y = amax == 0.0f ? 0 : roundf(value.y/d);
+        q.z = amax == 0.0f ? 0 : roundf(value.z/d);
+        q.w = amax == 0.0f ? 0 : roundf(value.w/d);
+        ((char4 *) image[block].qs)[lane/4] = q;
+        if (lane == 0) { image[block].ds = make_half2(d, (sum.x + sum.z) + (sum.y + sum.w)); }
+        if (column/QK8_1 == cols.z/QK8_1 - 1) {
+            for (int64_t tail = cols.z/QK8_1; tail < padded/QK8_1; ++tail) {
+                block_q8_1 & zero = image[row*(padded/QK8_1) + tail];
+                ((char4 *) zero.qs)[lane/4] = make_char4(0, 0, 0, 0);
+                if (lane == 0) { zero.ds = make_half2(0.0f, 0.0f); }
+            }
+        }
+    }
+};
+
 template <mmq_q8_1_ds_layout Layout>
 struct ggml_cuda_norm_mmq_store {
     static constexpr int width = 4;
@@ -2880,11 +2920,29 @@ struct ggml_cuda_rms_gate_mmq_store {
     }
 };
 
+template <typename Write>
+struct ggml_cuda_rms_gate_mixed_store {
+    static constexpr int width = 4;
+    ggml_cuda_rms_gate_mmq_store<Write> write;
+    ggml_cuda_norm_q8_vec_store q8;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float4 value) const {
+        write(dst, base, col, value);
+        q8.emit(dst - base + col, value);
+    }
+};
+
 template <int Block, ggml_unary_op Gate, typename Write>
 static void ggml_cuda_rms_gate_mmq_launch(const ggml_cuda_kernel_launch_params & params, const ggml_cuda_rms_gate_data & a,
         const ggml_cuda_rms_gate_images & images, Write write) {
     const ggml_cuda_rms_gate_mmq_store<Write> store{write, (half *) images.f16, (nv_bfloat16 *) images.bf16};
-    ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, decltype(store)>, params, a, store);
+    if (images.q8) {
+        const ggml_cuda_rms_gate_mixed_store<Write> mixed{store,
+            {(block_q8_1 *) images.q8, init_fastdiv_values(images.q8_cols), images.q8_padded}};
+        ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, decltype(mixed)>, params, a, mixed);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, decltype(store)>, params, a, store);
+    }
 }
 
 template <int Block, ggml_unary_op Gate>
@@ -2892,7 +2950,6 @@ static void ggml_cuda_rms_gate_launch(ggml_backend_cuda_context & ctx, const ggm
         dim3 grid, const ggml_cuda_rms_gate_images * images) {
     const ggml_cuda_kernel_launch_params params(grid, dim3(Block), 32*sizeof(float), ctx.stream());
     if (images && images->mmq) {
-        GGML_ASSERT(!images->q8);
         const uint3 cols = init_fastdiv_values(images->cols);
         const uint3 rows = init_fastdiv_values(images->rows);
         if (images->layout == 3) {

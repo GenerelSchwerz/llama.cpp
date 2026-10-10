@@ -4562,8 +4562,7 @@ static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, in
 }
 
 static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph * graph, int device,
-        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse,
-        const std::vector<ggml_cuda_norm_q8_match> & q8_emits) {
+        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (keys[i] < 0) { continue; }
@@ -4576,7 +4575,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_mmq(graph, i, device);
-        if (!match.norm || (match.gate && !q8_emits.empty() && q8_emits[i].gate)) { continue; }
+        if (!match.norm) { continue; }
         const auto norm_group_invalid = [&](int node) {
             const int group = keys[node] == int(MMQ_Q8_1_DS_LAYOUT_D2S6) ? 64 : 32;
             return match.norm->ne[0] % group || graph->nodes[node]->src[1]->ne[0] % group;
@@ -7295,7 +7294,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_reuse_plan mmq_reuse(cgraph, stream_ctx, mmq_keys, mmq_sizes, ggml_cuda_mmq_input_overwritten);
             std::vector<ggml_cuda_norm_mmq_match> mmq_emits;
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                mmq_emits = ggml_cuda_plan_norm_mmq(cgraph, cuda_ctx->device, mmq_keys, mmq_sizes, mmq_reuse, q8_emits);
+                mmq_emits = ggml_cuda_plan_norm_mmq(cgraph, cuda_ctx->device, mmq_keys, mmq_sizes, mmq_reuse);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_mmq_input> mmq_inputs(cuda_ctx->pool(), mmq_reuse);
             const auto prepare_mmq_group = [&](int group) {
@@ -7513,7 +7512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_tensor * dst = gate_typed ? gate_typed->dst : gate_q8 ? gate_q8->dst : gate_mmq->dst;
                     const auto gate_op = gate_typed ? gate_typed->gate_op : gate_q8 ? gate_q8->gate_op : gate_mmq->gate_op;
                     const int last = gate_typed ? gate_typed->last : gate_q8 ? gate_q8->last : gate_mmq->last;
-                    GGML_ASSERT(!gate_mmq || (!gate_q8 && gate_mmq->norm == norm && gate_mmq->mul == mul && gate_mmq->gate == gate &&
+                    GGML_ASSERT(!gate_mmq || (gate_mmq->norm == norm && gate_mmq->mul == mul && gate_mmq->gate == gate &&
                         gate_mmq->dst == dst && gate_mmq->gate_op == gate_op && gate_mmq->last == last));
                     GGML_ASSERT(!gate_q8 || (gate_q8->norm == norm && gate_q8->mul == mul && gate_q8->gate == gate &&
                         gate_q8->dst == dst && gate_q8->gate_op == gate_op && gate_q8->last == last));
@@ -7535,6 +7534,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         images.q8 = q8_inputs[g].get();
                         images.cols = input->ne[0];
                         images.padded = GGML_PAD(input->ne[0], MATRIX_ROW_PADDING);
+                        images.q8_cols = images.cols;
+                        images.q8_padded = images.padded;
                     }
                     if (gate_mmq) {
                         prepare_mmq_shared(i, false);
