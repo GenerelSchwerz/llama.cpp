@@ -69,6 +69,8 @@ struct ggml_cuda_moe_prefill_source_binding {
     uint64_t resource_identity = 0;
     uint64_t residency_token = 0;
     bool measure_resources = false;
+    uint64_t schedule_token = 0;
+    uint32_t schedule_phase = UINT32_MAX;
 };
 
 bool ggml_cuda_moe_tensor_storage(const ggml_tensor * tensor, int device, bool & unavailable);
@@ -467,6 +469,11 @@ struct ggml_cuda_moe_prefill_body_bank {
     ggml_cuda_moe_graph_binding binding;
     ggml_tensor * node = nullptr;
     ggml_cuda_moe_prefill_source_binding source;
+};
+
+struct ggml_cuda_moe_prefill_phase {
+    ggml_cuda_moe_graph_group_dispatch * group = nullptr;
+    std::vector<ggml_cuda_moe_prefill_body_bank> banks;
 };
 
 struct ggml_cuda_moe_prefill_wave {
@@ -1328,6 +1335,9 @@ public:
             uint32_t n_unique_experts);
     size_t prefill_staging_capacity_bytes() const;
     bool prefill_body_fits(const ggml_tensor * const * banks, uint32_t count) const;
+    bool begin_prefill_schedule(const std::vector<ggml_cuda_moe_prefill_phase> & phases,
+            ggml_cuda_moe_stream_t stream, uint64_t * token);
+    bool finish_prefill_schedule(ggml_cuda_moe_stream_t stream, uint64_t token, bool complete);
     ggml_cuda_moe_grouped_decode_result execute_bounded_prefill(
             ggml_backend_cuda_context & context,
             ggml_cuda_moe_graph_group_dispatch * group,
@@ -1553,6 +1563,7 @@ private:
             std::vector<std::shared_ptr<void>> * leases) const;
     bool source_transport_matches_locked(const ggml_cuda_moe_source_transport * transport, const uint32_t * binding_indices,
             const ggml_cuda_moe_grouped_transaction & transaction, const uint32_t * bank_indices, uint32_t count) const;
+    bool issue_prefill_schedule();
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_group_call_locked(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;

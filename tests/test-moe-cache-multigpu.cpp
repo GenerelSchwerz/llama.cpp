@@ -4829,6 +4829,43 @@ void test_source_softmax_resources(int device) {
     }
 }
 
+void test_staged_input_capacity(int device) {
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    CHECK(backend);
+    const auto * api = ggml_cuda_staged_input_api();
+    CHECK(api && !api->create(backend.get(), 0));
+    const size_t capacity = 2*1024*1024;
+    std::unique_ptr<void, void (*)(void *)> input(api->create(backend.get(), capacity), api->destroy);
+    CHECK(input && ggml_cuda_staged_input_consumed(input.get()));
+    for (const size_t bytes : {capacity, size_t(13)*sizeof(float), capacity}) {
+        ggml_context_ptr ctx(ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true}));
+        CHECK(ctx);
+        auto * graph = ggml_new_graph_custom(ctx.get(), 16, false);
+        auto * node = api->build(input.get(), ctx.get(), nullptr, bytes/sizeof(float));
+        ggml_build_forward_expand(graph, node);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+        CHECK(buffer);
+        ggml_cuda_source_staged_input_view view;
+        CHECK(ggml_cuda_staged_input_prepare_source_view(device, node, view) && view.bytes == bytes);
+        auto invalid = *node;
+        invalid.ne[0] = capacity/sizeof(float) + 1;
+        for (int i = 1; i < 4; ++i) { invalid.nb[i] = capacity + sizeof(float); }
+        CHECK(!ggml_cuda_staged_input_prepare_source_view(device, &invalid, view));
+        auto * values = static_cast<float *>(api->data(input.get()));
+        for (int replay = 0; replay < 2; ++replay) {
+            for (size_t i = 0; i < bytes/sizeof(float); ++i) { values[i] = float(int(i % 31) - 15 + replay); }
+            api->publish(input.get());
+            CHECK(!ggml_cuda_staged_input_consumed(input.get()));
+            CHECK(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_cuda_staged_input_consumed(input.get()));
+            std::vector<float> actual(bytes/sizeof(float));
+            ggml_backend_tensor_get(node, actual.data(), 0, bytes);
+            CHECK(memcmp(actual.data(), values, bytes) == 0);
+        }
+    }
+    fprintf(stderr, "test-moe-cache: staged capacity 2MiB/full-prefix-full replay/consumed/bounds OK\n");
+}
+
 void staged_source_view_checks(int device, const ggml_tensor * node, const ggml_staged_input_api * api, void * input) {
     ggml_cuda_source_staged_input_view view, again;
     CHECK(ggml_cuda_staged_input_prepare_source_view(device, node, view));
@@ -5912,15 +5949,16 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
     const bool source_core = scheduler && ggml_moe_fidelity_selection().source_pool;
     const char * fidelity_mode = getenv("GGML_TEST_MOE_FIDELITY");
     const bool generic_body = fidelity_mode && (!strcmp(fidelity_mode, "source-core-generic") || !strcmp(fidelity_mode, "source-core-miss-skip"));
-    const bool body_prefill = fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill-body");
+    const bool prefill_stream = fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill-stream");
+    const bool body_prefill = prefill_stream || (fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill-body"));
     const bool body_tail = body_prefill && getenv("GGML_TEST_MOE_BODY_TAIL") && !strcmp(getenv("GGML_TEST_MOE_BODY_TAIL"), "1");
     const bool main_prefill = body_prefill || (fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill"));
     const bool approximate = ggml_moe_fidelity_selection().keep_ranks && !main_prefill;
     struct source_environment {
         bool enabled;
-        std::string saved[2];
-        bool present[2] = {};
-        const char * names[2] = {"GGML_MOE_FIDELITY_ARM", "GGML_MOE_FIDELITY_NO_HOST_ALIAS"};
+        std::string saved[3];
+        bool present[3] = {};
+        const char * names[3] = {"GGML_MOE_FIDELITY_ARM", "GGML_MOE_FIDELITY_NO_HOST_ALIAS", "GGML_MOE_SOURCE_PREFILL_STREAM_AHEAD"};
         static void set(const char * name, const char * value) {
 #ifdef _WIN32
             CHECK(_putenv_s(name, value ? value : "") == 0);
@@ -5928,18 +5966,19 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             CHECK((value ? setenv(name, value, 1) : unsetenv(name)) == 0);
 #endif
         }
-        source_environment(bool enabled, uint32_t arm, bool no_alias) : enabled(enabled) {
+        source_environment(bool enabled, uint32_t arm, bool no_alias, bool stream) : enabled(enabled) {
             if (!enabled) { return; }
-            for (size_t i = 0; i < 2; ++i) {
+            for (size_t i = 0; i < 3; ++i) {
                 const char * value = getenv(names[i]);
                 present[i] = value != nullptr;
                 saved[i] = value ? value : "";
             }
             set(names[0], arm == GGML_CUDA_MOE_FIDELITY_SEGMENTED ? "segmented" : "poll");
             set(names[1], no_alias ? "1" : "0");
+            if (stream) { set(names[2], "1"); }
         }
-        ~source_environment() { if (enabled) { for (size_t i = 0; i < 2; ++i) { set(names[i], present[i] ? saved[i].c_str() : nullptr); } } }
-    } environment(source_core, arm, no_alias);
+        ~source_environment() { if (enabled) { for (size_t i = 0; i < 3; ++i) { set(names[i], present[i] ? saved[i].c_str() : nullptr); } } }
+    } environment(source_core, arm, no_alias, prefill_stream);
     CHECK(!pending_handoff || (native_reference && capacity == 1 && !staged_inputs && !delayed_cancel && experts > routes));
     CHECK(!staged_inputs || ((!scheduler || source_core) && !delayed_cancel));
     if (quota == UINT32_MAX) { quota = capacity == 1 ? 0 : 1; }
@@ -5999,6 +6038,19 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
         routes, signature.down_type, signature.n_embd, signature.n_ff, experts);
     auto & fixture = *owner->fixture;
     auto & reference = *owner->reference;
+    if (main_prefill && transport_case == 3) {
+        CHECK(fixture.buft->context);
+        auto & budget = *static_cast<moe_host_budget *>(fixture.buft->context);
+        std::lock_guard<std::mutex> lock(budget.mutex);
+        uint32_t staged = 0;
+        for (const auto & bank : fixture.tensors) {
+            if (bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) { continue; }
+            const auto source = budget.sources.find(bank.tensor);
+            CHECK(source != budget.sources.end() && !source->second.device_alias);
+            ++staged;
+        }
+        CHECK(staged > 0);
+    }
     if (native_reference) {
         CHECK(routes > n_used && (uint64_t(routes - n_used) * ggml_moe_fidelity_selection().pcie_num) / 256 > 0);
         const auto snapshot = fixture.manifest();
@@ -7083,7 +7135,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     }
                     CHECK(!held.timed_out && status == GGML_STATUS_SUCCESS);
                     CHECK(ggml_backend_sched_moe_hybrid_set_test_hook_v1(owner->sched.get(), nullptr, nullptr));
-                } else if (source_core && staged_inputs && step == 0) {
+                } else if (source_core && staged_inputs && !main_prefill && step == 0) {
                     struct held_stage {
                         std::mutex mutex;
                         std::condition_variable condition;
@@ -7141,7 +7193,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     CHECK(ggml_backend_sched_moe_source_drain_v1(owner->sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
                     CHECK(ggml_backend_sched_moe_hybrid_set_test_hook_v1(owner->sched.get(), nullptr, nullptr));
                     fprintf(stderr, "test-moe-cache: source-core early unsupported fallback actual-stream retained/finite drain OK\n");
-                } else if (source_core && staged_inputs && step == 1) {
+                } else if (source_core && staged_inputs && !main_prefill && step == 1) {
                     CHECK(owned_program);
                     auto wrong = certificate;
                     ++wrong.owner_generation;
@@ -7164,7 +7216,10 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     retained->op_params[0] ^= 1;
                     CHECK(status == GGML_STATUS_SUCCESS);
                 } else { CHECK((owned_program ? compute_owned(owned_program) : compute_phases()) == GGML_STATUS_SUCCESS); }
-                if (source_core && (staged_inputs || (approximate && !pruned_phase)) && step == 0 && !delayed_cancel) {
+                if (source_core && staged_inputs && main_prefill) {
+                    CHECK(!stage_pending(owner->staged_input.get()));
+                }
+                if (source_core && !main_prefill && (staged_inputs || (approximate && !pruned_phase)) && step == 0 && !delayed_cancel) {
                     CHECK(ggml_backend_sched_moe_source_program_bind_v1(owner->sched.get(), fixture.result.get_gf(), &certificate,
                         &owned_program) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && owned_program);
                     ggml_backend_moe_hybrid_state_v1 before = {}, after = {};
@@ -7280,7 +7335,14 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     }
                 }
                 auto expected = active_grouped_tensor_values(reference.output[1]);
-                if (main_prefill) {
+                if (main_prefill && staged_inputs) {
+                    ggml_backend_moe_hybrid_state_v1 state = {};
+                    state.struct_size = sizeof(state);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &state));
+                    CHECK(state.cpu_routes == 0 && state.cpu_execute_calls == 0);
+                    const auto staged = active_grouped_tensor_values(fixture.staged);
+                    CHECK(memcmp(staged.data(), stage_api->data(owner->staged_input.get()), ggml_nbytes(fixture.staged)) == 0);
+                } else if (main_prefill) {
                     double gpu_error = 0, gpu_energy = 0;
                     for (size_t i = 0; i < actual.size(); ++i) {
                         gpu_error += (double(actual[i]) - expected[i]) * (double(actual[i]) - expected[i]);
@@ -7670,7 +7732,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
         if (source_core) {
             CHECK(ggml_backend_sched_moe_source_close_v1(owner->sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
             CHECK(ggml_backend_sched_moe_source_drain_v1(owner->sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
-            if (transport_case) {
+            if (transport_case && !main_prefill) {
                 moe_host_budget * source_budget = nullptr;
                 if (transport_case >= 2) {
                     CHECK(transport_budget > 0 && fixture.buft->context);
@@ -9659,7 +9721,7 @@ void test_hybrid_metadata() {
             }
             return;
         }
-        if (!strcmp(mode, "source-core-prefill") || !strcmp(mode, "source-core-prefill-body")) {
+        if (!strcmp(mode, "source-core-prefill") || !strcmp(mode, "source-core-prefill-body") || !strcmp(mode, "source-core-prefill-stream")) {
             CHECK(ggml_moe_fidelity_selection().valid && ggml_moe_fidelity_selection().source_pool && ggml_moe_fidelity_selection().reference);
             for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
                 const hybrid_layer_signature signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, type, type, LLM_FFN_SILU, 256, 256};
@@ -9668,7 +9730,7 @@ void test_hybrid_metadata() {
                         false, 0, false, false, true);
                 }
             }
-            if (!strcmp(mode, "source-core-prefill-body") && getenv("GGML_TEST_MOE_BODY_LAYOUTS")) {
+            if (strcmp(mode, "source-core-prefill") && getenv("GGML_TEST_MOE_BODY_LAYOUTS")) {
                 for (const auto & signature : {
                     hybrid_layer_signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, LLM_FFN_SILU, 256, 256},
                     hybrid_layer_signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, LLM_FFN_SILU, 256, 256}}) {
@@ -9676,6 +9738,16 @@ void test_hybrid_metadata() {
                         test_fidelity_real_window(device, rows, GGML_CUDA_MOE_FIDELITY_POLL, false, true, signature, 4, 1, 16,
                             false, 0, false, false, true);
                     }
+                }
+            }
+            if (!strcmp(mode, "source-core-prefill-stream")) {
+                const hybrid_layer_signature staged_signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, LLM_FFN_SILU, 1024, 256};
+                test_fidelity_real_window(device, 65, GGML_CUDA_MOE_FIDELITY_POLL, false, true, staged_signature, 4, 1, 16,
+                    false, 0, false, false, false, false, true);
+                for (const auto type : {GGML_TYPE_Q5_K, GGML_TYPE_F32}) {
+                    const hybrid_layer_signature signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, type, type, LLM_FFN_SILU, 256, 256};
+                    test_fidelity_real_window(device, 65, GGML_CUDA_MOE_FIDELITY_POLL, false, true, signature, 4, 1, 16,
+                        false, 0, false, false, true, false, false, false, false, 3);
                 }
             }
             return;
@@ -9714,6 +9786,7 @@ void test_hybrid_metadata() {
                 strcmp(mode, "source-core-deadline") == 0) {
             CHECK(ggml_moe_fidelity_selection().valid && ggml_moe_fidelity_selection().source_pool && ggml_moe_fidelity_selection().reference);
             const bool staged = strcmp(mode, "source-core-staged") == 0;
+            if (staged) { test_staged_input_capacity(device); }
             const bool deadline = strcmp(mode, "source-core-deadline") == 0;
             const bool cancel = strcmp(mode, "source-core-cancel") == 0 || strcmp(mode, "source-core-overlap-cancel") == 0 || deadline;
             const bool overlap = strcmp(mode, "source-core-overlap") == 0 || strcmp(mode, "source-core-overlap-cancel") == 0;

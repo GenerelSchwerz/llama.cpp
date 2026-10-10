@@ -317,6 +317,10 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+const llama_ubatch * llama_memory_hybrid_context::get_next_ubatch() const {
+    return i_next + 1 < ubatches.size() ? &ubatches[i_next + 1] : nullptr;
+}
+
 uint32_t llama_memory_hybrid_context::get_attn_reserve_n_kv() const {
     return ctx_attn->get_attn_reserve_n_kv();
 }

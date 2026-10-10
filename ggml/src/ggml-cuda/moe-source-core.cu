@@ -221,13 +221,33 @@ static __global__ void copy_input(uint8_t * destination, const uint8_t * input, 
         if (acquire(stop)) { runtime->failed = 1; }
     }
     __syncthreads();
-    if (runtime->failed) { return; }
+    if (runtime->failed || bytes == 0) { return; }
     for (size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
         destination[i] = input[i];
     }
     __syncthreads();
     // One block finishes every input read before the host can reuse the buffer.
     if (threadIdx.x == 0) { cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*flag).store(0, cuda::memory_order_release); }
+}
+
+static __global__ void copy_input_payload(uint32_t * destination, const uint32_t * input, size_t values,
+        uint32_t * flag, source_runtime * runtime) {
+    __shared__ bool ready;
+    if (threadIdx.x == 0) {
+        ready = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*flag).load(cuda::memory_order_acquire) != 0;
+        if (!ready) { atomicExch(&runtime->failed, 1u); }
+        ready = ready && atomicAdd(&runtime->failed, 0u) == 0;
+    }
+    __syncthreads();
+    if (!ready) { return; }
+    for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x; i < values; i += size_t(blockDim.x)*gridDim.x) {
+        destination[i] = input[i];
+    }
+}
+
+static __global__ void consume_input(uint32_t * flag, const source_runtime * runtime) {
+    // Stream order completes every payload block before host reuse.
+    if (!runtime->failed) { cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*flag).store(0, cuda::memory_order_release); }
 }
 
 static __global__ void wait_phase(source_control * control, source_runtime * runtime, uint32_t flag) {
@@ -441,6 +461,7 @@ struct core_layer {
     cudaEvent_t plan_ready = nullptr;
     uint64_t epoch = 0;
     uint64_t residency_token = 0;
+    uint32_t prefill_phase = UINT32_MAX;
 };
 
 struct core_source_statistics {
@@ -652,6 +673,7 @@ struct core_session {
     std::vector<std::unique_ptr<core_prefill_body>> prefill_bodies;
     size_t prefill_body_bytes = 0;
     uint64_t prefill_body_launches = 0, prefill_body_waves = 0, prefill_body_chunks = 0;
+    uint64_t prefill_schedule_token = 0;
     uint64_t prefill_body_shared_inputs = 0;
     uint64_t prefill_body_shared_plans = 0;
     uint64_t prefill_body_sorted_preparations = 0;
@@ -1170,8 +1192,18 @@ bool core_session::emit_operations(const std::vector<prepared_operation> & opera
             auto * flag = static_cast<uint32_t *>(view.device_flag);
             if (!cancel_alias || view.bytes != ggml_nbytes(operation.operation.tensor)) { return false; }
             auto * control = reinterpret_cast<source_control *>(cancel_alias + layers[0].control_offset);
-            copy_input<<<1, 256, 0, stream>>>(static_cast<uint8_t *>(operation.operation.tensor->data),
-                static_cast<const uint8_t *>(view.device_alias), view.bytes, flag, &control->stop, runtime());
+            if (prefill) {
+                const size_t values = view.bytes / sizeof(float);
+                const unsigned blocks = unsigned(std::min((values + 255) / 256, size_t(ggml_cuda_info().devices[parent->device].nsm) * 4));
+                if (!blocks || view.bytes % sizeof(float)) { return false; }
+                copy_input<<<1, 256, 0, stream>>>(nullptr, nullptr, 0, flag, &control->stop, runtime());
+                copy_input_payload<<<blocks, 256, 0, stream>>>(static_cast<uint32_t *>(operation.operation.tensor->data),
+                    static_cast<const uint32_t *>(view.device_alias), values, flag, runtime());
+                consume_input<<<1, 1, 0, stream>>>(flag, runtime());
+            } else {
+                copy_input<<<1, 256, 0, stream>>>(static_cast<uint8_t *>(operation.operation.tensor->data),
+                    static_cast<const uint8_t *>(view.device_alias), view.bytes, flag, &control->stop, runtime());
+            }
 #else
             return false;
 #endif
@@ -1543,6 +1575,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     const bool main_prefill = graph->execution_certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
         graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
         graph->execution_certificate.n_rows > 1;
+    source_cpu_range preparation_trace(cpu_profile && main_prefill, "generic.prefill.prepare", program_instance, 0);
     schedule.overlap_independent_ordinary = overlap_enabled && !main_prefill;
     schedule.leaf_context = this;
     schedule.bind_leaf = [](void * context, const ggml_tensor * original, ggml_backend_buffer_t * buffer, void ** data) {
@@ -1620,6 +1653,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     prefill = graph->execution_certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
         graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
         graph->execution_certificate.n_rows > 1;
+    preparation_trace.mark("generic.prefill.program_ready");
     if (prefill && std::any_of(experts.begin(), experts.end(), [](const ggml_moe_source_expert * expert) { return !expert->routed_operation; })) { return false; }
     shared_prefill_bytes = prefill ? owner().prefill_staging_capacity_bytes() : 0;
     if (prefill && !prefill_cpu_enabled) {
@@ -1676,6 +1710,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         }
         if (!prefill_bodies.empty() && !program->prepare(graph, experts, ggml_backend_get_default_buffer_type(config.backend), schedule)) { return false; }
     }
+    preparation_trace.mark("generic.prefill.body_plan_ready");
     if (!fits_device_budget(program->storage_bytes()) || !reserve_private_resources(program->storage_bytes(), 0) ||
             !program->allocate()) { return false; }
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=private_storage prefill=%d bytes=%zu elapsed_ns=%llu\n", int(prefill), program->storage_bytes(), (unsigned long long) (now_ns() - preparation_started)); }
@@ -1877,6 +1912,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             if (cudaEventCreateWithFlags(event, cudaEventDisableTiming) != cudaSuccess) { return false; }
         }
     }
+    preparation_trace.mark("generic.prefill.layer_storage");
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=layer_storage layers=%zu elapsed_ns=%llu\n", layers.size(), (unsigned long long) (now_ns() - preparation_started)); }
     if (prefill && !retain_routed_outputs) {
         size_t input_offset, ids_offset, output_offset;
@@ -1988,6 +2024,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             !owner_execution.resolve_streams([](void * context, const ggml_tensor *) {
                 return static_cast<core_session *>(context)->stream;
             }, this) || !acquire_owner(true)) { return false; }
+    preparation_trace.mark("generic.prefill.owner_ready");
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=owner_ready elapsed_ns=%llu\n", (unsigned long long) (now_ns() - preparation_started)); }
     for (auto & layer : layers) {
         for (uint32_t b = 0; b < layer.banks.size(); ++b) {
@@ -2001,11 +2038,13 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     const uint64_t profile_elapsed = now_ns() - profile_started;
     if (prefill && !profile_groups.empty() && (!wait_stream(stream, now_ns() + 5'000'000'000ull) ||
             !finish_owner() || !acquire_owner(false) || !wait_stream(stream, now_ns() + 5'000'000'000ull))) { return false; }
+    preparation_trace.mark("generic.prefill.profiles_ready");
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=profiles_ready apply_wall_ns=%llu elapsed_ns=%llu\n", (unsigned long long) profile_elapsed, (unsigned long long) (now_ns() - preparation_started)); }
     const uint64_t capture_started = now_ns();
     if (!prepare_capture_resources() ||
             !wait_stream(stream, now_ns() + 5'000'000'000ull) || !finish_owner()) { return false; }
     resources_live = false;
+    preparation_trace.mark("generic.prefill.capture_ready");
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=capture_ready capture_wall_ns=%llu elapsed_ns=%llu\n", (unsigned long long) (now_ns() - capture_started), (unsigned long long) (now_ns() - preparation_started)); }
     prepared = true;
     counters.window_fused_nodes = fused_nodes;
@@ -2974,6 +3013,7 @@ bool core_session::metadata_valid(const ggml_cgraph * graph, const ggml_graph_ex
 }
 
 bool core_session::replay_prefill_body(core_prefill_body & body) {
+    source_cpu_range body_trace(cpu_profile, "generic.prefill.body", epoch, body.first);
     auto & first = layers[body.first];
     const auto & geometry = first.descriptor->expert->region.geometry;
     std::vector<ggml_cuda_moe_prefill_body_bank> banks(body.count);
@@ -2995,6 +3035,7 @@ bool core_session::replay_prefill_body(core_prefill_body & body) {
                 owner_execution.find_group(bank.source.original, &bank.binding) != first.owner_group ||
                 !owner().get_hybrid_reference_view(*layer.owner_group, &view)) { return false; }
         bank.source.resource_identity = view.resource_identity; bank.source.residency_token = layer.residency_token;
+        bank.source.schedule_token = prefill_schedule_token; bank.source.schedule_phase = first.prefill_phase;
         bank.source.slot_for_expert = reinterpret_cast<int32_t *>(host + layer.map_offset);
         bank.source.expert_for_slot = reinterpret_cast<int32_t *>(host + layer.owners_offset);
         bank.source.expert_capacity = geometry.expert_count; bank.source.slot_capacity = geometry.expert_count;
@@ -3124,6 +3165,7 @@ bool core_session::replay_prefill_body(core_prefill_body & body) {
             nullptr, nullptr, nullptr, nullptr, &banks[0].source, &reader) != GGML_CUDA_MOE_GROUPED_DECODE_READY) { return false; }
     if (hook && (!hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_GPU_ENQUEUED, epoch, stream) ||
             !hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_CPU_JOINED, epoch, nullptr))) { return false; }
+    body_trace.mark("generic.prefill.body_enqueued");
     if (!wait_stream(stream, deadline) || canceled.load(std::memory_order_acquire)) { return false; }
     if (replay_diagnostic) {
         fprintf(stderr, "moe-source-prefill-row-bounds: program_instance=%llu body=%u old_rows=%llu exact_rows=%llu\n",
@@ -3155,6 +3197,16 @@ bool core_session::replay_prefill_body(core_prefill_body & body) {
 }
 
 ggml_status core_session::replay_prefill() {
+    source_cpu_range replay_trace(cpu_profile, "generic.prefill.replay", epoch, 0);
+    struct schedule_guard {
+        core_session & session;
+        ~schedule_guard() {
+            if (session.prefill_schedule_token) {
+                session.owner().finish_prefill_schedule(session.stream, session.prefill_schedule_token, false);
+                session.prefill_schedule_token = 0;
+            }
+        }
+    } scheduled{*this};
     bool ok = acquire_owner(false);
     *result() = {};
     result()->epoch = epoch;
@@ -3167,29 +3219,73 @@ ggml_status core_session::replay_prefill() {
         layers[i].branch_expected = layers[i].branch_completed = 0;
         layers[i].copy_submitted = false;
     }
+    const auto compatible_body = [&](const core_prefill_body & body) {
+        const auto & first = layers[body.first];
+        const auto experts = first.descriptor->expert->region.geometry.expert_count;
+        for (uint32_t k = 1; k < body.count; ++k) {
+            const auto & next = layers[body.first + k];
+            if (next.owner_group != first.owner_group || next.residency_token != first.residency_token ||
+                    memcmp(host + next.map_offset, host + first.map_offset, size_t(experts) * sizeof(int32_t))) { return false; }
+        }
+        return true;
+    };
+    prefill_schedule_token = 0;
+    for (auto & layer : layers) { layer.prefill_phase = UINT32_MAX; }
+    const auto * stream_ahead = std::getenv("GGML_MOE_SOURCE_PREFILL_STREAM_AHEAD");
+    const bool dense = std::all_of(layers.begin(), layers.end(), [](const core_layer & layer) {
+        const auto & geometry = layer.descriptor->expert->region.geometry;
+        return geometry.row_capacity >= geometry.expert_count;
+    });
+    if (ok && stream_ahead && strcmp(stream_ahead, "1") == 0 && !prefill_cpu_enabled && dense) {
+        std::vector<ggml_cuda_moe_prefill_phase> phases;
+        for (uint32_t i = 0; i < layers.size() && ok;) {
+            const auto body = std::find_if(prefill_bodies.begin(), prefill_bodies.end(),
+                [&](const std::unique_ptr<core_prefill_body> & body) { return body->first == i && compatible_body(*body); });
+            const uint32_t count = body == prefill_bodies.end() ? 1 : (*body)->count;
+            ggml_cuda_moe_prefill_phase phase;
+            phase.group = layers[i].owner_group;
+            for (uint32_t k = 0; k < count; ++k) {
+                auto & layer = layers[i + k];
+                const auto & geometry = layer.descriptor->expert->region.geometry;
+                ggml_cuda_moe_prefill_body_bank bank;
+                bank.node = &layer.routed_output;
+                bank.source.original = program->original_node(layer.descriptor->expert->region.first_node);
+                ggml_cuda_moe_hybrid_reference_view view;
+                if (owner_execution.find_group(bank.source.original, &bank.binding) != phase.group ||
+                        !owner().get_hybrid_reference_view(*phase.group, &view)) { ok = false; break; }
+                bank.source.resource_identity = view.resource_identity; bank.source.residency_token = layer.residency_token;
+                bank.source.slot_for_expert = reinterpret_cast<int32_t *>(host + layer.map_offset);
+                bank.source.expert_for_slot = reinterpret_cast<int32_t *>(host + layer.owners_offset);
+                bank.source.expert_capacity = geometry.expert_count; bank.source.slot_capacity = geometry.expert_count;
+                phase.banks.push_back(bank);
+                layer.prefill_phase = phases.size();
+            }
+            phases.push_back(std::move(phase));
+            i += count;
+        }
+        if (ok) { ok = owner().begin_prefill_schedule(phases, stream, &prefill_schedule_token); }
+    }
     if (ok) { ok = cudaMemcpyAsync(runtime(), result(), sizeof(source_runtime), cudaMemcpyHostToDevice, stream) == cudaSuccess; }
+    replay_trace.mark("generic.prefill.stream_ready");
     for (uint32_t i = 0; i < layers.size() && ok; ++i) {
         auto & layer = layers[i];
         const auto & expert = *layer.descriptor->expert;
         const auto & geometry = expert.region.geometry;
         control(i)->status = 0; control(i)->epoch = epoch; layer.epoch = epoch;
         control(i)->stop.store(canceled.load(std::memory_order_acquire) ? 1 : 0);
-        ok = !canceled.load(std::memory_order_acquire) && emit_operations(layer.prelude) &&
-            cudaMemcpy2DAsync(host + layer.ids_offset, layer.ids_stride, layer.descriptor->ids->data,
-                layer.descriptor->ids->nb[1], size_t(geometry.routes_per_row) * sizeof(int32_t), geometry.row_capacity,
-                cudaMemcpyDeviceToHost, stream) == cudaSuccess && wait_stream(stream, deadline) &&
-            !canceled.load(std::memory_order_acquire) && build_plan(i);
+        {
+            source_cpu_range router_trace(cpu_profile, "generic.prefill.router", epoch, i);
+            ok = !canceled.load(std::memory_order_acquire) && emit_operations(layer.prelude) &&
+                cudaMemcpy2DAsync(host + layer.ids_offset, layer.ids_stride, layer.descriptor->ids->data,
+                    layer.descriptor->ids->nb[1], size_t(geometry.routes_per_row) * sizeof(int32_t), geometry.row_capacity,
+                    cudaMemcpyDeviceToHost, stream) == cudaSuccess && wait_stream(stream, deadline) &&
+                !canceled.load(std::memory_order_acquire) && build_plan(i);
+        }
         if (!ok) { break; }
         const auto body = std::find_if(prefill_bodies.begin(), prefill_bodies.end(),
             [&](const std::unique_ptr<core_prefill_body> & body) { return body->first == i; });
         if (body != prefill_bodies.end()) {
-            bool compatible = true;
-            for (uint32_t k = 1; k < (*body)->count; ++k) {
-                const auto & next = layers[i + k];
-                compatible &= next.owner_group == layer.owner_group && next.residency_token == layer.residency_token &&
-                    !memcmp(host + next.map_offset, host + layer.map_offset, size_t(geometry.expert_count) * sizeof(int32_t));
-            }
-            if (compatible) {
+            if (compatible_body(**body)) {
                 ok = replay_prefill_body(**body);
                 if (!ok) { stop(); break; }
                 i += (*body)->count - 1;
@@ -3210,6 +3306,7 @@ ggml_status core_session::replay_prefill() {
         if (!ok) { break; }
         ggml_cuda_moe_prefill_source_binding source;
         source.original = original; source.resource_identity = view.resource_identity; source.residency_token = layer.residency_token;
+        source.schedule_token = prefill_schedule_token; source.schedule_phase = layer.prefill_phase;
         source.slot_for_expert = reinterpret_cast<int32_t *>(host + layer.map_offset);
         source.expert_for_slot = reinterpret_cast<int32_t *>(host + layer.owners_offset);
         source.expert_capacity = geometry.expert_count; source.slot_capacity = geometry.expert_count;
@@ -3282,6 +3379,13 @@ ggml_status core_session::replay_prefill() {
             (unsigned long long) program_instance, prefill_bodies.size(), (unsigned long long) prefill_body_launches,
             (unsigned long long) prefill_body_waves, (unsigned long long) prefill_body_chunks, prefill_body_bytes,
             pool.capacity, pool.peak, pool.used, (unsigned long long) prefill_body_shared_inputs, (unsigned long long) prefill_body_shared_plans, (unsigned long long) prefill_body_sorted_preparations);
+    }
+    if (prefill_schedule_token) {
+        const bool finished = owner().finish_prefill_schedule(stream, prefill_schedule_token, ok);
+        if (replay_diagnostic) { fprintf(stderr, "moe-source-prefill-stream: program_instance=%llu token=%llu complete=%d\n",
+            (unsigned long long) program_instance, (unsigned long long) prefill_schedule_token, int(finished)); }
+        ok &= finished;
+        prefill_schedule_token = 0;
     }
     if (ok && config.profile_adaptation) { ok = apply_profiles(false, true) && wait_stream(io, deadline) && !canceled.load(); }
     if (ok && hook) { ok = hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_BEFORE_PUBLISH, epoch, stream); }

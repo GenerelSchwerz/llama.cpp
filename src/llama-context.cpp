@@ -14,6 +14,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -4051,7 +4052,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 }
 
 bool llama_context::set_ple_prefetch(bool enabled) {
-    if (staged_inputs_checked) { return false; }
+    if (staged_inputs_checked || prefill_staged_inputs_checked) { return false; }
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
     auto set_callback = reinterpret_cast<ggml_backend_set_get_rows_callback_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_get_rows_callback"));
     if (!set_callback) { return false; }
@@ -4433,8 +4434,45 @@ llm_graph_result * llama_context::process_ubatch(
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
+    llama_staged_inputs * known_inputs = nullptr;
+    ggml_backend_t known_backend = nullptr;
+    const auto * prefill_stream_option = std::getenv("GGML_MOE_SOURCE_PREFILL_STREAM_AHEAD");
+    if (prefill_stream_option && strcmp(prefill_stream_option, "1") == 0 && ubatch.n_tokens > 1 &&
+            moe_hybrid_required && !use_sampled_input && source_core_enabled() &&
+            requested_certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+            requested_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+            model.per_layer_tok_embd && cparams.decode_boundary_overlap && !cparams.pipeline_parallel && !cparams.cb_eval &&
+            model.n_devices() == 1 && loras->empty() && dynamic_cast<llama_memory_hybrid_idx_context *>(mctx) &&
+            ubatch.token && !ubatch.is_mixed() &&
+            std::all_of(ubatch.n_seq_id, ubatch.n_seq_id + ubatch.n_tokens, [](int32_t n) { return n == 1; })) {
+        auto * backend = backends.front().get();
+        auto * device = ggml_backend_get_device(backend);
+        if (device && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") == 0) {
+            if (!prefill_staged_inputs_checked) {
+                prefill_staged_inputs = llama_staged_inputs::create(model, backend, ple_prefetch, cparams.n_ubatch, false);
+                prefill_staged_inputs_checked = true;
+                LLAMA_LOG_INFO("%s: staged prefill inputs %s, row capacity %u\n", __func__,
+                    prefill_staged_inputs ? "enabled" : "unavailable", cparams.n_ubatch);
+            }
+            known_inputs = prefill_staged_inputs.get();
+            if (known_inputs) {
+                try {
+                    known_inputs->set_rows(ubatch.n_tokens);
+                    const auto * memory = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+                    known_inputs->set_lookahead(memory->get_next_ubatch(), memory);
+                } catch (const std::exception & error) {
+                    LLAMA_LOG_ERROR("%s: staged prefill setup failed: %s\n", __func__, error.what());
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                known_backend = backend;
+            }
+        }
+    }
+
     // Graph reuse must include the full topology and input compatibility.
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    if (known_inputs) { gparams.staged_inputs = known_inputs; }
     if (moe_hybrid_required && memcmp(&moe_hybrid_graph_certificate, &requested_certificate, sizeof(requested_certificate))) {
         gf_res_prev_active = nullptr;
     }
@@ -4564,6 +4602,13 @@ llm_graph_result * llama_context::process_ubatch(
         }
         place_moe_regions(res);
         place_sampled_inputs(res);
+        if (known_backend) {
+            for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+                if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), tensor, known_backend);
+                }
+            }
+        }
         sampled_inputs_device = use_sampled_input_async;
         moe_source_active_input_mode = use_sampled_input_async ? 2 : unsigned(use_sampled_input);
         const bool allocated = rebuild_async ? ggml_backend_sched_alloc_graph_async(sched.get(), gf) :
@@ -4617,6 +4662,15 @@ llm_graph_result * llama_context::process_ubatch(
         }
     }
 
+    // Finish the producer before failed input setup can retire its graph or history.
+    const auto finish_staged = [&](llama_staged_inputs * input) {
+        if (input) {
+            moe_source_poisoned.store(true);
+            try { input->finish(); } catch (...) {}
+        }
+    };
+    std::unique_ptr<llama_staged_inputs, decltype(finish_staged)> staged_guard(known_inputs, finish_staged);
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -4648,7 +4702,7 @@ llm_graph_result * llama_context::process_ubatch(
                 }
             }
         } else {
-            auto * backend = mtp_input_backend();
+            auto * backend = known_backend ? known_backend : mtp_input_backend();
             bool stage_mtp = backend != nullptr;
             bool has_device_inputs = false;
             for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); stage_mtp && tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
@@ -4675,6 +4729,16 @@ llm_graph_result * llama_context::process_ubatch(
         return nullptr;
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch, execution_intent);
+    if (known_inputs) {
+        try {
+            known_inputs->finish();
+        } catch (const std::exception & error) {
+            moe_source_poisoned.store(true);
+            LLAMA_LOG_ERROR("%s: staged prefill input failed: %s\n", __func__, error.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4689,6 +4753,7 @@ llm_graph_result * llama_context::process_ubatch(
     }
     ret = GGML_STATUS_SUCCESS;
 
+    staged_guard.release();
     return res;
 }
 

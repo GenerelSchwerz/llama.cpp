@@ -16,6 +16,7 @@ bool ggml_cuda_staged_input_compute(ggml_backend_cuda_context & ctx, ggml_tensor
 const ggml_staged_input_api * ggml_cuda_staged_input_api();
 bool ggml_cuda_staged_input_set_submit(void * input, void (*submit)(void *), void * context);
 bool ggml_cuda_staged_input_pending_for_test(void * input);
+bool ggml_cuda_staged_input_consumed(void * input);
 
 struct ggml_cuda_source_staged_input_view {
     const void * host = nullptr;

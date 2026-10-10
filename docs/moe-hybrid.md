@@ -148,6 +148,14 @@ Load the model-bound statistics with `--moe-expert-profile calibration.gguf`. De
 
 Observers are private test hooks. Without an observer, the runtime skips source-access enumeration. Profile loading uses the canonical residency owner; it does not create a second expert cache.
 
+## Experimental prefill overlap
+
+Set `GGML_MOE_SOURCE_PREFILL_STREAM_AHEAD=1` for the server process to enable bounded expert staging across prefill layers and known-token input lookahead. Use `-b 8192 -ub 2048` to expose multiple prompt chunks within one decode call. The option defaults off; ordinary decode and full-GPU execution keep their existing paths.
+
+Expert staging reuses the canonical owner and its two fixed lanes. Input backing is bounded by one configured ubatch plus one future host chunk. Input lookahead requires supported readable embedding/ngram tables and a compatible backend; other models keep their original generic input handling. Original expert kernels, logical row counts and cache capacity checks are preserved.
+
+Cold graph/resource preparation and chunk transitions can still expose GPU gaps. This option does not establish scheduling fairness, prefill/decode VRAM lending, native Windows, physical multi-GPU or concurrent-request qualification.
+
 ## Validation and limits
 
 Focused existing fixtures cover routed/native CPU service, original quantization, source ownership, publication, graph/state reuse, cancellation, backing retention, auxiliary contexts, partial-pin transport and logical observation. LFM and Nemotron controls compare matching mixed CPU/GPU arithmetic; a GPU-only reference is not exact hybrid arithmetic.

@@ -18125,6 +18125,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_STAGED_INPUT_PROC) == 0) {
         return (void *) ggml_cuda_staged_input_api;
     }
+    if (strcmp(name, GGML_STAGED_INPUT_CONSUMED_PROC) == 0) {
+        return (void *) ggml_cuda_staged_input_consumed;
+    }
     if (strcmp(name, GGML_STAGED_INPUT_SET_SUBMIT_PROC) == 0) {
         return (void *) ggml_cuda_staged_input_set_submit;
     }

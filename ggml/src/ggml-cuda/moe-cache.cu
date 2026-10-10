@@ -6882,6 +6882,22 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
 
+        struct phase {
+            ggml_cuda_moe_prefill_phase descriptor;
+            std::array<size_t, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> offsets = {};
+        };
+        struct wave {
+            uint32_t phase = 0;
+            int32_t begin = 0, end = 0;
+            std::vector<int32_t> misses;
+        };
+        std::vector<phase> phases;
+        std::vector<wave> waves;
+        size_t issued = 0, consumed = 0;
+        uint64_t schedule_token = 0, next_token = 1;
+        cudaStream_t compute_stream = nullptr;
+        uint64_t schedule_bytes = 0;
+
         int device;
         size_t lane_bytes;
         void * data = nullptr;
@@ -7010,6 +7026,21 @@ struct ggml_cuda_moe_grouped_context::impl {
         early_max_rows = std::max(1u, max_rows);
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+    }
+
+    bool prepare_prefill_staging() {
+        if (prefill_staging) { return !prefill_staging->failed; }
+        auto prospective = std::unique_ptr<prefill_staging_arena>(new (std::nothrow) prefill_staging_arena(device, prefill_staging_lane_bytes));
+        if (!prospective || prefill_staging_lane_bytes > SIZE_MAX / 2) { return false; }
+        moe_grouped_device_scope device_scope(device);
+        if (!moe_grouped_cuda_success(cudaMalloc(&prospective->data, 2 * prefill_staging_lane_bytes)) ||
+                !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&prospective->copy_stream, cudaStreamNonBlocking))) { return false; }
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+            if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&prospective->ready[lane], cudaEventDisableTiming)) ||
+                    !moe_grouped_cuda_success(cudaEventCreateWithFlags(&prospective->released[lane], cudaEventDisableTiming))) { return false; }
+        }
+        prefill_staging = std::move(prospective);
+        return true;
     }
 
     bool frequency_aware = true;
@@ -17702,6 +17733,186 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_prefi
 #endif
 }
 
+static size_t moe_prefill_wave_layout(const ggml_tensor * const * weights, uint32_t count, uint32_t slots,
+        size_t lane_bytes, int device, size_t * offsets) {
+    if (!weights || !count || count > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || !slots) { return 0; }
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cuda_buffer_type(device));
+    size_t stride = 0, padding = 0;
+    if (!alignment) { return 0; }
+    for (uint32_t b = 0; b < count; ++b) {
+        const auto * bank = weights[b];
+        if (!bank || !bank->nb[2] || bank->nb[2] > SIZE_MAX - stride) { return 0; }
+        const size_t extra = moe_cache_quantized_source_padding(bank->type, bank->ne[0]);
+        if (extra > SIZE_MAX - padding) { return 0; }
+        stride += bank->nb[2]; padding += extra;
+    }
+    if (padding >= lane_bytes) { return 0; }
+    size_t capacity = std::min<size_t>(slots, (lane_bytes - padding) / stride);
+    while (capacity) {
+        size_t offset = 0;
+        bool fits = true;
+        for (uint32_t b = 0; b < count; ++b) {
+            if (offset > SIZE_MAX - (alignment - 1)) { return 0; }
+            offset = (offset + alignment - 1) / alignment * alignment;
+            offsets[b] = offset;
+            const size_t bytes = capacity * weights[b]->nb[2] + moe_cache_quantized_source_padding(weights[b]->type, weights[b]->ne[0]);
+            if (offset > lane_bytes || bytes > lane_bytes - offset) { fits = false; break; }
+            offset += bytes;
+        }
+        if (fits) { return capacity; }
+        --capacity;
+    }
+    return 0;
+}
+
+bool ggml_cuda_moe_grouped_context::issue_prefill_schedule() {
+    auto & arena = *impl_->prefill_staging;
+    const size_t limit = std::min(arena.waves.size(), arena.consumed + arena.ready.size());
+    while (arena.issued < limit) {
+        const auto & wave = arena.waves[arena.issued];
+        const auto & phase = arena.phases[wave.phase];
+        const size_t lane = arena.issued % arena.ready.size();
+        if (arena.release_recorded[lane] && !moe_grouped_cuda_success(cudaStreamWaitEvent(arena.copy_stream, arena.released[lane], 0))) { return false; }
+        auto * data = static_cast<char *>(arena.data) + lane * arena.lane_bytes;
+        for (size_t b = 0; b < phase.descriptor.banks.size(); ++b) {
+            const auto * weight = phase.descriptor.banks[b].node->src[0];
+            auto * destination = data + phase.offsets[b];
+            bool direct;
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                const auto * source = impl_->source_for(weight);
+                direct = !source || source->device_alias;
+            }
+            for (size_t miss = 0; miss < wave.misses.size();) {
+                size_t count = 1;
+                while (direct && miss + count < wave.misses.size() && wave.misses[miss + count] == wave.misses[miss + count - 1] + 1) { ++count; }
+                const size_t bytes = count * weight->nb[2];
+                if (!copy_staged_source(weight, destination + miss * weight->nb[2],
+                        static_cast<const char *>(weight->data) + size_t(wave.misses[miss]) * weight->nb[2], bytes, arena.copy_stream)) { return false; }
+                if (bytes > UINT64_MAX - arena.schedule_bytes) { return false; }
+                arena.schedule_bytes += bytes;
+                miss += count;
+            }
+            const size_t padding = moe_cache_quantized_source_padding(weight->type, weight->ne[0]);
+            if (!wave.misses.empty() && padding && !moe_grouped_cuda_success(cudaMemsetAsync(
+                    destination + wave.misses.size() * weight->nb[2], 0, padding, arena.copy_stream))) { return false; }
+        }
+        if (!moe_grouped_cuda_success(cudaEventRecord(arena.ready[lane], arena.copy_stream))) { return false; }
+        ++arena.issued;
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::begin_prefill_schedule(const std::vector<ggml_cuda_moe_prefill_phase> & phases,
+        ggml_cuda_moe_stream_t stream, uint64_t * token) {
+    if (!token) { return false; }
+    *token = 0;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(phases); GGML_UNUSED(stream);
+    return false;
+#else
+    std::lock_guard<std::mutex> staging_lock(impl_->prefill_staging_mutex);
+    cudaStreamCaptureStatus capture;
+    if (!stream || phases.empty() || phases.size() > UINT32_MAX ||
+            !moe_grouped_cuda_success(cudaStreamIsCapturing(stream, &capture)) || capture != cudaStreamCaptureStatusNone ||
+            !impl_->prepare_prefill_staging()) { return false; }
+    auto & arena = *impl_->prefill_staging;
+    if (arena.schedule_token || !arena.next_token) { return false; }
+    std::vector<impl::prefill_staging_arena::phase> prepared;
+    std::vector<impl::prefill_staging_arena::wave> waves;
+    try {
+        for (const auto & phase : phases) {
+            const auto * group = phase.group;
+            ggml_cuda_moe_hybrid_reference_view view;
+            if (!group || group->stream != stream || !group->defer_completion || phase.banks.empty() ||
+                    phase.banks.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || !get_hybrid_reference_view(*group, &view)) { return false; }
+            impl::prefill_staging_arena::phase current;
+            current.descriptor = phase;
+            const ggml_tensor * weights[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+            const auto & first = phase.banks.front().source;
+            if (!first.slot_for_expert || !first.expert_for_slot || first.expert_capacity != view.n_experts ||
+                    first.slot_capacity < group->n_slots || first.measure_resources) { return false; }
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            const auto * resource = impl_->find_resource(group->transaction);
+            if (!resource || resource->residency_token != first.residency_token || resource->device->serial != first.resource_identity) { return false; }
+            const auto & candidate = impl_->table.groups[group->key.candidate.group_index];
+            for (size_t b = 0; b < phase.banks.size(); ++b) {
+                const auto & bank = phase.banks[b];
+                const auto & binding = bank.binding;
+                const auto * original = bank.source.original;
+                if (!bank.node || !bank.node->src[0] || !original || !ggml_cuda_mmid_shape_valid(original) ||
+                        bank.node->src[0] != original->src[0] || binding.bank_index >= candidate.banks.size() ||
+                        binding.slot_index >= resource->snapshot.banks.size() || binding.slot_index >= group->key.n_banks ||
+                        binding.key.candidate.generation != group->key.candidate.generation ||
+                        binding.key.candidate.group_index != group->key.candidate.group_index ||
+                        binding.key.execution_semantic_key != group->key.execution_semantic_key ||
+                        candidate.banks[binding.bank_index].slot_index != binding.slot_index ||
+                        candidate.banks[binding.bank_index].info.role != binding.role ||
+                        !moe_candidate_record_matches(candidate.banks[binding.bank_index], original->src[0]) ||
+                        resource->snapshot.banks[binding.slot_index].tensor != original->src[0] ||
+                        resource->device->bank_data[binding.slot_index] != group->bank_data[binding.slot_index] ||
+                        bank.source.resource_identity != first.resource_identity || bank.source.residency_token != first.residency_token ||
+                        bank.source.expert_capacity != first.expert_capacity || bank.source.slot_capacity != first.slot_capacity ||
+                        !bank.source.slot_for_expert || !bank.source.expert_for_slot || bank.source.measure_resources ||
+                        memcmp(bank.source.slot_for_expert, first.slot_for_expert, size_t(view.n_experts) * sizeof(int32_t))) { return false; }
+                weights[b] = original->src[0];
+                for (size_t previous = 0; previous < b; ++previous) {
+                    if (phase.banks[previous].binding.slot_index == binding.slot_index) { return false; }
+                }
+            }
+            for (uint32_t e = 0; e < view.n_experts; ++e) {
+                const int32_t slot = first.slot_for_expert[e];
+                if (slot < -1 || (slot >= 0 && (uint32_t(slot) >= group->n_slots || first.expert_for_slot[slot] != int32_t(e)))) { return false; }
+            }
+            for (uint32_t slot = 0; slot < group->n_slots; ++slot) {
+                const int32_t expert = first.expert_for_slot[slot];
+                if (expert < -1 || (expert >= 0 && (uint32_t(expert) >= view.n_experts || first.slot_for_expert[expert] != int32_t(slot)))) { return false; }
+            }
+            const size_t capacity = moe_prefill_wave_layout(weights, phase.banks.size(), group->n_slots, arena.lane_bytes, impl_->device, current.offsets.data());
+            if (!capacity || view.n_experts > INT32_MAX) { return false; }
+            for (int32_t begin = 0; begin < int32_t(view.n_experts);) {
+                impl::prefill_staging_arena::wave wave;
+                wave.phase = prepared.size(); wave.begin = begin; wave.end = begin;
+                while (wave.end < int32_t(view.n_experts)) {
+                    if (first.slot_for_expert[wave.end] < 0) {
+                        if (wave.misses.size() == capacity) { break; }
+                        wave.misses.push_back(wave.end);
+                    }
+                    ++wave.end;
+                }
+                begin = wave.end;
+                waves.push_back(std::move(wave));
+            }
+            prepared.push_back(std::move(current));
+        }
+    } catch (const std::bad_alloc &) { return false; }
+    arena.phases = std::move(prepared); arena.waves = std::move(waves);
+    arena.issued = arena.consumed = 0; arena.schedule_bytes = 0;
+    arena.compute_stream = stream; arena.schedule_token = arena.next_token++;
+    *token = arena.schedule_token;
+    return issue_prefill_schedule();
+#endif
+}
+
+bool ggml_cuda_moe_grouped_context::finish_prefill_schedule(ggml_cuda_moe_stream_t stream, uint64_t token, bool complete) {
+    std::lock_guard<std::mutex> lock(impl_->prefill_staging_mutex);
+    if (!impl_->prefill_staging || !token) { return false; }
+    auto & arena = *impl_->prefill_staging;
+    if (arena.schedule_token != token || arena.compute_stream != stream) { return false; }
+    const bool valid = complete && arena.consumed == arena.waves.size();
+    const bool copy_drained = moe_grouped_cuda_success(cudaStreamSynchronize(arena.copy_stream));
+    const bool compute_drained = moe_grouped_cuda_success(cudaStreamSynchronize(stream));
+    arena.failed |= !copy_drained || !compute_drained;
+    if (arena.failed) { return false; }
+    if (auto * debug = impl_->debug_stats()) { debug->prefill_bounded_h2d_bytes.fetch_add(arena.schedule_bytes, std::memory_order_relaxed); }
+    fprintf(stderr, "moe-prefill-stream: token=%llu phases=%zu issued=%zu consumed=%zu h2d_bytes=%llu staging_bytes=%zu complete=%d\n",
+        (unsigned long long) token, arena.phases.size(), arena.issued, arena.consumed,
+        (unsigned long long) arena.schedule_bytes, 2 * arena.lane_bytes, int(valid));
+    arena.phases.clear(); arena.waves.clear(); arena.schedule_token = 0; arena.compute_stream = nullptr;
+    arena.release_recorded.fill(false);
+    return valid;
+}
+
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bounded_prefill(
         ggml_backend_cuda_context & context,
         ggml_cuda_moe_graph_group_dispatch * group,
@@ -18133,51 +18344,27 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bound
     if (wave_padding >= staging_lane_bytes) {
         return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
     }
-    size_t wave_capacity = std::min<size_t>(group->n_slots, (staging_lane_bytes - wave_padding) / wave_stride);
-    if (n_banks > 1) {
-        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cuda_buffer_type(impl_->device));
-        if (!alignment) { return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK; }
-        while (wave_capacity) {
-            size_t offset = 0;
-            bool fits = true;
-            for (uint32_t bank = 0; bank < n_banks; ++bank) {
-                if (offset > SIZE_MAX - (alignment - 1)) { return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK; }
-                offset = (offset + alignment - 1) / alignment * alignment;
-                lane_offsets[bank] = offset;
-                const size_t bytes = wave_capacity * expert_stride[bank] + source_padding[bank];
-                if (offset > staging_lane_bytes || bytes > staging_lane_bytes - offset) { fits = false; break; }
-                offset += bytes;
-            }
-            if (fits) { break; }
-            --wave_capacity;
-        }
-    }
+    const size_t wave_capacity = moe_prefill_wave_layout(weights, n_banks, group->n_slots,
+        staging_lane_bytes, impl_->device, lane_offsets);
     if (wave_capacity == 0) {
         return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
     }
-    if (impl_->prefill_staging == nullptr) {
-        auto prospective = std::unique_ptr<impl::prefill_staging_arena>(
-            new (std::nothrow) impl::prefill_staging_arena(impl_->device, staging_lane_bytes));
-        if (prospective == nullptr) {
-            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-        }
-        moe_grouped_device_scope device_scope(impl_->device);
-        if (staging_lane_bytes > SIZE_MAX / 2 ||
-                !moe_grouped_cuda_success(cudaMalloc(&prospective->data, 2 * staging_lane_bytes)) ||
-                !moe_grouped_cuda_success(cudaStreamCreateWithFlags(&prospective->copy_stream, cudaStreamNonBlocking))) {
-            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-        }
-        for (uint32_t lane = 0; lane < 2; ++lane) {
-            if (!moe_grouped_cuda_success(cudaEventCreateWithFlags(&prospective->ready[lane], cudaEventDisableTiming)) ||
-                    !moe_grouped_cuda_success(cudaEventCreateWithFlags(&prospective->released[lane], cudaEventDisableTiming))) {
-                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-            }
-        }
-        impl_->prefill_staging = std::move(prospective);
-    }
+    if (!impl_->prepare_prefill_staging()) { return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK; }
     auto & arena = *impl_->prefill_staging;
     if (arena.failed) {
         return GGML_CUDA_MOE_GROUPED_DECODE_ERROR;
+    }
+    const bool scheduled = source_binding && source_binding->schedule_token;
+    if (scheduled != bool(arena.schedule_token) || (scheduled && (cpu_partition || paired ||
+            source_binding->schedule_token != arena.schedule_token || stream != arena.compute_stream ||
+            source_binding->schedule_phase >= arena.phases.size()))) { return GGML_CUDA_MOE_GROUPED_DECODE_ERROR; }
+    if (scheduled) {
+        const auto & phase = arena.phases[source_binding->schedule_phase];
+        if (phase.descriptor.group != group || phase.descriptor.banks.size() != n_banks) { return GGML_CUDA_MOE_GROUPED_DECODE_ERROR; }
+        for (uint32_t b = 0; b < n_banks; ++b) {
+            if (phase.descriptor.banks[b].node->src[0] != weights[b] || phase.offsets[b] != lane_offsets[b] ||
+                    phase.descriptor.banks[b].source.residency_token != source_binding->residency_token) { return GGML_CUDA_MOE_GROUPED_DECODE_ERROR; }
+        }
     }
     const auto fail_after_enqueue = [&]() {
         const bool copy_drained = moe_grouped_cuda_success(cudaStreamSynchronize(arena.copy_stream));
@@ -18221,7 +18408,14 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bound
         if (range_begin > last_active) { break; }
         int32_t range_end = range_begin;
         misses.clear();
-        while (range_end <= last_active) {
+        if (scheduled) {
+            if (arena.consumed >= arena.issued || arena.consumed >= arena.waves.size()) { return fail_after_enqueue(); }
+            const auto & entry = arena.waves[arena.consumed];
+            if (entry.phase != source_binding->schedule_phase || entry.begin != range_begin) { return fail_after_enqueue(); }
+            range_end = entry.end;
+            misses = entry.misses;
+        }
+        while (!scheduled && range_end <= last_active) {
             if (cpu_partition && cpu_experts[range_end]) { break; }
             const bool missing = active[range_end] && slots[range_end] < 0;
             if (missing && misses.size() == wave_capacity) {
@@ -18251,14 +18445,27 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bound
                 source_map_host[expert] = slot;
             }
         }
-        if (!max_rows) { range_begin = range_end; continue; }
+        const size_t lane = scheduled ? arena.consumed % arena.ready.size() : wave % arena.ready.size();
+        const auto consume = [&]() {
+            if (!scheduled) { return true; }
+            if (!moe_grouped_cuda_success(cudaEventRecord(arena.released[lane], stream))) { return false; }
+            arena.release_recorded[lane] = true;
+            ++arena.consumed;
+            return issue_prefill_schedule();
+        };
+        if (!max_rows) {
+            if (!consume()) { return fail_after_enqueue(); }
+            range_begin = range_end;
+            continue;
+        }
         for (uint32_t miss = 0; miss < misses.size(); ++miss) {
             source_map_host[misses[miss]] = static_cast<int32_t>(group->n_slots + miss);
         }
 
-        const uint32_t lane = wave % 2;
         char * lane_data = static_cast<char *>(arena.data) + lane * arena.lane_bytes;
-        if (!misses.empty()) {
+        if (scheduled) {
+            if (!moe_grouped_cuda_success(cudaStreamWaitEvent(stream, arena.ready[lane], 0))) { return fail_after_enqueue(); }
+        } else if (!misses.empty()) {
             if ((arena.release_recorded[lane] && !moe_grouped_cuda_success(
                     cudaStreamWaitEvent(arena.copy_stream, arena.released[lane], 0)))) {
                 return fail_after_enqueue();
@@ -18324,7 +18531,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::execute_bound
                     lane_data, source_map_host, group->n_slots, misses.size(), range_begin, range_end - range_begin)) {
             return fail_after_enqueue();
         }
-        if (!misses.empty()) {
+        if (scheduled) {
+            if (!consume()) { return fail_after_enqueue(); }
+        } else if (!misses.empty()) {
             if (!moe_grouped_cuda_success(cudaEventRecord(arena.released[lane], stream))) {
                 return fail_after_enqueue();
             }

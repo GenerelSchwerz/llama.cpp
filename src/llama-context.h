@@ -583,6 +583,8 @@ private:
     uint64_t compute_sync_generation = 0;
     bool sampled_inputs_device = false;
     std::unique_ptr<class llama_staged_inputs> staged_inputs;
+    std::unique_ptr<class llama_staged_inputs> prefill_staged_inputs;
+    bool prefill_staged_inputs_checked = false;
     bool staged_inputs_checked = false;
     struct sampled_input_staging {
         ggml_backend_buffer_ptr buffer;

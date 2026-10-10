@@ -32,14 +32,22 @@ struct staged_input {
     GGML_ABORT("staged input requires its CUDA backend");
 }
 
-static bool enqueue(staged_input & input, cudaStream_t stream, void * dst) {
+static uint64_t logical_bytes(const ggml_tensor * tensor) {
+    uint64_t bytes = 0;
+    static_assert(sizeof(ggml_custom_op_params) + sizeof(bytes) <= GGML_MAX_OP_PARAMS);
+    std::memcpy(&bytes, reinterpret_cast<const char *>(tensor->op_params) + sizeof(ggml_custom_op_params), sizeof(bytes));
+    return bytes;
+}
+
+static bool enqueue(staged_input & input, cudaStream_t stream, void * dst, size_t bytes) {
+    if (!bytes || bytes > input.bytes) { return false; }
     return input.wait(stream, input.device_flag, 1, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS &&
-        cudaMemcpyAsync(dst, input.host, input.bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+        cudaMemcpyAsync(dst, input.host, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
         input.write(stream, input.device_flag, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
 }
 
 static void * create(ggml_backend_t backend, size_t bytes) {
-    if (!bytes || bytes > 1024*1024) { return nullptr; }
+    if (!bytes || bytes > size_t(INT64_MAX)) { return nullptr; }
     // Resolve stream memops without adding a CUDA driver link dependency.
     auto input = std::make_unique<staged_input>();
     const auto resolve = [](const char * name, void ** function) {
@@ -76,13 +84,13 @@ static void * create(ggml_backend_t backend, size_t bytes) {
     void * dst = nullptr;
     bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess && cudaMalloc(&dst, bytes) == cudaSuccess;
     if (ok) {
-        ok = enqueue(*input, stream, dst) && cudaStreamSynchronize(stream) == cudaSuccess &&
+        ok = enqueue(*input, stream, dst, bytes) && cudaStreamSynchronize(stream) == cudaSuccess &&
             input->flag->load(std::memory_order_acquire) == 0;
     }
     if (ok) {
         ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
         if (ok) {
-            ok = enqueue(*input, stream, dst);
+            ok = enqueue(*input, stream, dst, bytes);
             const auto end = cudaStreamEndCapture(stream, &graph);
             ok = ok && end == cudaSuccess && graph;
         }
@@ -103,8 +111,11 @@ static void * create(ggml_backend_t backend, size_t bytes) {
 
 static ggml_tensor * build(void * opaque, ggml_context * ctx, ggml_tensor * dependency, int64_t elements) {
     auto * input = static_cast<staged_input *>(opaque);
-    GGML_ASSERT(elements > 0 && size_t(elements)*sizeof(float) == input->bytes);
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, elements, 1, 1, 1, &dependency, dependency ? 1 : 0, marker, 1, input);
+    GGML_ASSERT(elements > 0 && uint64_t(elements) <= input->bytes/sizeof(float));
+    auto * tensor = ggml_custom_4d(ctx, GGML_TYPE_F32, elements, 1, 1, 1, &dependency, dependency ? 1 : 0, marker, 1, input);
+    const uint64_t bytes = uint64_t(elements)*sizeof(float);
+    std::memcpy(reinterpret_cast<char *>(tensor->op_params) + sizeof(ggml_custom_op_params), &bytes, sizeof(bytes));
+    return tensor;
 }
 }
 
@@ -120,8 +131,8 @@ bool ggml_cuda_staged_input_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     ggml_custom_op_params params;
     memcpy(&params, tensor->op_params, sizeof(params));
     auto & input = *static_cast<staged_input *>(params.userdata);
-    GGML_ASSERT(ggml_nbytes(tensor) == input.bytes);
-    return enqueue(input, ctx.stream(), tensor->data);
+    GGML_ASSERT(ggml_nbytes(tensor) <= input.bytes && ggml_nbytes(tensor) == logical_bytes(tensor));
+    return enqueue(input, ctx.stream(), tensor->data, ggml_nbytes(tensor));
 }
 
 const ggml_staged_input_api * ggml_cuda_staged_input_api() {
@@ -138,6 +149,9 @@ const ggml_staged_input_api * ggml_cuda_staged_input_api() {
 bool ggml_cuda_staged_input_pending_for_test(void * input) {
     return static_cast<staged_input *>(input)->flag->load(std::memory_order_acquire) != 0;
 }
+bool ggml_cuda_staged_input_consumed(void * input) {
+    return input && !ggml_cuda_staged_input_pending_for_test(input);
+}
 bool ggml_cuda_staged_input_set_submit(void * opaque, void (*submit)(void *), void * context) {
     auto * input = static_cast<staged_input *>(opaque);
     if (!input || !submit || input->submit) { return false; }
@@ -153,6 +167,7 @@ bool ggml_cuda_staged_input_prepare_source_view(int device, const ggml_tensor * 
             uint64_t(node->ne[0]) > SIZE_MAX / sizeof(float) || uint64_t(node->ne[0]) > uint64_t(INT64_MAX) / sizeof(float) ||
             node->view_src || node->view_offs) { return false; }
     const size_t bytes = size_t(node->ne[0]) * sizeof(float);
+    if (logical_bytes(node) != bytes) { return false; }
     if (node->nb[0] != sizeof(float)) { return false; }
     for (int i = 1; i < 4; ++i) { if (node->ne[i] != 1 || node->nb[i] != bytes) { return false; } }
     ggml_custom_op_params params;
@@ -160,7 +175,7 @@ bool ggml_cuda_staged_input_prepare_source_view(int device, const ggml_tensor * 
     if (params.fun != marker || params.n_tasks != 1 || !params.userdata ||
             reinterpret_cast<uintptr_t>(params.userdata) % alignof(staged_input)) { return false; }
     const auto & input = *static_cast<const staged_input *>(params.userdata);
-    if (input.device != device || input.bytes != bytes || !input.host || !input.flag || !input.device_flag ||
+    if (input.device != device || input.bytes < bytes || !input.host || !input.flag || !input.device_flag ||
             sizeof(std::atomic<uint32_t>) != sizeof(uint32_t) || !std::atomic<uint32_t>::is_always_lock_free ||
             reinterpret_cast<uintptr_t>(input.host) % alignof(float) ||
             reinterpret_cast<uintptr_t>(input.flag) % alignof(std::atomic<uint32_t>)) { return false; }
@@ -204,5 +219,6 @@ bool ggml_cuda_staged_input_compute(ggml_backend_cuda_context &, ggml_tensor *) 
 const ggml_staged_input_api * ggml_cuda_staged_input_api() { return nullptr; }
 bool ggml_cuda_staged_input_set_submit(void *, void (*)(void *), void *) { return false; }
 bool ggml_cuda_staged_input_pending_for_test(void *) { return false; }
+bool ggml_cuda_staged_input_consumed(void *) { return false; }
 bool ggml_cuda_staged_input_prepare_source_view(int, const ggml_tensor *, ggml_cuda_source_staged_input_view & view) { view = {}; return false; }
 #endif

@@ -137,6 +137,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    const llama_ubatch * get_next_ubatch() const;
     uint32_t get_attn_reserve_n_kv() const override;
 
     //
