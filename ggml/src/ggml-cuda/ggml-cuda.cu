@@ -3309,13 +3309,26 @@ struct ggml_cuda_rms_norm_gated_match {
 };
 
 static bool ggml_cuda_match_rms_norm_gated(const ggml_cgraph * cgraph, int i, ggml_cuda_rms_norm_gated_match & match) {
-    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
-        return false;
+    if (cgraph->nodes[i]->op != GGML_OP_RMS_NORM && cgraph->nodes[i]->op != GGML_OP_UNARY) { return false; }
+    int indices[4], count = 0;
+    ggml_op ops[4];
+    for (int j = i; j < cgraph->n_nodes && count < 4; ++j) {
+        const auto op = cgraph->nodes[j]->op;
+        if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) { continue; }
+        if (op != GGML_OP_RMS_NORM && op != GGML_OP_MUL && op != GGML_OP_UNARY) { return false; }
+        indices[count] = j;
+        ops[count++] = op;
     }
-    ggml_tensor * norm  = cgraph->nodes[i];
-    ggml_tensor * mul   = cgraph->nodes[i + 1];
-    ggml_tensor * unary = cgraph->nodes[i + 2];
-    ggml_tensor * dst   = cgraph->nodes[i + 3];
+    if (count != 4 || ops[3] != GGML_OP_MUL ||
+            !ggml_can_fuse_subgraph_ext(cgraph, indices, 4, ops, &indices[3], 1)) { return false; }
+    ggml_tensor * norm = nullptr, * mul = nullptr, * unary = nullptr;
+    for (int j = 0; j < 3; ++j) {
+        ggml_tensor ** slot = ops[j] == GGML_OP_RMS_NORM ? &norm : ops[j] == GGML_OP_UNARY ? &unary : &mul;
+        if (*slot) { return false; }
+        *slot = cgraph->nodes[indices[j]];
+    }
+    if (!norm || !mul || !unary) { return false; }
+    ggml_tensor * dst = cgraph->nodes[indices[3]];
     const ggml_unary_op gate_op = ggml_get_unary_op(unary);
     if ((gate_op != GGML_UNARY_OP_SILU && gate_op != GGML_UNARY_OP_SIGMOID) || norm->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -3332,7 +3345,13 @@ static bool ggml_cuda_match_rms_norm_gated(const ggml_cgraph * cgraph, int i, gg
             gate == norm || gate == mul || gate->view_src == norm || gate->view_src == mul) {
         return false;
     }
-    match = { norm, mul, gate, dst, 4, gate_op };
+    const ggml_tensor * reads[] = {norm->src[0], weight, gate};
+    for (const ggml_tensor * read : reads) {
+        for (const ggml_tensor * internal : {norm, mul, unary, dst}) {
+            if (read == internal || read->view_src == internal) { return false; }
+        }
+    }
+    match = { norm, mul, gate, dst, indices[3] - i + 1, gate_op };
     return true;
 }
 
@@ -4150,11 +4169,6 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
         if (!(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
         return match;
     }
-    ggml_tensor * norm = graph->nodes[i];
-    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
-            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
-    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
-            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     ggml_cuda_norm_emit_match match;
     ggml_cuda_rms_norm_gated_match gated;
     if (ggml_cuda_match_rms_gate_emit(graph, i, device, gated)) {
@@ -4166,6 +4180,11 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
         match.last = i + gated.node_count - 1;
         return match;
     }
+    ggml_tensor * norm = graph->nodes[i];
+    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
+            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
+    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
+            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -4322,15 +4341,10 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
         if (!(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
         return match;
     }
-    ggml_tensor * norm = graph->nodes[i];
-    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
-            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
-    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
-            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     ggml_cuda_norm_q8_match match;
     ggml_cuda_rms_norm_gated_match gated;
     if (ggml_cuda_match_rms_gate_emit(graph, i, device, gated)) {
-        if (norm->ne[0] % QK8_1) { return {}; }
+        if (gated.norm->ne[0] % QK8_1) { return {}; }
         match.norm = gated.norm;
         match.mul = gated.mul;
         match.dst = gated.dst;
@@ -4339,6 +4353,11 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
         match.last = i + gated.node_count - 1;
         return match;
     }
+    ggml_tensor * norm = graph->nodes[i];
+    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
+            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
+    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
+            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -4495,15 +4514,10 @@ static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, in
         mmq.last = match.last;
         return mmq;
     }
-    ggml_tensor * norm = graph->nodes[i];
-    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
-            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
-    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
-            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     ggml_cuda_norm_mmq_match match;
     ggml_cuda_rms_norm_gated_match gated;
     if (ggml_cuda_match_rms_gate_emit(graph, i, device, gated)) {
-        if (norm->ne[0] % QK8_1) { return {}; }
+        if (gated.norm->ne[0] % QK8_1) { return {}; }
         match.norm = gated.norm;
         match.mul = gated.mul;
         match.dst = gated.dst;
@@ -4512,6 +4526,11 @@ static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, in
         match.last = i + gated.node_count - 1;
         return match;
     }
+    ggml_tensor * norm = graph->nodes[i];
+    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
+            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
+    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
+            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -6231,7 +6250,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_RMS_NORM) {
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_UNARY) {
         ggml_cuda_rms_norm_gated_match match;
         if (ggml_cuda_match_rms_norm_gated(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
