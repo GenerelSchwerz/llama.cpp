@@ -464,7 +464,12 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int column = col + j;
-                if constexpr (do_multiply && do_add) {
+                if constexpr (ggml_cuda_norm_has_gate<Write>::value) {
+                    static_assert(do_multiply && !do_add && !do_scale);
+                    const int mul_col = fastmodulo(column, mul_ncols_packed);
+                    const float gate = write.activation(column);
+                    values[j] = (scale * x[column] * mul[mul_col]) * gate;
+                } else if constexpr (do_multiply && do_add) {
                     const int mul_col = fastmodulo(column, mul_ncols_packed);
                     const int add_col = fastmodulo(column, add_ncols_packed);
                     values[j] = scale * x[column] * mul[mul_col] + add[add_col];
@@ -475,7 +480,9 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
                     values[j] = scale_out * (scale * x[column]);
                 } else { values[j] = scale * x[column]; }
             }
-            write(dst, dst_base, col, make_float4(values[0], values[1], values[2], values[3]));
+            const float4 value = make_float4(values[0], values[1], values[2], values[3]);
+            if constexpr (ggml_cuda_norm_has_gate<Write>::value) { write.write(dst, dst_base, col, value); }
+            else { write(dst, dst_base, col, value); }
         }
     } else {
     for (int col = tid; col < ncols; col += block_size) {
@@ -2854,11 +2861,59 @@ static __global__ void rms_norm_gated_f32(ggml_cuda_rms_gate_data a, Write write
         a.weight_ne[0], a.weight_ne[1], a.weight_ne[2], a.weight_ne[3]);
 }
 
+template <typename Write>
+struct ggml_cuda_rms_gate_mmq_store {
+    static constexpr int width = 4;
+    Write write;
+    half * f16;
+    nv_bfloat16 * bf16;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float4 value) const {
+        write(dst, base, col, value);
+        const float values[4] = {value.x, value.y, value.z, value.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t index = dst - base + col + j;
+            if (f16) { f16[index] = ggml_cuda_cast<half>(values[j]); }
+            if (bf16) { bf16[index] = ggml_cuda_cast<nv_bfloat16>(values[j]); }
+        }
+    }
+};
+
+template <int Block, ggml_unary_op Gate, typename Write>
+static void ggml_cuda_rms_gate_mmq_launch(const ggml_cuda_kernel_launch_params & params, const ggml_cuda_rms_gate_data & a,
+        const ggml_cuda_rms_gate_images & images, Write write) {
+    const ggml_cuda_rms_gate_mmq_store<Write> store{write, (half *) images.f16, (nv_bfloat16 *) images.bf16};
+    ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, decltype(store)>, params, a, store);
+}
+
 template <int Block, ggml_unary_op Gate>
 static void ggml_cuda_rms_gate_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_rms_gate_data & a,
         dim3 grid, const ggml_cuda_rms_gate_images * images) {
     const ggml_cuda_kernel_launch_params params(grid, dim3(Block), 32*sizeof(float), ctx.stream());
-    if (images && images->q8) {
+    if (images && images->mmq) {
+        GGML_ASSERT(!images->q8);
+        const uint3 cols = init_fastdiv_values(images->cols);
+        const uint3 rows = init_fastdiv_values(images->rows);
+        if (images->layout == 3) {
+            ggml_cuda_rms_gate_mmq_launch<Block, Gate>(params, a, *images,
+                ggml_cuda_norm_banked_store<ggml_cuda_norm_mxfp4_store, QK_FP4_MMQ, 32, true>{
+                    {(block_fp4_mmq *) images->mmq, images->cols, images->padded, images->rows}, cols, rows});
+        } else {
+            const auto launch = [&](auto layout) {
+                constexpr auto Layout = decltype(layout)::value;
+                ggml_cuda_rms_gate_mmq_launch<Block, Gate>(params, a, *images,
+                    ggml_cuda_norm_banked_store<ggml_cuda_norm_mmq_store<Layout>, QK8_1_MMQ, Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32, false>{
+                        {(block_q8_1_mmq *) images->mmq, images->cols, images->padded, images->rows}, cols, rows});
+            };
+            switch (images->layout) {
+                case MMQ_Q8_1_DS_LAYOUT_D4: launch(std::integral_constant<mmq_q8_1_ds_layout, MMQ_Q8_1_DS_LAYOUT_D4>{}); break;
+                case MMQ_Q8_1_DS_LAYOUT_DS4: launch(std::integral_constant<mmq_q8_1_ds_layout, MMQ_Q8_1_DS_LAYOUT_DS4>{}); break;
+                case MMQ_Q8_1_DS_LAYOUT_D2S6: launch(std::integral_constant<mmq_q8_1_ds_layout, MMQ_Q8_1_DS_LAYOUT_D2S6>{}); break;
+                default: GGML_ABORT("unsupported gated MMQ image layout");
+            }
+        }
+    } else if (images && images->q8) {
         const ggml_cuda_norm_emit_q8_store write{(block_q8_1 *) images->q8, init_fastdiv_values(images->cols), images->padded,
             (half *) images->f16, (nv_bfloat16 *) images->bf16};
         ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, ggml_cuda_norm_emit_q8_store>, params, a, write);
@@ -2890,12 +2945,12 @@ void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int d = 0; d < 4; ++d) { a.weight_ne[d] = init_fastdiv_values(weight->ne[d]); }
     const dim3 grid(x->ne[1], x->ne[2], x->ne[3]);
     if (gate_op == GGML_UNARY_OP_SIGMOID) {
-        if (images && (images->q8 || images->f16 || images->bf16) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
+        if (images && (images->q8 || images->f16 || images->bf16 || images->mmq) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
         else if (a.cols < 1024) { ggml_cuda_rms_gate_launch<256, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
         else { ggml_cuda_rms_gate_launch<1024, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
     } else {
         GGML_ASSERT(gate_op == GGML_UNARY_OP_SILU);
-        if (images && (images->q8 || images->f16 || images->bf16) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
+        if (images && (images->q8 || images->f16 || images->bf16 || images->mmq) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
         else if (a.cols < 1024) { ggml_cuda_rms_gate_launch<256, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
         else { ggml_cuda_rms_gate_launch<1024, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
     }
