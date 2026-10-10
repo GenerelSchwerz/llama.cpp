@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "common.cuh"
 #include "convert.cuh"
+#include "cp-async.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -45,7 +46,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1>
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1, bool prefetch = false>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -172,20 +173,41 @@ static __global__ void mul_mat_f(
     }
 
 
+    T * staged_x = (T *) compute_base + tile_A::I*tile_k_padded;
+    const auto stage_x = [&](int col) {
+        for (int i = threadIdx.x; i < rows_per_block*warp_size/4; i += warp_size) {
+            const int row = i/(warp_size/4);
+            const int k = 4*(i%(warp_size/4));
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(staged_x + row*tile_k_padded + k), x + row*stride_row + col + k);
+        }
+    };
+    if constexpr (prefetch) {
+        static_assert(nwarps == 1 && !has_ids && warp_splits > 1, "one warp owns a staged weight tile");
+        stage_x(split*warp_size);
+    }
     for (int col = (split*nwarps + threadIdx.y)*warp_size + threadIdx.x; col < ncols; col += warp_splits*nwarps*warp_size) {
+        if constexpr (prefetch) { cp_async_wait_all(); ggml_cuda_syncwarp(); }
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
-            ggml_cuda_syncwarp();
+            if constexpr (!prefetch) {
+                ggml_cuda_syncwarp();
 #pragma unroll
-            for (int i = 0; i < tile_A::I; ++i) {
-                tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
+                for (int i = 0; i < tile_A::I; ++i) {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row + col];
+                }
+                ggml_cuda_syncwarp();
             }
-            ggml_cuda_syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
-                load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
+                const T * tile = prefetch ? staged_x + itA*tile_A::I*tile_k_padded : tile_xy;
+                load_ldmatrix(A[itA][k0/tile_A::J], tile + k0, tile_k_padded);
             }
+        }
+        if constexpr (prefetch) {
+            ggml_cuda_syncwarp();
+            const int next = col - threadIdx.x + warp_splits*warp_size;
+            if (next < ncols) { stage_x(next); }
         }
 
 #pragma unroll

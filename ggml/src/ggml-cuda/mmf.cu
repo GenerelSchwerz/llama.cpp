@@ -24,15 +24,15 @@ static __global__ void mul_mat_f_reduce_warps(const float * partial, float * dst
     dst[i] = sum;
 }
 
-template <typename T, int cols>
+template <typename T, int cols, bool prefetch>
 static void mul_mat_f_split_warps(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, float * partial) {
     const int vals = sizeof(T) == 4 && !std::is_same_v<T, float> ? 2 : 1;
     const int64_t count = ggml_nelements(dst);
     const dim3 blocks(src0->ne[1]/MMF_ROWS_PER_BLOCK, dst->ne[2], dst->ne[3]*8);
     const dim3 threads(32, 1, 1);
-    const int shared = std::max(16*36*4, GGML_PAD(cols, 8)*(32 + 4)*4);
+    const int shared = std::max(16*36*4, GGML_PAD(cols, 8)*(32 + 4)*4) + (prefetch ? 32*36*4 : 0);
     // Each block keeps one original warp's K sequence; the second launch keeps its sum order.
-    mul_mat_f<T, MMF_ROWS_PER_BLOCK, cols, 1, false, 8><<<blocks, threads, shared, ctx.stream()>>>(
+    mul_mat_f<T, MMF_ROWS_PER_BLOCK, cols, 1, false, 8, prefetch><<<blocks, threads, shared, ctx.stream()>>>(
         (const T *) src0->data, (const float *) src1->data, nullptr, partial,
         src0->ne[0]/vals, cols, dst->ne[2], src0->nb[1]/sizeof(T), src1->nb[1]/sizeof(float)/vals, dst->nb[1]/sizeof(float),
         0, 0, dst->ne[2]/src0->ne[2], src0->nb[2]/sizeof(T), src1->nb[2]/sizeof(float), dst->nb[2]/sizeof(float),
@@ -43,7 +43,9 @@ static void mul_mat_f_split_warps(ggml_backend_cuda_context & ctx, const ggml_te
 template <typename T>
 static void mul_mat_f_split_warps_switch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, float * partial) {
     switch (dst->ne[1]) {
-#define MMF_SPLIT_CASE(cols) case cols: mul_mat_f_split_warps<T, cols>(ctx, src0, src1, dst, partial); break
+#define MMF_SPLIT_CASE(cols) case cols: \
+        if (ggml_cuda_is_aligned(src0, 16)) { mul_mat_f_split_warps<T, cols, true>(ctx, src0, src1, dst, partial); } \
+        else { mul_mat_f_split_warps<T, cols, false>(ctx, src0, src1, dst, partial); } break
         MMF_SPLIT_CASE(1);  MMF_SPLIT_CASE(2);  MMF_SPLIT_CASE(3);  MMF_SPLIT_CASE(4);
         MMF_SPLIT_CASE(5);  MMF_SPLIT_CASE(6);  MMF_SPLIT_CASE(7);  MMF_SPLIT_CASE(8);
         MMF_SPLIT_CASE(9);  MMF_SPLIT_CASE(10); MMF_SPLIT_CASE(11); MMF_SPLIT_CASE(12);
