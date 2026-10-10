@@ -1,3 +1,9 @@
+# Latest kernel integration, 2026-10-10
+
+Owner-authorized PR162 (6f15ebb1a, "skip empty MMQ stream-k fixup") is merged into the generic feature branch. The one-line semantic resolution preserves the existing checked MMQ resource planner and applies the PR's K <= selected K_vram exclusion to actual scratch allocation and finalizer launch. Resource estimates remain conservative. Original main/finalizer kernels, launch grids, precision, routing and retained phase-cache behavior are unchanged. No reference engine is included.
+
+Own plainj18 build and all nine merge qualification commands pass: all-GPU complete-body prefill, source overlap, direct/view readers, short tails, CPU-assisted prefill and491 stock CUDA ordinary/routed operator cases across Q4_0, Q5_K, IQ3_XXS and NVFP4. Source hashes remain unchanged during testing; whole-process-tree teardown passes under ordered shared locks. Evidence: external generic-prefill-gap-20261009/merge-pr162-tests-324/{FINAL.json,SOURCE-REVIEW.json,stock-mmq-ordinary-routed.log}. The following318 throughput figures remain the pre-merge measurements; this integration has no new serving speed claim or default promotion.
+
 # Validated generic prefill checkpoint, 2026-10-10
 
 The owner accepted this bounded prefill improvement and authorized committing and pushing it. Frozen318 matches the current production source and own build. No default executor promotion or standalone reference engine is included. Entries below are historical checkpoints and retain their original qualifications.

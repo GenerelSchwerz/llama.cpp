@@ -1609,7 +1609,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(mmq_stream_k_requirements(config, cc, nsm, args.nrows_x, args.ncols_max,
         args.nchannels_y, args.nsamples_y, blocks_per_ne00_fd.z, resources));
     const dim3 block_nums_stream_k(resources.blocks, 1, 1);
-    const bool fixup_needed = resources.fixup_elements != 0;
+    const bool fixup_needed = resources.fixup_elements != 0 && args.ncols_x > config.K_vram;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
