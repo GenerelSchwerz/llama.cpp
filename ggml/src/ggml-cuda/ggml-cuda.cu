@@ -3356,6 +3356,79 @@ static bool ggml_cuda_match_rms_norm_gated(const ggml_cgraph * cgraph, int i, gg
 }
 
 
+static bool ggml_cuda_rms_gate_pure_node(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_ADD:
+        case GGML_OP_ADD_ID:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+            return node->view_src == nullptr && node->buffer == nullptr && node->data == nullptr;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_cuda_sort_rms_gate(ggml_cgraph * graph, int i) {
+    if (i + 4 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_RMS_NORM) { return false; }
+    ggml_cuda_rms_norm_gated_match adjacent;
+    if (ggml_cuda_match_rms_norm_gated(graph, i, adjacent)) { return false; }
+    ggml_tensor * norm = graph->nodes[i];
+    ggml_tensor * mul = graph->nodes[i + 1];
+    if (mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm)) { return false; }
+    if (norm->buffer || norm->data || mul->buffer || mul->data) { return false; }
+    constexpr int window = 32;
+    for (int u = i + 2; u < graph->n_nodes && u < i + window; ++u) {
+        ggml_tensor * unary = graph->nodes[u];
+        if (unary->op != GGML_OP_UNARY ||
+                (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU && ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID)) { continue; }
+        int last = u + 1;
+        while (last < graph->n_nodes && last < i + window) {
+            const auto op = graph->nodes[last]->op;
+            if (op != GGML_OP_VIEW && op != GGML_OP_RESHAPE && op != GGML_OP_PERMUTE && op != GGML_OP_TRANSPOSE) { break; }
+            ++last;
+        }
+        if (last >= graph->n_nodes || last >= i + window) { continue; }
+        ggml_tensor * dst = graph->nodes[last];
+        if (dst->op != GGML_OP_MUL ||
+                !((dst->src[0] == mul && dst->src[1] == unary) || (dst->src[0] == unary && dst->src[1] == mul))) { continue; }
+        bool independent = true;
+        for (int j = i + 2; j < u; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (!ggml_cuda_rms_gate_pure_node(node)) { independent = false; break; }
+            for (const ggml_tensor * src : node->src) {
+                if (src == norm || src == mul || (src && (src->view_src == norm || src->view_src == mul))) { independent = false; break; }
+            }
+            if (!independent) { break; }
+        }
+        if (!independent) { continue; }
+        const int indices[] = {i, i + 1, u, last};
+        const ggml_op ops[] = {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL};
+        if (!ggml_can_fuse_subgraph_ext(graph, indices, 4, ops, &last, 1)) { continue; }
+        std::array<ggml_tensor *, window> nodes;
+        std::copy(graph->nodes + i, graph->nodes + last + 1, nodes.begin());
+        std::rotate(nodes.begin(), nodes.begin() + 2, nodes.begin() + u - i);
+        ggml_cgraph ordered = *graph;
+        ordered.nodes = nodes.data();
+        ordered.n_nodes = last - i + 1;
+        ggml_cuda_rms_norm_gated_match match;
+        if (!ggml_cuda_match_rms_norm_gated(&ordered, u - i - 2, match) || match.dst != dst) { continue; }
+        std::copy(nodes.begin(), nodes.begin() + ordered.n_nodes, graph->nodes + i);
+        return true;
+    }
+    return false;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -7936,6 +8009,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) { ggml_cuda_sort_rms_gate(cgraph, i); }
         const ggml_cuda_mmvf_pair_plan mmvf_pairs(cgraph, cuda_ctx->device, false);
         std::unordered_set<const ggml_tensor *> paired_mmvf;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
