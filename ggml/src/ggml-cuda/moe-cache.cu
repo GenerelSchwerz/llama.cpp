@@ -8086,6 +8086,14 @@ struct ggml_cuda_moe_grouped_context::impl {
         return const_cast<impl *>(this)->find_resource(transaction);
     }
 
+    bool end_transaction_locked(const ggml_cuda_moe_grouped_transaction & transaction) {
+        auto * resource = find_resource(transaction);
+        if (resource == nullptr) { return false; }
+        resource->active_transaction_token = 0;
+        resource->active_decode_stream = nullptr;
+        return true;
+    }
+
     grouped_resource * begin_decode(
             const ggml_cuda_moe_complete_group_key & key,
             cudaStream_t compute_stream,
@@ -11502,12 +11510,7 @@ bool ggml_cuda_moe_grouped_context::begin_group_transaction(
 
 bool ggml_cuda_moe_grouped_context::end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto * resource = impl_->find_resource(transaction);
-    if (resource == nullptr) {
-        return false;
-    }
-    resource->active_transaction_token = 0;
-    resource->active_decode_stream = nullptr;
+    if (!impl_->end_transaction_locked(transaction)) { return false; }
     impl_->resource_cv.notify_all();
     return true;
 }
@@ -14957,6 +14960,12 @@ struct ggml_cuda_moe_source_transport {
         std::vector<mapped_range> aliases;
     };
     std::vector<binding> bindings;
+    struct graph_group {
+        uint32_t record;
+        std::vector<uint32_t> bindings, banks;
+    };
+    const ggml_cuda_moe_graph_execution * execution = nullptr;
+    std::vector<graph_group> graph_groups;
     struct timer {
         uint64_t & total;
         std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
@@ -15001,22 +15010,84 @@ static bool moe_source_catalog_equal(const ggml_cuda_moe_source_transport::bindi
 
 bool ggml_cuda_moe_grouped_context::source_transport_matches(const ggml_cuda_moe_source_transport * transport,
         uint32_t index, const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index) const {
-    if (!transport || transport->owner != this || transport->device != impl_->device || transport->failed || index >= transport->bindings.size()) { return false; }
+    return source_transport_matches(transport, &index, transaction, &bank_index, 1);
+}
+
+bool ggml_cuda_moe_grouped_context::source_transport_matches(const ggml_cuda_moe_source_transport * transport,
+        const uint32_t * indices, const ggml_cuda_moe_grouped_transaction & transaction, const uint32_t * bank_indices, uint32_t count) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto & binding = transport->bindings[index];
-    const auto & current = transaction.acquisition;
-    if (binding.bank_index != bank_index || binding.acquisition.candidate.generation != current.candidate.generation ||
-            binding.acquisition.candidate.group_index != current.candidate.group_index ||
-            binding.acquisition.resource_generation != current.resource_generation) { return false; }
+    return source_transport_matches_locked(transport, indices, transaction, bank_indices, count);
+}
+
+bool ggml_cuda_moe_grouped_context::source_transport_matches_locked(const ggml_cuda_moe_source_transport * transport,
+        const uint32_t * indices, const ggml_cuda_moe_grouped_transaction & transaction, const uint32_t * bank_indices, uint32_t count) const {
+    if (!transport || transport->owner != this || transport->device != impl_->device || transport->failed ||
+            !indices || !bank_indices || !count || count > transport->bindings.size()) { return false; }
     const auto * resource = impl_->find_resource(transaction);
-    if (!resource || !resource->device || bank_index >= resource->snapshot.banks.size() ||
-            bank_index >= resource->device->bank_source_paths.size() || bank_index >= resource->device->bank_source_aliases.size()) { return false; }
-    if (binding.device_serial != resource->device->serial) { return false; }
-    auto bank = resource->snapshot.banks[bank_index];
-    bank.source_path = resource->device->bank_source_paths[bank_index];
-    bank.source_device_alias = resource->device->bank_source_aliases[bank_index];
-    return moe_source_bank_current(bank) && moe_source_bank_equal(binding.bank, bank) &&
-        moe_source_catalog_equal(binding, impl_->source_for(bank.tensor));
+    if (!resource || !resource->device || count > resource->snapshot.banks.size()) { return false; }
+    const auto & current = transaction.acquisition;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto index = indices[i];
+        const auto bank_index = bank_indices[i];
+        if (index >= transport->bindings.size() || bank_index >= resource->snapshot.banks.size() ||
+                bank_index >= resource->device->bank_source_paths.size() || bank_index >= resource->device->bank_source_aliases.size()) { return false; }
+        const auto & binding = transport->bindings[index];
+        if (binding.bank_index != bank_index || binding.acquisition.candidate.generation != current.candidate.generation ||
+                binding.acquisition.candidate.group_index != current.candidate.group_index ||
+                binding.acquisition.resource_generation != current.resource_generation || binding.device_serial != resource->device->serial) { return false; }
+        auto bank = resource->snapshot.banks[bank_index];
+        bank.source_path = resource->device->bank_source_paths[bank_index];
+        bank.source_device_alias = resource->device->bank_source_aliases[bank_index];
+        if (!moe_source_bank_current(bank) || !moe_source_bank_equal(binding.bank, bank) ||
+                !moe_source_catalog_equal(binding, impl_->source_for(bank.tensor))) { return false; }
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::bind_source_transport(ggml_cuda_moe_source_transport * transport,
+        const ggml_cuda_moe_graph_execution & execution) try {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!transport || transport->owner != this || transport->device != impl_->device || transport->failed ||
+            transport->bindings.empty() || execution.owner_ != this || !execution.dispatch_active_ ||
+            execution.dispatch_mode_ != GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT) { return false; }
+    std::vector<ggml_cuda_moe_source_transport::graph_group> groups;
+    groups.reserve(execution.n_groups_);
+    size_t covered = 0;
+    for (uint32_t record = 0; record < execution.n_groups_; ++record) {
+        const auto & group = execution.groups_[record];
+        ggml_cuda_moe_source_transport::graph_group bound = {record, {}, {}};
+        for (uint32_t i = 0; i < transport->bindings.size(); ++i) {
+            const auto & binding = transport->bindings[i];
+            if (binding.acquisition.candidate.generation != group.key.candidate.generation ||
+                    binding.acquisition.candidate.group_index != group.key.candidate.group_index) { continue; }
+            bound.bindings.push_back(i);
+            bound.banks.push_back(binding.bank_index);
+        }
+        if (bound.bindings.empty()) { continue; }
+        if (!source_transport_matches_locked(transport, bound.bindings.data(), group.transaction,
+                bound.banks.data(), uint32_t(bound.bindings.size()))) { return false; }
+        covered += bound.bindings.size();
+        groups.push_back(std::move(bound));
+    }
+    if (covered != transport->bindings.size()) { return false; }
+    transport->graph_groups = std::move(groups);
+    transport->execution = &execution;
+    return true;
+} catch (...) { return false; }
+
+bool ggml_cuda_moe_grouped_context::source_resource_fingerprint(const ggml_cuda_moe_graph_execution & execution,
+        cudaStream_t stream, const ggml_cuda_moe_source_transport * transport, uint64_t * fingerprint) const {
+    if (!fingerprint) { return false; }
+    *fingerprint = 0;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!transport || transport->execution != &execution || transport->graph_groups.empty() ||
+            execution.owner_ != this || !execution.dispatch_active_ ||
+            execution.dispatch_mode_ != GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT) { return false; }
+    for (const auto & bound : transport->graph_groups) {
+        if (bound.record >= execution.n_groups_ || !source_transport_matches_locked(transport, bound.bindings.data(),
+                execution.groups_[bound.record].transaction, bound.banks.data(), uint32_t(bound.bindings.size()))) { return false; }
+    }
+    return graph_resource_fingerprint_locked(execution, stream, fingerprint, nullptr);
 }
 
 bool ggml_cuda_moe_grouped_context::prepare_source_transport(const ggml_cuda_moe_grouped_transaction & transaction,
@@ -15087,6 +15158,8 @@ bool ggml_cuda_moe_grouped_context::prepare_source_transport(const ggml_cuda_moe
         binding.bank.source_path == MOE_GROUPED_SOURCE_MAPPED && binding.bank.source_device_alias != nullptr;
     *index = uint32_t(transport->bindings.size());
     transport->bindings.push_back(binding);
+    transport->execution = nullptr;
+    transport->graph_groups.clear();
     if (direct || transport->storage || transport->fallback) { return true; }
     moe_grouped_device_scope scope(impl_->device);
     try {
@@ -17020,12 +17093,24 @@ bool ggml_cuda_moe_grouped_context::finish_source_dispatch(ggml_cuda_moe_graph_e
         }
         if (!queried && cudaStreamQuery(group.stream) != cudaSuccess) { return false; }
     }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (uint32_t i = 0; i < execution->n_groups_; ++i) {
+        const auto & group = execution->groups_[i];
+        const auto & lease = group.authority;
+        if (lease.owner_ != this || lease.candidate_generation_ != impl_->state.generation ||
+                lease.group_index_ >= impl_->table.groups.size()) { return false; }
+        const auto & authority = impl_->group_authorities[lease.group_index_];
+        if (lease.authority_epoch_ != authority.epoch || lease.authority_ != authority.authority ||
+                !authority.active_calls) { return false; }
+        if (group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+            const auto * resource = impl_->find_resource(group.transaction);
+            if (!resource || resource->active_decode_stream != group.stream) { return false; }
+        }
+    }
     for (uint32_t i = 0; i < execution->n_groups_; ++i) {
         auto & group = execution->groups_[i];
         if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) { continue; }
-        std::lock_guard<std::mutex> lock(impl_->mutex);
         auto * resource = impl_->find_resource(group.transaction);
-        if (!resource || resource->active_decode_stream != group.stream) { return false; }
         if (resource->device) {
             auto & device = *resource->device;
             // All work is complete; an existing completed event needs no new record.
@@ -17036,17 +17121,19 @@ bool ggml_cuda_moe_grouped_context::finish_source_dispatch(ggml_cuda_moe_graph_e
     }
     for (uint32_t i = 0; i < execution->n_groups_; ++i) {
         auto & group = execution->groups_[i];
-        if (group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && !end_group_transaction(group.transaction)) { return false; }
+        if (group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && !impl_->end_transaction_locked(group.transaction)) { return false; }
         group.transaction = {};
         std::fill_n(group.bank_data, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, nullptr);
         group.n_slots = 0;
         group.defer_completion = false;
         group.state = GGML_CUDA_MOE_GRAPH_GROUP_FINISHED;
         group.strategy = execution->plan_->groups_[i].strategy;
+        end_group_call_locked(group.authority);
         group.authority = {};
     }
     execution->dispatch_active_ = false;
     execution->dispatch_mode_ = GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED;
+    impl_->resource_cv.notify_all();
     return true;
 }
 
@@ -18531,13 +18618,17 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
 
 void ggml_cuda_moe_grouped_context::end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    end_group_call_locked(lease);
+    impl_->resource_cv.notify_all();
+}
+
+void ggml_cuda_moe_grouped_context::end_group_call_locked(ggml_cuda_moe_group_call_lease & lease) noexcept {
     GGML_ASSERT(lease.owner_ == this && lease.group_index_ < impl_->table.groups.size());
     auto & current = impl_->group_authorities[lease.group_index_];
     GGML_ASSERT(lease.candidate_generation_ == impl_->state.generation && lease.authority_epoch_ == current.epoch &&
         lease.authority_ == current.authority && current.active_calls > 0);
     --current.active_calls;
     lease.owner_ = nullptr;
-    impl_->resource_cv.notify_all();
 }
 
 void ggml_cuda_moe_grouped_context::shutdown() {

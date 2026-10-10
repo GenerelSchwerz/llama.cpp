@@ -924,6 +924,7 @@ struct ggml_moe_source_program::impl {
     std::vector<uint8_t> omitted, body_storage;
     std::vector<ggml_tensor *> allocation_nodes, leafs;
     std::vector<const ggml_tensor *> outputs;
+    std::vector<ggml_moe_source_public_binding> public_bindings;
     std::vector<ggml_moe_source_layer> layers;
     std::vector<ggml_moe_source_operation> epilogue;
     ggml_context * dependency_context = nullptr;
@@ -1311,6 +1312,10 @@ struct ggml_moe_source_program::impl {
             allocation_nodes.push_back(&tensor);
         }
         if (outputs.empty()) { return reject("public_outputs"); }
+        public_bindings.reserve(outputs.size());
+        for (const auto * output : outputs) {
+            public_bindings.push_back({output, output->buffer, output->data, ggml_nbytes(output)});
+        }
         for (size_t i = count; i < tensors.size(); ++i) { leafs.push_back(&tensors[i]); }
         size_t cursor = 0;
         layers.reserve(experts.size());
@@ -1401,6 +1406,10 @@ bool ggml_moe_source_program::matches(const ggml_cgraph * graph, const ggml_grap
         if (!state->witnesses[i].matches(*state->validation_tensors[i])) { return false; }
     }
     return true;
+}
+
+const ggml_tensor * ggml_moe_source_program::original_node(size_t index) const {
+    return state && index < size_t(state->source_node_count) ? state->originals[index] : nullptr;
 }
 
 ggml_tensor * ggml_moe_source_program::find(const ggml_tensor * original) const {
@@ -1522,6 +1531,7 @@ bool ggml_moe_source_program::closed_cut(const ggml_tensor * const * cut, size_t
 const std::vector<ggml_moe_source_layer> & ggml_moe_source_program::layers() const { return state->layers; }
 const std::vector<ggml_moe_source_operation> & ggml_moe_source_program::epilogue() const { return state->epilogue; }
 const std::vector<const ggml_tensor *> & ggml_moe_source_program::public_outputs() const { return state->outputs; }
+const std::vector<ggml_moe_source_public_binding> & ggml_moe_source_program::public_bindings() const { return state->public_bindings; }
 const ggml_graph_execution_certificate & ggml_moe_source_program::certificate() const { return state->certificate; }
 size_t ggml_moe_source_program::storage_bytes() const { return state ? state->bytes : 0; }
 size_t ggml_moe_source_program::operation_count() const { return state ? state->operations : 0; }

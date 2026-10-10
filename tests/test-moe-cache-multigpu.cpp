@@ -4368,6 +4368,7 @@ struct fidelity_graph_owner : std::enable_shared_from_this<fidelity_graph_owner>
     std::unique_ptr<llama_model> model;
     ggml_backend_ptr gpu, cpu;
     std::unique_ptr<void, void (*)(void *)> staged_input{nullptr, [](void *) {}}, staged_reference{nullptr, [](void *) {}};
+    std::atomic<uint64_t> staged_submissions{0};
     std::vector<ggml_backend_buffer_ptr> input_buffers;
     ggml_backend_sched_ptr sched, oracle;
     std::vector<std::unique_ptr<llm_graph_moe_hybrid_prepared>> metadata;
@@ -5027,12 +5028,28 @@ void test_source_overlap_schedule(fidelity_graph_owner & owner, layer_fixture & 
     ggml_tensor unrelated = *fixture.input;
     CHECK(!original.find(&unrelated));
     const auto * first_node = owner.graph.nodes[0];
+    CHECK(original.original_node(0) == first_node);
+    CHECK(!original.original_node(owner.graph.n_nodes) && !original.original_node(SIZE_MAX));
     owner.graph.nodes[0] = owner.graph.nodes[1];
+    CHECK(original.original_node(0) == first_node);
     CHECK(!original.matches(&owner.graph));
     ggml_moe_source_program duplicate;
     CHECK(!duplicate.prepare(&owner.graph, pointers, buft));
     owner.graph.nodes[0] = const_cast<ggml_tensor *>(first_node);
     CHECK(original.matches(&owner.graph));
+    CHECK(original.public_bindings().size() == original.public_outputs().size());
+    for (size_t i = 0; i < original.public_bindings().size(); ++i) {
+        const auto & binding = original.public_bindings()[i];
+        auto * output = const_cast<ggml_tensor *>(original.public_outputs()[i]);
+        CHECK(binding.original == output && binding.buffer == output->buffer &&
+            binding.data == output->data && binding.bytes == ggml_nbytes(output));
+        const auto saved = *output;
+        output->data = reinterpret_cast<void *>(uintptr_t(output->data) ^ 1);
+        CHECK(!original.matches(&owner.graph));
+        CHECK(binding.data == saved.data && binding.buffer == saved.buffer && binding.bytes == ggml_nbytes(&saved));
+        *output = saved;
+        CHECK(original.matches(&owner.graph));
+    }
     const auto input_saved = *fixture.input;
     const std::function<void(ggml_tensor &)> mutations[] = {
         [](ggml_tensor & t) { t.type = GGML_TYPE_I32; },
@@ -5942,6 +5959,15 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
         owner->staged_input = {stage_api->create(owner->gpu.get(), signature.n_embd * sizeof(float)), stage_api->destroy};
         owner->staged_reference = {stage_api->create(owner->gpu.get(), signature.n_embd * sizeof(float)), stage_api->destroy};
         CHECK(owner->staged_input && owner->staged_reference);
+        const auto set_submit = reinterpret_cast<ggml_staged_input_set_submit_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_STAGED_INPUT_SET_SUBMIT_PROC));
+        CHECK(set_submit);
+        const auto submit = +[](void * context) {
+            static_cast<fidelity_graph_owner *>(context)->staged_submissions.fetch_add(1, std::memory_order_relaxed);
+        };
+        CHECK(!set_submit(owner->staged_input.get(), nullptr, owner.get()));
+        CHECK(set_submit(owner->staged_input.get(), submit, owner.get()));
+        CHECK(!set_submit(owner->staged_input.get(), submit, owner.get()));
     }
     size_t transport_budget = 0;
     if (transport_case >= 2) {
@@ -6201,6 +6227,11 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
         const auto n_phases = absent ? 0 : row_phases.size();
         return async ? ggml_backend_sched_graph_compute_async_with_phases(owner->sched.get(), fixture.result.get_gf(), &certificate, phases, n_phases) :
             ggml_backend_sched_graph_compute_with_phases(owner->sched.get(), fixture.result.get_gf(), &certificate, phases, n_phases);
+    };
+    const auto compute_owned = [&](uint64_t program) {
+        const bool absent = phase_fixture && !strcmp(phase_fixture, "absent");
+        return ggml_backend_sched_moe_source_program_compute_with_phases_v1(owner->sched.get(), program, &certificate,
+            absent ? nullptr : row_phases.data(), absent ? 0 : row_phases.size());
     };
     const auto set_inputs = [&](layer_fixture & target, bool warm, uint32_t step, bool publish_stage = true) {
         std::vector<float> values(ggml_nelements(target.input));
@@ -6872,6 +6903,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 allocate_inputs();
                 allocate_regions();
             }
+            row_phases.resize(certificate.n_rows, GGML_GRAPH_EXECUTION_PHASE_GENERATION);
             prepare_regions(&certificate);
             if (retained_hook_test && phase == 0) {
                 CHECK(ggml_backend_sched_moe_hybrid_set_test_hook_v1(owner->sched.get(),
@@ -6957,6 +6989,15 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     }, &held_adaptation));
             }
             uint64_t captures = 0;
+            uint64_t owned_program = 0;
+            uint32_t unused_copy_calls = 0;
+            if (source_core && staged_inputs) {
+                ggml_backend_sched_set_copy_callback(owner->sched.get(),
+                    +[](ggml_backend_t, const ggml_tensor *, ggml_tensor *, ggml_cgraph *, void * data) {
+                        ++*static_cast<uint32_t *>(data);
+                        return false;
+                    }, &unused_copy_calls);
+            }
             if (approximate && phase == 0) {
                 const uint8_t invalid_phase = 3;
                 CHECK(ggml_backend_sched_graph_compute_async_with_phases(owner->sched.get(), fixture.result.get_gf(), &certificate, nullptr, capacity) == GGML_STATUS_FAILED);
@@ -7074,6 +7115,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                         ggml_backend_moe_hybrid_state_v1 state = {};
                         state.struct_size = sizeof(state);
                         CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &state) && state.dispatch_active == 1 && state.cpu_active_jobs == 0);
+                        CHECK(owner->staged_submissions.load(std::memory_order_relaxed) > 0);
                         CHECK(!stage_pending(owner->staged_input.get()));
                         stage_api->publish(owner->staged_input.get());
                         held.released = true; held.condition.notify_all();
@@ -7099,7 +7141,48 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     CHECK(ggml_backend_sched_moe_source_drain_v1(owner->sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
                     CHECK(ggml_backend_sched_moe_hybrid_set_test_hook_v1(owner->sched.get(), nullptr, nullptr));
                     fprintf(stderr, "test-moe-cache: source-core early unsupported fallback actual-stream retained/finite drain OK\n");
-                } else { CHECK(compute_phases() == GGML_STATUS_SUCCESS); }
+                } else if (source_core && staged_inputs && step == 1) {
+                    CHECK(owned_program);
+                    auto wrong = certificate;
+                    ++wrong.owner_generation;
+                    ggml_backend_moe_hybrid_state_v1 before = {}, after = {};
+                    before.struct_size = sizeof(before); after.struct_size = sizeof(after);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &before));
+                    CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), UINT64_MAX, &certificate) == GGML_STATUS_FAILED);
+                    CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), owned_program, &wrong) == GGML_STATUS_FAILED);
+                    CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->oracle.get(), owned_program, &certificate) == GGML_STATUS_FAILED);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &after));
+                    CHECK(before.window_launches == after.window_launches && before.window_waits == after.window_waits);
+                    auto * retained = ggml_get_tensor(fixture.result.get_ctx(), "hybrid_fusion_retained");
+                    CHECK(retained);
+                    retained->op_params[0] ^= 1;
+                    reject(certificate);
+                    auto * destination = fixture.output[1]->data;
+                    fixture.output[1]->data = reinterpret_cast<void *>(uintptr_t(destination) ^ 1);
+                    const auto status = compute_owned(owned_program);
+                    fixture.output[1]->data = destination;
+                    retained->op_params[0] ^= 1;
+                    CHECK(status == GGML_STATUS_SUCCESS);
+                } else { CHECK((owned_program ? compute_owned(owned_program) : compute_phases()) == GGML_STATUS_SUCCESS); }
+                if (source_core && (staged_inputs || (approximate && !pruned_phase)) && step == 0 && !delayed_cancel) {
+                    CHECK(ggml_backend_sched_moe_source_program_bind_v1(owner->sched.get(), fixture.result.get_gf(), &certificate,
+                        &owned_program) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && owned_program);
+                    ggml_backend_moe_hybrid_state_v1 before = {}, after = {};
+                    before.struct_size = sizeof(before); after.struct_size = sizeof(after);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &before));
+                    for (const size_t size : {size_t(0), row_phases.size() + 1}) {
+                        CHECK(ggml_backend_sched_moe_source_program_compute_with_phases_v1(owner->sched.get(), owned_program,
+                            &certificate, row_phases.data(), size) == GGML_STATUS_FAILED);
+                    }
+                    CHECK(ggml_backend_sched_moe_source_program_compute_with_phases_v1(owner->sched.get(), owned_program,
+                        &certificate, nullptr, row_phases.size()) == GGML_STATUS_FAILED);
+                    auto invalid = row_phases;
+                    invalid[0] = UINT8_MAX;
+                    CHECK(ggml_backend_sched_moe_source_program_compute_with_phases_v1(owner->sched.get(), owned_program,
+                        &certificate, invalid.data(), invalid.size()) == GGML_STATUS_FAILED);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &after));
+                    CHECK(before.window_launches == after.window_launches && before.window_waits == after.window_waits);
+                }
                 if (profile_adaptation == 2 && phase == 0 && step == 3) {
                     const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                     while (!held_adaptation.entered.load() && std::chrono::steady_clock::now() < limit) { std::this_thread::yield(); }
@@ -7381,6 +7464,23 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     CHECK(ggml_backend_sched_moe_source_reset_graph_v1(clone) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
                     CHECK(ggml_backend_sched_moe_source_free_v1(&clone) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
                     CHECK(!clone);
+                    if (owned_program) {
+                        CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), owned_program, &certificate) == GGML_STATUS_FAILED);
+                        CHECK(ggml_backend_sched_moe_source_program_bind_v1(owner->sched.get(), fixture.result.get_gf(), &certificate,
+                            &owned_program) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && owned_program);
+                    }
+                }
+                if (source_core && step == 0 && !main_prefill && !early_fallback && !delayed_cancel && !overlap_fixture) {
+                    auto * retained = ggml_get_tensor(fixture.result.get_ctx(), "hybrid_fusion_retained");
+                    CHECK(retained);
+                    retained->op_params[0] ^= 1;
+                    reject(certificate);
+                    retained->op_params[0] ^= 1;
+                    ggml_backend_moe_hybrid_state_v1 rejected = {};
+                    rejected.struct_size = sizeof(rejected);
+                    CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &rejected));
+                    CHECK(!rejected.quiescing && !rejected.dispatch_active && !rejected.cpu_active_jobs &&
+                        rejected.window_launches == state.window_launches && rejected.window_waits == state.window_waits);
                 }
                 if (phase == 1 && step == 0) {
                     auto stale = certificate;
@@ -7391,9 +7491,33 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     CHECK(ggml_backend_sched_moe_hybrid_state_v1(owner->sched.get(), &rejected));
                     CHECK(rejected.window_launches == state.window_launches && rejected.window_waits == state.window_waits);
                 }
+                if (static_profile && !profile_adaptation && phase == 0 && step == 1) {
+                    const auto previous = read_residency();
+                    auto replacement = ranking;
+                    std::rotate(replacement.begin(), replacement.begin() + 1, replacement.end());
+                    std::vector<ggml_backend_moe_static_profile_v1> changed;
+                    for (const auto * down : fixture.down) { changed.push_back({down, replacement.data(), experts}); }
+                    cudaStream_t stream = nullptr;
+                    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                    uint64_t copied = 0;
+                    CHECK(grouped->initialize_profile(changed.data(), changed.size(), stream, &copied));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                    CUDA_OK(cudaStreamDestroy(stream));
+                    CHECK(read_residency() != previous);
+                }
             }
             fprintf(stderr, "test-moe-cache: fidelity scheduler phase=%u rows=%u certificate=%u replay/publication OK\n",
                 phase, capacity, certificate.row_semantics);
+            if (owned_program) {
+                CHECK(unused_copy_calls == 0);
+                ggml_backend_sched_set_copy_callback(owner->sched.get(), nullptr, nullptr);
+                CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), owned_program, &certificate) == GGML_STATUS_FAILED);
+                CHECK(ggml_backend_sched_moe_source_program_bind_v1(owner->sched.get(), fixture.result.get_gf(), &certificate,
+                    &owned_program) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && owned_program);
+                ggml_backend_sched_set_eval_callback(owner->sched.get(), nullptr, nullptr);
+                CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), owned_program, &certificate) == GGML_STATUS_FAILED);
+                fprintf(stderr, "test-moe-cache: owned program immutable metadata/publication, stale/cross-owner/certificate rejection OK\n");
+            }
         }
         if (profile_adaptation == 2) {
             CUDA_OK(cudaStreamDestroy(held_adaptation.release_stream));
@@ -7449,6 +7573,10 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     prepare_regions(&certificate);
                 }
                 set_inputs(fixture, false, 0);
+                CHECK(ggml_backend_sched_graph_compute_ext(owner->sched.get(), fixture.result.get_gf(), &certificate) == GGML_STATUS_SUCCESS);
+                uint64_t canceled_program = 0;
+                CHECK(ggml_backend_sched_moe_source_program_bind_v1(owner->sched.get(), fixture.result.get_gf(), &certificate,
+                    &canceled_program) == GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK && canceled_program);
                 std::vector<uint8_t> sentinel(ggml_nbytes(fixture.output[1]), 0x6b), observed(sentinel.size());
                 ggml_backend_tensor_set(fixture.output[1], sentinel.data(), 0, sentinel.size());
                 std::vector<uint8_t> effect_sentinel;
@@ -7467,7 +7595,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 ggml_status result = GGML_STATUS_FAILED;
                 std::thread caller([&] {
                     CUDA_OK(cudaSetDevice(device));
-                    result = compute_phases();
+                    result = compute_owned(canceled_program);
                 });
                 {
                     std::unique_lock<std::mutex> lock(paused.mutex);
@@ -7511,6 +7639,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                 CHECK(!paused.timed_out);
                 CHECK(result == (event == GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_COMPUTE_RETURNING ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED));
                 CHECK(ggml_backend_sched_moe_source_drain_v1(owner->sched.get()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+                CHECK(ggml_backend_sched_moe_source_program_compute_v1(owner->sched.get(), canceled_program, &certificate) == GGML_STATUS_FAILED);
                 ggml_backend_tensor_get(fixture.output[1], observed.data(), 0, observed.size());
                 if (event != GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_COMPUTE_RETURNING) { CHECK(observed == sentinel); }
                 if (!effect_sentinel.empty()) {
@@ -7628,6 +7757,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                             }
                             CHECK(grouped->prepare_source_transport(group->transaction, b, tile_bytes, &transport, &copy.binding, true));
                             copies.push_back(copy);
+                            if (copies.size() == 1) { CHECK(grouped->bind_source_transport(transport, transport_execution)); }
                         }
                     }
                     CHECK(groups.size() == 2 && !copies.empty());
@@ -7646,7 +7776,22 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     }
                     CUDA_OK(cudaStreamSynchronize(copy_stream));
                     CUDA_OK(cudaFree(selection_data));
+                    const auto saved_transaction = groups.back()->transaction;
+                    groups.back()->transaction.transaction_token = 0;
+                    CHECK(!grouped->finish_source_dispatch(&transport_execution));
+                    groups.back()->transaction = saved_transaction;
+                    for (auto * group : groups) {
+                        ggml_cuda_moe_grouped_resource_info info;
+                        CHECK(grouped->get_group_resources(group->transaction.acquisition, &info) && info.transaction_active);
+                        CHECK(group->authority && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE);
+                    }
                     CHECK(grouped->finish_source_dispatch(&transport_execution));
+                    for (size_t i = 0; i < groups.size(); ++i) {
+                        ggml_cuda_moe_grouped_resource_info info;
+                        CHECK(grouped->get_group_resources(acquisitions[i], &info) && !info.transaction_active);
+                        CHECK(!groups[i]->authority && !groups[i]->transaction.transaction_token &&
+                            groups[i]->state == GGML_CUDA_MOE_GRAPH_GROUP_FINISHED);
+                    }
                     CHECK(grouped->begin_graph_dispatch(&transport_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT));
                     for (size_t i = 0; i < groups.size(); ++i) {
                         const auto previous = residency_tokens[i];
@@ -7688,6 +7833,60 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                         return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) + 5'000'000'000ull;
                     };
 
+                    const auto matches_group = [&](const bank_copy & copy, const ggml_cuda_moe_grouped_transaction & transaction) {
+                        std::vector<uint32_t> bindings, banks;
+                        for (const auto & candidate : copies) {
+                            if (candidate.group != copy.group) { continue; }
+                            bindings.push_back(candidate.binding);
+                            banks.push_back(candidate.bank);
+                        }
+                        return grouped->source_transport_matches(transport, bindings.data(), transaction, banks.data(), banks.size());
+                    };
+                    uint64_t source_identity = 0, full_identity = 0;
+                    CHECK(!grouped->source_resource_fingerprint(transport_execution, copy_stream, transport, &source_identity) && !source_identity);
+                    CHECK(grouped->bind_source_transport(transport, transport_execution));
+                    CHECK(grouped->graph_resource_fingerprint(transport_execution, copy_stream, &full_identity));
+                    CHECK(grouped->source_resource_fingerprint(transport_execution, copy_stream, transport, &source_identity) && source_identity == full_identity);
+                    ggml_cuda_moe_graph_execution foreign_execution;
+                    CHECK(!grouped->bind_source_transport(transport, foreign_execution));
+                    CHECK(!grouped->source_resource_fingerprint(foreign_execution, copy_stream, transport, &source_identity) && !source_identity);
+                    const auto matches_sources = [&] {
+                        source_identity = UINT64_MAX;
+                        const bool matched = grouped->source_resource_fingerprint(transport_execution, copy_stream, transport, &source_identity);
+                        CHECK(matched ? source_identity == full_identity : source_identity == 0);
+                        return matched;
+                    };
+                    CHECK(matches_sources());
+                    for (auto * group : groups) {
+                        std::vector<uint32_t> bindings, banks;
+                        for (const auto & copy : copies) {
+                            if (copy.group != group) { continue; }
+                            bindings.push_back(copy.binding);
+                            banks.push_back(copy.bank);
+                        }
+                        CHECK(bindings.size() == group->key.n_banks);
+                        CHECK(grouped->source_transport_matches(transport, bindings.data(), group->transaction, banks.data(), banks.size()));
+                        CHECK(!grouped->source_transport_matches(transport, bindings.data(), group->transaction, banks.data(), 0));
+                        const auto binding = bindings.back();
+                        bindings.back() = UINT32_MAX;
+                        CHECK(!grouped->source_transport_matches(transport, bindings.data(), group->transaction, banks.data(), banks.size()));
+                        bindings.back() = binding;
+                        const auto bank = banks.back();
+                        banks.back() = group->key.n_banks;
+                        CHECK(!grouped->source_transport_matches(transport, bindings.data(), group->transaction, banks.data(), banks.size()));
+                        banks.back() = bank;
+                        const auto & late = *std::find_if(copies.begin(), copies.end(), [&](const bank_copy & copy) {
+                            return copy.group == group && copy.bank == bank;
+                        });
+                        auto * tensor = const_cast<ggml_tensor *>(late.descriptor.tensor);
+                        auto * data = tensor->data;
+                        tensor->data = static_cast<uint8_t *>(data) + 1;
+                        CHECK(!matches_group(late, group->transaction));
+                        CHECK(!matches_sources());
+                        tensor->data = data;
+                        CHECK(matches_group(late, group->transaction));
+                        CHECK(matches_sources());
+                    }
                     for (const auto & copy : copies) {
                         CHECK(grouped->source_transport_matches(transport, copy.binding, copy.group->transaction, copy.bank));
                         const void * alias = nullptr;
@@ -7717,18 +7916,26 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     auto stale = copy.group->transaction;
                     ++stale.acquisition.resource_generation;
                     CHECK(!grouped->source_transport_matches(transport, copy.binding, stale, copy.bank));
+                    CHECK(!matches_group(copy, stale));
+                    const auto transaction = copy.group->transaction;
+                    copy.group->transaction = stale;
+                    CHECK(!matches_sources());
+                    copy.group->transaction = transaction;
+                    CHECK(matches_sources());
                     std::vector<uint8_t> public_sentinel(ggml_nbytes(fixture.output[1]), 0x6b), public_observed(public_sentinel.size());
                     ggml_backend_tensor_set(fixture.output[1], public_sentinel.data(), 0, public_sentinel.size());
                     auto * tensor = const_cast<ggml_tensor *>(copy.descriptor.tensor);
                     void * original_data = tensor->data;
                     tensor->data = static_cast<uint8_t *>(original_data) + 1;
                     CHECK(!grouped->source_transport_matches(transport, copy.binding, copy.group->transaction, copy.bank));
+                    CHECK(!matches_sources());
                     const void * alias = nullptr;
                     CHECK(!grouped->source_transport_alias(transport, copy.binding, tensor,
                         copy.descriptor.source_data, copy.descriptor.expert_stride, &alias) && !alias);
                     CHECK(!grouped->copy_source_transport(transport, copy.binding, tensor, fixture.output[1]->data,
                         copy.descriptor.source_data, copy.descriptor.expert_stride, copy_stream, deadline()));
                     tensor->data = original_data;
+                    CHECK(matches_sources());
                     if (transport_case >= 2) {
                         const auto staged = std::find_if(copies.begin(), copies.end(), [](const bank_copy & candidate) {
                             return candidate.descriptor.source_path == MOE_GROUPED_SOURCE_PAGEABLE_STAGED;
@@ -7745,6 +7952,8 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                             record->second.read_only = !read_only;
                         }
                         CHECK(!grouped->source_transport_matches(transport, staged->binding, staged->group->transaction, staged->bank));
+                        CHECK(!matches_group(*staged, staged->group->transaction));
+                        CHECK(!matches_sources());
                         CHECK(!grouped->source_transport_alias(transport, staged->binding, staged->descriptor.tensor,
                             staged->descriptor.source_data, staged->descriptor.expert_stride, &alias) && !alias);
                         CHECK(!grouped->copy_source_transport(transport, staged->binding, staged->descriptor.tensor, fixture.output[1]->data,
@@ -7754,11 +7963,14 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                             budget->sources.at(staged->descriptor.tensor).read_only = read_only;
                         }
                         CHECK(grouped->source_transport_matches(transport, staged->binding, staged->group->transaction, staged->bank));
+                        CHECK(matches_group(*staged, staged->group->transaction));
+                        CHECK(matches_sources());
                     }
                     CUDA_OK(cudaStreamSynchronize(copy_stream));
                     ggml_backend_tensor_get(fixture.output[1], public_observed.data(), 0, public_observed.size());
                     CHECK(public_observed == public_sentinel);
                     CHECK(grouped->finish_source_dispatch(&transport_execution));
+                    CHECK(!matches_sources());
                     CHECK(grouped->release_source_transport(&transport) && !transport);
                     CUDA_OK(cudaFree(destination));
                     CUDA_OK(cudaStreamDestroy(copy_stream));

@@ -19,7 +19,7 @@ This fork should inherit future llama.cpp model, operator, backend and server im
 - Before diverging from upstream, inspect its current implementation and document why the existing contract is insufficient, the smallest necessary extension and how a later upstream implementation can replace it. Avoid private copies of upstream structures, redundant bookkeeping and model-specific configuration controls.
 - Merge upstream changes semantically: preserve upstream fixes and new model/operator behavior while reconciling fork hooks. Do not resolve conflicts by discarding one side wholesale, copying a donor checkout or restoring obsolete assumptions to make a build pass. Record deliberate exclusions with source evidence.
 - Validate shared contracts across different graph structures and formats, plus synthetic cases for unavailable models. Compare matched prefill and decode controls with actual routes, resident bytes, MTP work and resources; a component speedup or changed output is not proof of an end-to-end gain. Investigate regressions before promoting the combined implementation.
-- Keep the generic publication free of the standalone Strata engine and specialized research port. Reference results belong in separate evidence artifacts; public code must use maintainable generic contracts.
+- Keep the generic publication free of the standalone reference engines and private research ports. Reference results belong in separate evidence artifacts; public code must use maintainable generic contracts.
 
 > [!IMPORTANT]
 >

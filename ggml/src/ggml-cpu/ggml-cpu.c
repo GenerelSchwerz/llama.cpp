@@ -2917,7 +2917,9 @@ struct ggml_cplan ggml_graph_plan(
 
         const int n_tasks = ggml_get_n_tasks(node, n_threads);
 
-        max_tasks = MAX(max_tasks, n_tasks);
+        if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            max_tasks = MAX(max_tasks, n_tasks);
+        }
 
         size_t cur = 0;
 

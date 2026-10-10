@@ -1063,6 +1063,8 @@ public:
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
+    uint64_t get_source_program() const { return source_program; }
+    void set_source_program(uint64_t program) { source_program = program; }
 
     int64_t get_max_nodes() const;
 
@@ -1141,6 +1143,7 @@ public:
     int64_t max_nodes;
 
 private:
+    uint64_t source_program = 0;
     std::vector<ggml_tensor *> inp_token_tensors;
     std::vector<ggml_tensor *> inp_tensors;
     size_t inp_tensors_context_used = SIZE_MAX;

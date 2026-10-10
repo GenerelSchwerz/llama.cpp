@@ -19,6 +19,8 @@ struct staged_input {
     int device = -1;
     PFN_cuStreamWaitValue32_v11070 wait = nullptr;
     PFN_cuStreamWriteValue32_v11070 write = nullptr;
+    void (*submit)(void *) = nullptr;
+    void * context = nullptr;
 
     ~staged_input() {
         if (host) { cudaFreeHost(host); }
@@ -136,6 +138,13 @@ const ggml_staged_input_api * ggml_cuda_staged_input_api() {
 bool ggml_cuda_staged_input_pending_for_test(void * input) {
     return static_cast<staged_input *>(input)->flag->load(std::memory_order_acquire) != 0;
 }
+bool ggml_cuda_staged_input_set_submit(void * opaque, void (*submit)(void *), void * context) {
+    auto * input = static_cast<staged_input *>(opaque);
+    if (!input || !submit || input->submit) { return false; }
+    input->submit = submit;
+    input->context = context;
+    return true;
+}
 bool ggml_cuda_staged_input_prepare_source_view(int device, const ggml_tensor * node, ggml_cuda_source_staged_input_view & view) {
     view = {};
     int selected = -1;
@@ -182,14 +191,18 @@ bool ggml_cuda_staged_input_prepare_source_view(int device, const ggml_tensor * 
     for (const auto * source : node->src) { mix(reinterpret_cast<uintptr_t>(source)); }
     const auto * raw_params = reinterpret_cast<const unsigned char *>(node->op_params);
     for (size_t i = 0; i < sizeof(node->op_params); ++i) { mix(raw_params[i]); }
+    mix(reinterpret_cast<uintptr_t>(input.submit));
+    mix(reinterpret_cast<uintptr_t>(input.context));
     view.host = input.host; view.device_alias = payload_alias; view.host_flag = input.flag; view.device_flag = flag_alias;
     view.bytes = bytes; view.device = device; view.identity = identity;
+    view.submit = input.submit; view.context = input.context;
     return true;
 }
 #else
 bool ggml_cuda_staged_input_supports(const ggml_tensor *) { return false; }
 bool ggml_cuda_staged_input_compute(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 const ggml_staged_input_api * ggml_cuda_staged_input_api() { return nullptr; }
+bool ggml_cuda_staged_input_set_submit(void *, void (*)(void *), void *) { return false; }
 bool ggml_cuda_staged_input_pending_for_test(void *) { return false; }
 bool ggml_cuda_staged_input_prepare_source_view(int, const ggml_tensor *, ggml_cuda_source_staged_input_view & view) { view = {}; return false; }
 #endif

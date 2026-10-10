@@ -13,3 +13,7 @@ struct ggml_staged_input_api {
 
 typedef const ggml_staged_input_api * (*ggml_staged_input_get_api_t)();
 #define GGML_STAGED_INPUT_PROC "ggml_backend_staged_input_v1"
+
+// Register once before building consumers. Context stays live through their completion.
+typedef bool (*ggml_staged_input_set_submit_t)(void * input, void (*submit)(void *), void * context);
+#define GGML_STAGED_INPUT_SET_SUBMIT_PROC "ggml_backend_staged_input_set_submit_v1"

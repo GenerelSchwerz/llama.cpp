@@ -17,20 +17,21 @@ class llama_memory_hybrid_idx_context;
 
 class llama_staged_inputs {
 public:
-    static std::unique_ptr<llama_staged_inputs> create(const llama_model & model, ggml_backend_t backend, bool prefetch, bool caller_inputs);
+    static std::unique_ptr<llama_staged_inputs> create(const llama_model & model, ggml_backend_t backend, bool prefetch);
     ~llama_staged_inputs();
     void set_source(const llama_token * token, ggml_backend_event_t ready);
     void prepare(const llama_ubatch & ubatch, const llama_memory_hybrid_idx_context * memory);
+    void set_deferred(bool value) { deferred = value; }
+    void submit();
     void finish();
     ggml_tensor * build_embedding(ggml_context * ctx, llm_graph_result * result);
     ggml_tensor * build_ple(ggml_context * ctx, llm_graph_result * result, const llama_memory_hybrid_idx_context * memory);
 
 private:
     void run();
-    llama_staged_inputs(const llama_model & model, bool prefetch, bool caller_inputs) : model(model), prefetch(prefetch), caller_inputs(caller_inputs) {}
+    llama_staged_inputs(const llama_model & model, bool prefetch) : model(model), prefetch(prefetch) {}
     const llama_model & model;
     const bool prefetch;
-    const bool caller_inputs;
     const ggml_staged_input_api * api = nullptr;
     void * embedding = nullptr;
     void * ple = nullptr;
@@ -42,4 +43,5 @@ private:
     std::condition_variable condition;
     std::packaged_task<void()> task;
     bool stopping = false;
+    bool deferred = false, submit_supported = false, task_submitted = false;
 };

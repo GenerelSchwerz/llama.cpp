@@ -26,9 +26,10 @@ static __global__ void start_tail(ggml_cuda_moe_source_runtime * runtime,
     dispatch_tail(runtime, dispatch, !canceled);
 }
 
-static __global__ void import_join_tail(float * output, const float * input, size_t values, size_t width, const uint32_t * gpu_mask,
+template<bool tail>
+static __global__ void import_join(float * output, const float * input, size_t values, size_t width, const uint32_t * gpu_mask,
         ggml_cuda_moe_source_runtime * runtime, const int32_t * resident, const int32_t * selected,
-        ggml_cuda_moe_source_control * next_control, const ggml_cuda_moe_source_tail_dispatch * dispatch) {
+        ggml_cuda_moe_source_control * next_control, const ggml_cuda_moe_source_tail_dispatch * dispatch, cudaGraphConditionalHandle next_handle) {
     if (!runtime->failed) {
         const uint32_t route = blockIdx.y;
         const bool gpu = (gpu_mask[route / 32] & (uint32_t(1) << (route % 32))) != 0;
@@ -45,7 +46,11 @@ static __global__ void import_join_tail(float * output, const float * input, siz
             runtime->selected += *selected > 0;
         }
         // This flag selects the next graph and publishes no input data.
-        dispatch_tail(runtime, dispatch, !runtime->failed && !stopped(next_control, cuda::memory_order_relaxed));
+        if constexpr (tail) {
+            dispatch_tail(runtime, dispatch, !runtime->failed && !stopped(next_control, cuda::memory_order_relaxed));
+        } else if (next_handle) {
+            cudaGraphSetConditional(next_handle, !runtime->failed && !stopped(next_control));
+        }
     }
 }
 
@@ -75,11 +80,6 @@ static __global__ void import_tail(float * output, const float * input, size_t v
     }
 }
 
-static __global__ void finish_tail(ggml_cuda_moe_source_runtime * runtime,
-        const ggml_cuda_moe_source_tail_dispatch * dispatch) {
-    dispatch_tail(runtime, dispatch, true);
-}
-
 cudaError_t ggml_cuda_moe_source_tail_start(ggml_cuda_moe_source_runtime * runtime,
         ggml_cuda_moe_source_control * control, const ggml_cuda_moe_source_tail_dispatch * dispatch, cudaStream_t stream) {
     start_tail<<<1, 1, 0, stream>>>(runtime, control, dispatch);
@@ -93,8 +93,8 @@ cudaError_t ggml_cuda_moe_source_tail_import(float * output, const float * input
     if (gpu_mask) {
         if (routes_per_row || output_column || output_row || !width || width % ggml_cuda_moe_source_import_threads ||
                 values % width || !values || values / width > 65535 || width > UINT32_MAX) { return cudaErrorInvalidValue; }
-        import_join_tail<<<dim3(unsigned(width / ggml_cuda_moe_source_import_threads), unsigned(values / width)), ggml_cuda_moe_source_import_threads, 0, stream>>>(output, input, values,
-            width, gpu_mask, runtime, resident, selected, next_control, dispatch);
+        import_join<true><<<dim3(unsigned(width / ggml_cuda_moe_source_import_threads), unsigned(values / width)), ggml_cuda_moe_source_import_threads, 0, stream>>>(output, input, values,
+            width, gpu_mask, runtime, resident, selected, next_control, dispatch, 0);
     } else if (width) {
         if (!routes_per_row) { return cudaErrorInvalidValue; }
         import_tail<true><<<unsigned((values + 255) / 256), 256, 0, stream>>>(output, input, values, runtime,
@@ -106,9 +106,14 @@ cudaError_t ggml_cuda_moe_source_tail_import(float * output, const float * input
     return cudaGetLastError();
 }
 
-cudaError_t ggml_cuda_moe_source_tail_finish(ggml_cuda_moe_source_runtime * runtime,
-        const ggml_cuda_moe_source_tail_dispatch * dispatch, cudaStream_t stream) {
-    finish_tail<<<1, 1, 0, stream>>>(runtime, dispatch);
+cudaError_t ggml_cuda_moe_source_join_import(float * output, const float * input, size_t values, size_t width, const uint32_t * gpu_mask,
+        ggml_cuda_moe_source_runtime * runtime, const int32_t * resident, const int32_t * selected,
+        ggml_cuda_moe_source_control * next_control, cudaGraphConditionalHandle next_handle, cudaStream_t stream) {
+    if (!gpu_mask || !width || width % ggml_cuda_moe_source_import_threads || values % width ||
+            !values || values / width > 65535 || width > UINT32_MAX) { return cudaErrorInvalidValue; }
+    import_join<false><<<dim3(unsigned(width / ggml_cuda_moe_source_import_threads), unsigned(values / width)), ggml_cuda_moe_source_import_threads, 0, stream>>>(output, input, values,
+        width, gpu_mask, runtime, resident, selected, next_control, nullptr, next_handle);
     return cudaGetLastError();
 }
+
 #endif

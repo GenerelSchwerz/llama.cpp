@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -1267,6 +1268,18 @@ struct ggml_backend_sched {
     uint64_t source_preparation_epoch;
     uint64_t source_preparation_graph_uid;
     bool source_retirement_failed;
+    uint64_t source_program_token;
+    uint64_t source_program_epoch;
+    uint64_t source_program_generation;
+    uint64_t source_program_shrink_generation;
+    uint64_t source_program_source_uid;
+    uint64_t source_program_split_uid;
+    int source_program_copy;
+    int source_program_backend;
+    bool source_program_dependencies[GGML_SCHED_MAX_BACKENDS];
+    ggml_graph_execution_certificate source_program_certificate;
+    ggml_backend_sched_hybrid * source_program_hybrid;
+    void * source_program;
     ggml_backend_sched_hybrid * hybrid;
     ggml_backend_sched_hybrid * hybrids[GGML_SCHED_MAX_BACKENDS];
     int n_hybrids;
@@ -1540,6 +1553,7 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
 
 int32_t ggml_backend_sched_moe_hybrid_configure_v1(
         ggml_backend_sched_t sched, const ggml_backend_moe_hybrid_config_v1 * config) {
+    if (sched) { sched->source_program_token = 0; }
     return ggml_backend_sched_moe_hybrid_configure_impl_v1(sched, config);
 }
 
@@ -1838,6 +1852,7 @@ int32_t ggml_backend_moe_hybrid_bind_cpu_row_v1(
 
 int32_t ggml_backend_sched_moe_hybrid_prepare_v1(
         ggml_backend_sched_t sched, const ggml_backend_moe_hybrid_region_v1 * region) try {
+    if (sched) { sched->source_program_token = 0; }
     if (sched == nullptr || sched->hybrid == nullptr || sched->source_retirement_failed || !sched->is_alloc || region == nullptr ||
             ggml_backend_moe_hybrid_validate_buckets_v1(region) != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK ||
             region->source_graph_uid != sched->source_graph_uid || region->split_index >= uint32_t(sched->n_splits) ||
@@ -2355,6 +2370,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    sched->source_program_token = 0;
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -3192,6 +3208,31 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+static enum ggml_status ggml_backend_sched_compute_failure(ggml_backend_sched_t sched, enum ggml_status status,
+        ggml_backend_sched_hybrid * failed, bool previous_split_effects, bool required_grouped) {
+    if (sched->hybrid && sched->hybrid->source_api) {
+        ggml_backend_moe_hybrid_state_v1 state = {}; state.struct_size = sizeof(state);
+        const bool safe_rejection = failed && failed->source_api && failed->device && !previous_split_effects &&
+            failed->source_api->state(failed->device, &state) &&
+            state.ticket_state == GGML_BACKEND_MOE_SOURCE_CORE_TICKET_V1_REJECTED_BEFORE_EFFECTS &&
+            !state.quiescing && !state.dispatch_active && !state.cpu_active_jobs;
+        if (!safe_rejection) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
+        const int32_t drained = ggml_backend_sched_moe_source_drain_v1(sched);
+        if (drained != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
+        if (previous_split_effects && drained == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
+            // Source retirement also covers earlier ordinary backend work.
+            for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
+        }
+        GGML_LOG_ERROR("%s: source failure status=%d safe_rejection=%d previous_split_effects=%d drain_status=%d\n",
+            __func__, int(status), int(safe_rejection), int(previous_split_effects), drained);
+        return status;
+    }
+    if (required_grouped || sched->hybrid != nullptr) {
+        for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
+    }
+    return status;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(
         ggml_backend_sched_t sched,
         uint64_t source_graph_uid,
@@ -3203,27 +3244,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         (certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
     bool previous_split_effects = false;
     const auto fail = [&](enum ggml_status status, ggml_backend_sched_hybrid * failed = nullptr) {
-        if (sched->hybrid && sched->hybrid->source_api) {
-            ggml_backend_moe_hybrid_state_v1 state = {}; state.struct_size = sizeof(state);
-            const bool safe_rejection = failed && failed->source_api && failed->device && !previous_split_effects &&
-                failed->source_api->state(failed->device, &state) &&
-                state.ticket_state == GGML_BACKEND_MOE_SOURCE_CORE_TICKET_V1_REJECTED_BEFORE_EFFECTS &&
-                !state.quiescing && !state.dispatch_active && !state.cpu_active_jobs;
-            if (!safe_rejection) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
-            const int32_t drained = ggml_backend_sched_moe_source_drain_v1(sched);
-            if (drained != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { (void) ggml_backend_sched_moe_source_close_v1(sched); }
-            if (previous_split_effects && drained == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
-                // Source retirement also covers earlier ordinary backend work.
-                for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
-            }
-            GGML_LOG_ERROR("%s: source failure status=%d safe_rejection=%d previous_split_effects=%d drain_status=%d\n",
-                __func__, int(status), int(safe_rejection), int(previous_split_effects), drained);
-            return status;
-        }
-        if (required_grouped || sched->hybrid != nullptr) {
-            for (int i = 0; i < sched->n_backends; ++i) { ggml_backend_synchronize(sched->backends[i]); }
-        }
-        return status;
+        return ggml_backend_sched_compute_failure(sched, status, failed, previous_split_effects, required_grouped);
     };
 
     if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
@@ -3246,7 +3267,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         }
     }
 
-    if (!sched->callback_eval && sched->hybrid && sched->hybrid->source_api) {
+    // A sole split without input copies is validated by compute before graph effects.
+    const bool source_checks_before_effects = sched->n_splits == 1 && splits[0].n_inputs == 0;
+    if (!sched->callback_eval && sched->hybrid && sched->hybrid->source_api && !source_checks_before_effects) {
         // Check static source metadata before any split copies or execution.
         for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
             ggml_backend_sched_hybrid * hybrid = nullptr;
@@ -3504,6 +3527,7 @@ bool ggml_backend_sched_refresh_resizable_plan(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->source_program_token = 0;
     for (int i = 0; i < sched->n_backends; ++i) {
         if (sched->hybrids[i]) { sched->hybrids[i]->clear(); }
     }
@@ -3524,6 +3548,7 @@ bool ggml_backend_sched_moe_source_selected_v1(ggml_backend_sched_t sched) {
 }
 
 static int32_t ggml_backend_sched_moe_source_clear(ggml_backend_sched_t sched, bool keep_cpu) {
+    sched->source_program_token = 0;
     int32_t result = GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
     for (int i = 0; i < sched->n_backends; ++i) {
         auto * entry = sched->hybrids[i];
@@ -3801,6 +3826,97 @@ enum ggml_status ggml_backend_sched_graph_compute_async_with_phases(
     return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value, phases, n_phases);
 }
 
+int32_t ggml_backend_sched_moe_source_program_bind_v1(ggml_backend_sched_t sched, ggml_cgraph * graph,
+        const ggml_graph_execution_certificate * certificate, uint64_t * program) {
+    if (!program) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+    *program = 0;
+    if (!sched || !sched->hybrid || !sched->hybrid->source_api || sched->n_splits != 1 ||
+            sched->splits[0].n_inputs || sched->callback_eval) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    if (!sched->is_alloc || sched->source_retirement_failed || !graph || graph != sched->source_graph ||
+            graph->uid != sched->source_graph_uid || !ggml_backend_sched_execution_certificate_valid(certificate) ||
+            sched->source_preparation_epoch != sched->source_retirement_epoch) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    ggml_backend_sched_hybrid * hybrid = nullptr;
+    if (ggml_backend_sched_hybrid_dispatch_prepare(sched, 0, sched->source_graph_uid, *certificate, &hybrid) != GGML_STATUS_SUCCESS) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT;
+    }
+    if (!hybrid || !hybrid->source_api || !hybrid->source_api->bind_program || !hybrid->source_api->compute_program) {
+        return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_UNSUPPORTED_OPERATION;
+    }
+    const auto projected = ggml_backend_sched_split_certificate(sched->source_graph_uid, sched->splits[0].graph.uid, *certificate);
+    void * prepared = nullptr;
+    const auto status = hybrid->source_api->bind_program(hybrid->device, &sched->splits[0].graph, &projected,
+        hybrid->dispatch.data(), hybrid->dispatch.size(), &prepared);
+    if (status) { return status; }
+    if (!prepared) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_INVALID_ARGUMENT; }
+    static std::atomic<uint64_t> next_token{1};
+    auto token = next_token.load(std::memory_order_relaxed);
+    do {
+        if (token == UINT64_MAX) { return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_CAPACITY; }
+    } while (!next_token.compare_exchange_weak(token, token + 1, std::memory_order_relaxed));
+    ggml_backend_sched_get_buffer_state(sched, &sched->source_program_generation, &sched->source_program_shrink_generation);
+    sched->source_program_hybrid = hybrid;
+    sched->source_program = prepared;
+    sched->source_program_epoch = sched->source_retirement_epoch;
+    sched->source_program_source_uid = sched->source_graph_uid;
+    sched->source_program_split_uid = projected.split_graph_uid;
+    sched->source_program_certificate = projected;
+    sched->source_program_copy = sched->cur_copy;
+    sched->source_program_backend = sched->splits[0].backend_id;
+    std::copy(std::begin(sched->splits[0].direct_dependencies), std::end(sched->splits[0].direct_dependencies),
+        sched->source_program_dependencies);
+    sched->source_program_token = token;
+    *program = token;
+    return GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
+}
+
+enum ggml_status ggml_backend_sched_moe_source_program_compute_v1(ggml_backend_sched_t sched, uint64_t program,
+        const ggml_graph_execution_certificate * certificate) {
+    return ggml_backend_sched_moe_source_program_compute_with_phases_v1(sched, program, certificate, nullptr, 0);
+}
+
+enum ggml_status ggml_backend_sched_moe_source_program_compute_with_phases_v1(ggml_backend_sched_t sched, uint64_t program,
+        const ggml_graph_execution_certificate * certificate, const uint8_t * phases, size_t n_phases) {
+    if (!sched || !program || program != sched->source_program_token || !sched->is_alloc ||
+            sched->source_retirement_failed || sched->callback_eval ||
+            sched->source_program_epoch != sched->source_retirement_epoch || sched->source_program_copy != sched->cur_copy ||
+            !ggml_backend_sched_execution_certificate_valid(certificate)) { return GGML_STATUS_FAILED; }
+    if ((phases == nullptr) != (n_phases == 0) || (phases && n_phases != certificate->n_rows)) { return GGML_STATUS_FAILED; }
+    for (size_t i = 0; i < n_phases; ++i) {
+        if (phases[i] > GGML_GRAPH_EXECUTION_PHASE_GENERATION) { return GGML_STATUS_FAILED; }
+    }
+    auto * hybrid = sched->source_program_hybrid;
+    if (!hybrid || (phases && !hybrid->source_api->compute_program_with_phases)) { return GGML_STATUS_FAILED; }
+    uint64_t generation = 0, shrink_generation = 0;
+    ggml_backend_sched_get_buffer_state(sched, &generation, &shrink_generation);
+    const auto projected = ggml_backend_sched_split_certificate(sched->source_program_source_uid, sched->source_program_split_uid, *certificate);
+    if (generation != sched->source_program_generation || shrink_generation != sched->source_program_shrink_generation ||
+            memcmp(&projected, &sched->source_program_certificate, sizeof(projected))) {
+        GGML_LOG_ERROR("%s: prepared storage/certificate rejected generation=%llu expected=%llu shrink=%llu expected_shrink=%llu\n",
+            __func__, (unsigned long long) generation, (unsigned long long) sched->source_program_generation,
+            (unsigned long long) shrink_generation, (unsigned long long) sched->source_program_shrink_generation);
+        return GGML_STATUS_FAILED;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (!sched->source_program_dependencies[i]) { continue; }
+        if (sched->events[i][sched->cur_copy]) { ggml_backend_event_synchronize(sched->events[i][sched->cur_copy]); }
+        else { ggml_backend_synchronize(sched->backends[i]); }
+    }
+    const auto status = phases ? hybrid->source_api->compute_program_with_phases(
+        hybrid->device, sched->source_program, &projected, phases, n_phases) :
+        hybrid->source_api->compute_program(hybrid->device, sched->source_program, &projected);
+    if (status != GGML_STATUS_SUCCESS) {
+        return ggml_backend_sched_compute_failure(sched, status, hybrid, false,
+            (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0);
+    }
+    const auto event = sched->events[sched->source_program_backend][sched->cur_copy];
+    if (event) { ggml_backend_event_record(event, sched->backends[sched->source_program_backend]); }
+    return GGML_STATUS_SUCCESS;
+}
+
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     if (ggml_backend_sched_moe_source_selected_v1(sched)) {
@@ -3819,12 +3935,14 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     GGML_ASSERT(sched);
+    sched->source_program_token = 0;
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
     GGML_ASSERT(sched);
+    sched->source_program_token = 0;
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
 }
@@ -4178,6 +4296,7 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    if (tensor_backend_id(node) != backend_index) { sched->source_program_token = 0; }
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
