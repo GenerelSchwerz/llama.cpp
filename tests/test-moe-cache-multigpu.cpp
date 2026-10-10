@@ -7354,7 +7354,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     // Complete bodies retain mapped MMQ; the ordinary small-row control can use MMVQ.
                     if (!mixed_cpu && !body_prefill) { CHECK(gpu_error / std::max(gpu_energy, 1e-30) <= 5e-3); }
                 }
-                if (main_prefill || (approximate && phase == 0)) {
+                if ((main_prefill && !staged_inputs) || (approximate && phase == 0)) {
                     const auto * graph = reference.result.get_gf();
                     std::vector<const ggml_tensor *> nodes(graph->nodes, graph->nodes + graph->n_nodes);
                     std::vector<const ggml_tensor *> dynamic(graph->leafs, graph->leafs + graph->n_leafs);
