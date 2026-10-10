@@ -1203,6 +1203,9 @@ public:
     ggml_cuda_moe_grouped_context(const ggml_cuda_moe_grouped_context &) = delete;
     ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
+    double source_link_rate(double measured = 0);
+    unsigned source_miss_fraction(const void * service, const ggml_graph_execution_certificate & certificate);
+    unsigned source_miss_observe(const void * service, const ggml_graph_execution_certificate & certificate, uint64_t ns, uint64_t bytes, uint64_t experts);
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot,
             const uint32_t * capacities = nullptr, uint32_t n_capacities = 0);

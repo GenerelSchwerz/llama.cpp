@@ -2563,6 +2563,7 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
     const auto profile_bound = service->cpu_profile ? moe_cpu_profile_now() : 0;
     lane->plan.abort_callback = ggml_backend_moe_cpu_region_abort_v1;
     lane->plan.abort_callback_data = &abort_state;
+    const auto compute_started = moe_cpu_profile_now();
     enum ggml_status compute_status;
     if (lane->fidelity && service->source_pool) {
         compute_status = ggml_moe_source_pool_run(service->source_pool, lane->fidelity, binding,
@@ -2577,7 +2578,8 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
         compute_status = ggml_graph_compute(lane->graph, &lane->plan);
         if (service->source_pool) { ggml_threadpool_pause(service->threadpool); }
     }
-    const auto profile_computed = service->cpu_profile ? moe_cpu_profile_now() : 0;
+    const auto compute_finished = moe_cpu_profile_now();
+    const auto profile_computed = service->cpu_profile ? compute_finished : 0;
     lane->plan.abort_callback = nullptr;
     lane->plan.abort_callback_data = nullptr;
     if (compute_status == GGML_STATUS_ABORTED || ggml_backend_moe_cpu_region_abort_v1(&abort_state)) {
@@ -2637,6 +2639,7 @@ static int32_t ggml_backend_moe_cpu_region_service_execute_impl_v1(
     published.graph_uid         = region->graph_uid;
     published.graph_generation  = region->graph_generation;
     published.source_generation = region->source_generation;
+    published.compute_ns        = compute_finished - compute_started;
     published.lane_index        = lane_index;
     published.published_routes  = published_routes;
     published.published_outputs = region->n_live_outputs;

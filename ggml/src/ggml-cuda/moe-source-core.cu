@@ -189,12 +189,16 @@ static __global__ void decide_phase(source_runtime * runtime, const source_contr
 
 static __global__ void publish_ready(source_control * control, const float * input, size_t values,
         const int32_t * ids, size_t ids_stride, uint32_t routes_per_row, size_t routes,
-        float * host_input, int32_t * host_ids, size_t host_ids_stride) {
+        float * host_input, int32_t * host_ids, size_t host_ids_stride,
+        const float * weights, size_t weight_column, size_t weight_row, float * host_weights,
+        const int32_t * row_indices, size_t row_stride, int32_t * host_row_indices) {
     for (size_t i = threadIdx.x; i < values; i += blockDim.x) { host_input[i] = input[i]; }
     for (size_t i = threadIdx.x; i < routes; i += blockDim.x) {
         const auto * row = reinterpret_cast<const int32_t *>(reinterpret_cast<const uint8_t *>(ids) + (i / routes_per_row) * ids_stride);
         auto * destination = reinterpret_cast<int32_t *>(reinterpret_cast<uint8_t *>(host_ids) + (i / routes_per_row) * host_ids_stride);
         destination[i % routes_per_row] = row[i % routes_per_row];
+        if (weights) { host_weights[i] = weights[(i / routes_per_row) * weight_row + (i % routes_per_row) * weight_column]; }
+        if (row_indices && i < routes / routes_per_row) { host_row_indices[i] = row_indices[i * row_stride]; }
     }
     __threadfence_system();
     __syncthreads();
@@ -367,6 +371,14 @@ static bool phase(cudaGraph_t graph, cudaStream_t stream, std::vector<cudaGraphN
 }
 #endif
 
+static __global__ void clear_skipped(float * output, const uint8_t * skipped, size_t values,
+        uint32_t width, uint32_t top_k, size_t column_stride, size_t row_stride) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < values; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t route = i / width;
+        if (skipped[route]) { output[(route / top_k) * row_stride + (route % top_k) * column_stride + i % width] = 0; }
+    }
+}
+
 struct prepared_operation {
     ggml_moe_source_operation operation;
     uint32_t consumed = 1;
@@ -417,7 +429,10 @@ struct core_layer {
     std::vector<body_operation> body;
     ggml_tensor routed_output = {};
     ggml_cuda_mmid_resources routed_resources;
-    std::vector<uint8_t> cpu_ownership, prefill_cpu_experts;
+    std::vector<uint8_t> cpu_ownership, prefill_cpu_experts, skipped, row_phases;
+    std::vector<int32_t> route_ids;
+    size_t route_weights_offset = SIZE_MAX, skip_offset = SIZE_MAX, row_indices_offset = SIZE_MAX;
+    uint64_t expert_bytes = 0;
     std::vector<int64_t> prefill_expert_rows;
     uint32_t cpu_count = 0, resident_count = 0, selected_count = 0;
     uint32_t branch_expected = 0, branch_completed = 0;
@@ -630,6 +645,8 @@ struct core_session {
     bool fusion_enabled = true;
     uint64_t fused_nodes = 0, image_groups = 0, emitted_images = 0;
     std::vector<core_layer> layers;
+    std::vector<uint8_t> execution_phases;
+    uint64_t prompt_rows = 0, generation_rows = 0, unknown_rows = 0;
     std::vector<std::unique_ptr<core_prefill_body>> prefill_bodies;
     size_t prefill_body_bytes = 0;
     uint64_t prefill_body_launches = 0, prefill_body_waves = 0, prefill_body_chunks = 0;
@@ -652,6 +669,10 @@ struct core_session {
     ggml_backend_buffer_t pool_arena = nullptr;
     size_t pool_arena_bytes = 0;
     uint64_t resource_recaptures = 0;
+    bool tune_misses = false;
+    unsigned miss_numerator = 0;
+    uint64_t window_cpu_ns = 0, window_cpu_bytes = 0, window_cpu_experts = 0;
+    uint64_t skipped_experts = 0, skipped_routes = 0;
     std::vector<ggml_backend_buffer_ptr> library_workspaces;
     size_t library_bytes = 0;
     uint64_t library_preparations = 0;
@@ -1486,6 +1507,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         if (!region || region->owner != this || region->cpu_api != cpu_api || region->cpu_service != cpu_service) { return false; }
         experts.push_back(&region->expert);
     }
+    tune_misses = ggml_moe_fidelity_selection().tune_misses;
+    miss_numerator = ggml_moe_fidelity_selection().pcie_num;
     program = std::make_unique<ggml_moe_source_program>();
     const auto option = [](const char * name, bool & value) {
         const auto * text = getenv(name);
@@ -1549,6 +1572,23 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             }
             if (ordinary) { ggml_cuda_moe_weighted_reduction_alloc_deps(match, &params); }
             i += match.node_count - 1;
+        }
+    }
+    if (!main_prefill && ggml_moe_fidelity_selection().keep_ranks) {
+        for (const auto * expert : experts) {
+            const auto * weight = ggml_moe_fidelity_selection().keep_ranks < expert->region.geometry.routes_per_row ?
+                ggml_moe_source_route_weights(graph, expert->region.ids) : nullptr;
+            // Ranking must be available before the expert body begins.
+            const auto end = graph->nodes + expert->region.first_node;
+            if (weight && std::find(graph->nodes, end, weight) == end) { weight = nullptr; }
+            schedule.route_weights.push_back(weight);
+            bool identity = false;
+            const auto * indices = weight ? ggml_moe_source_row_indices(graph, expert->region.activation,
+                expert->region.geometry.row_capacity, graph->execution_certificate.n_rows, &identity) : nullptr;
+            schedule.row_indices.push_back(indices);
+            schedule.row_identity.push_back(identity);
+            if (weight) { schedule.allocation_dependencies.push_back({weight, expert->region.output}); }
+            if (indices) { schedule.allocation_dependencies.push_back({indices, expert->region.output}); }
         }
     }
     if (retain_routed_outputs) {
@@ -1772,6 +1812,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
                     !reserve(layer.plan_bytes, geometry.route_capacity, layer.ownership_offset)) { return false; }
             layer.cpu_ownership.resize(geometry.route_capacity);
         }
+        if (!prefill && layer.descriptor->route_weights &&
+                !reserve(layer.plan_bytes, geometry.route_capacity, layer.skip_offset)) { return false; }
         if (prefill) { layer.plan_bytes = 0; }
         else if (!reserve(pinned_bytes, layer.plan_bytes, layer.host_plan_offset) ||
                 !reserve(device_bytes, layer.plan_bytes, layer.device_plan_offset)) { return false; }
@@ -1780,12 +1822,14 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         layer.banks.resize(expert.banks.size());
         layer.selected_offsets.resize(expert.banks.size());
         size_t all_banks = 0;
-        const uint32_t selected_capacity = prefill ? 0 : uint64_t(std::min(geometry.route_capacity, geometry.expert_count)) * ggml_moe_fidelity_selection().pcie_num / 256;
+        const uint32_t selected_capacity = prefill ? 0 : uint64_t(std::min(geometry.route_capacity, geometry.expert_count)) * (tune_misses ? 154u : miss_numerator) / 256;
         for (size_t b = 0; b < expert.banks.size(); ++b) {
             layer.selected_offsets[b] = all_banks;
             size_t bytes;
             if (!product(selected_capacity, expert.banks[b].expert_bytes, bytes) || bytes > SIZE_MAX - all_banks) { return false; }
             all_banks += bytes;
+            if (expert.banks[b].expert_bytes > UINT64_MAX - layer.expert_bytes) { return false; }
+            layer.expert_bytes += expert.banks[b].expert_bytes;
             tile_bytes = std::max(tile_bytes, expert.banks[b].expert_bytes);
         }
         layer.selected_bytes = all_banks;
@@ -1798,6 +1842,13 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         layer.classes.reserve(geometry.route_capacity);
         layer.selected.reserve(geometry.route_capacity);
         layer.weights.resize(geometry.route_capacity);
+        layer.skipped.resize(geometry.route_capacity);
+        layer.row_phases.resize(geometry.row_capacity);
+        layer.route_ids.resize(geometry.route_capacity);
+        if (!prefill && layer.descriptor->route_weights &&
+                !reserve(pinned_bytes, size_t(geometry.route_capacity) * sizeof(float), layer.route_weights_offset)) { return false; }
+        if (!prefill && layer.descriptor->route_weights && layer.descriptor->row_indices &&
+                !reserve(pinned_bytes, size_t(geometry.row_capacity) * sizeof(int32_t), layer.row_indices_offset)) { return false; }
         layer.counts.resize(geometry.route_capacity);
         layer.cpu_ids.reserve(geometry.route_capacity);
         layer.cpu_rows.reserve(geometry.route_capacity);
@@ -1873,6 +1924,25 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
         for (auto & input : body->inputs) { input.indices_data = input.indices->data; }
     }
     memset(host, 0, pinned_bytes);
+    if (!prefill && tune_misses && !owner().source_link_rate()) {
+        const size_t sample = std::min({selected_bytes, pinned_bytes, size_t(1024 * 1024)});
+        if (sample) {
+            cudaEvent_t begin = nullptr, end = nullptr;
+            const auto cleanup = [&] { if (begin) { cudaEventDestroy(begin); } if (end) { cudaEventDestroy(end); } };
+            bool ok = cudaEventCreate(&begin) == cudaSuccess && cudaEventCreate(&end) == cudaSuccess &&
+                cudaEventRecord(begin, io) == cudaSuccess;
+            for (unsigned n = 0; ok && n < 8; ++n) {
+                ok = cudaMemcpyAsync(data() + selected_offset, host, sample, cudaMemcpyHostToDevice, io) == cudaSuccess;
+            }
+            ok = ok && cudaEventRecord(end, io) == cudaSuccess && wait_stream(io, now_ns() + 5'000'000'000ull);
+            float ms = 0;
+            ok = ok && cudaEventElapsedTime(&ms, begin, end) == cudaSuccess && ms > 0;
+            cleanup();
+            if (!ok) { return false; }
+            const double rate = owner().source_link_rate(double(sample) * 8 / (double(ms) * 1e6));
+            fprintf(stderr, "moe-source-miss-link: device=%d sample_bytes=%zu copies=8 GBps=%.3f\n", parent->device, sample, rate);
+        }
+    }
     if (host_completion_offset != SIZE_MAX) { new (completion()) source_flag(); }
     for (uint32_t i = 0; i < layers.size(); ++i) {
         new (control(i)) source_control();
@@ -1937,6 +2007,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
     layer.cpu_ids.clear(); layer.cpu_rows.clear(); layer.cpu_destinations.clear();
     layer.cpu_count = layer.resident_count = layer.selected_count = 0;
     layer.branch_expected = layer.branch_completed = 0;
+    std::fill(layer.skipped.begin(), layer.skipped.end(), 0);
     memset(host + layer.host_plan_offset, 0, layer.plan_bytes);
     if (shared) {
         const auto & source = shared->descriptor->expert->region;
@@ -1976,8 +2047,36 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
             layer.classes.push_back(slot >= 0 ? 0 : 2);
             layer.counts[weight] = 0;
         }
+        layer.route_ids[route] = id;
         layer.weights[route] = weight;
         ++layer.counts[weight];
+    }
+    if (!prefill && layer.route_weights_offset != SIZE_MAX) {
+        const auto & certificate = program->certificate();
+        const bool independent = certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+        std::fill(layer.row_phases.begin(), layer.row_phases.end(), GGML_GRAPH_EXECUTION_PHASE_UNKNOWN);
+        if (layer.row_indices_offset != SIZE_MAX) {
+            const auto * indices = reinterpret_cast<const int32_t *>(host + layer.row_indices_offset);
+            for (uint32_t row = 0; row < geometry.row_capacity; ++row) {
+                if (indices[row] < 0 || size_t(indices[row]) >= execution_phases.size()) { return false; }
+                layer.row_phases[row] = execution_phases[indices[row]];
+            }
+        } else if (layer.descriptor->row_identity && execution_phases.size() == geometry.row_capacity) { layer.row_phases = execution_phases; }
+        if (independent || certificate.n_sequences == 1) {
+            std::vector<uint8_t> resident(geometry.route_capacity);
+            for (uint32_t route = 0; route < geometry.route_capacity; ++route) { resident[route] = layer.classes[layer.weights[route]] == 0; }
+            if (!ggml_moe_source_skip_routes(layer.route_ids.data(), reinterpret_cast<const float *>(host + layer.route_weights_offset),
+                    geometry.row_capacity, geometry.routes_per_row, ggml_moe_fidelity_selection().keep_ranks, independent, resident, layer.skipped, layer.row_phases)) { return false; }
+            for (uint32_t w = 0; w < layer.distinct.size(); ++w) {
+                bool omitted = true;
+                for (uint32_t route = 0; route < geometry.route_capacity; ++route) {
+                    if (layer.weights[route] == w && !layer.skipped[route]) { omitted = false; break; }
+                }
+                if (omitted) { layer.classes[w] = 3; ++skipped_experts; }
+            }
+            for (const auto skipped : layer.skipped) { skipped_routes += skipped != 0; }
+            memcpy(host + layer.host_plan_offset + layer.skip_offset, layer.skipped.data(), geometry.route_capacity);
+        }
     }
     if (prefill) {
         for (auto & kind : layer.classes) { if (kind == 2) { kind = 1; } }
@@ -1986,7 +2085,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
     } else {
         uint32_t misses = 0;
         for (auto kind : layer.classes) { misses += kind == 2; }
-        uint32_t selected = uint64_t(misses) * ggml_moe_fidelity_selection().pcie_num / 256;
+        uint32_t selected = uint64_t(misses) * miss_numerator / 256;
         for (uint32_t w = uint32_t(layer.distinct.size()); w > 0 && selected; --w) {
             if (layer.classes[w - 1] == 2) { layer.classes[w - 1] = 1; --selected; }
         }
@@ -2030,9 +2129,10 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
     uint32_t groups[2] = {}, entries[2] = {};
     for (uint32_t w = 0; w < layer.distinct.size(); ++w) {
         const auto kind = layer.classes[w];
+        if (kind == 3) { continue; }
         if (kind == 2) {
             for (uint32_t route = 0; route < geometry.route_capacity; ++route) {
-                if (layer.weights[route] != w) { continue; }
+                if (layer.weights[route] != w || layer.skipped[route]) { continue; }
                 if (!expert.routed_operation) {
                     layer.cpu_ids.push_back(layer.distinct[w]);
                     layer.cpu_rows.push_back(route / geometry.routes_per_row);
@@ -2056,7 +2156,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
         }
         plan.starts[group] = entries[kind];
         for (uint32_t route = 0; route < geometry.route_capacity; ++route) {
-            if (layer.weights[route] != w) { continue; }
+            if (layer.weights[route] != w || layer.skipped[route]) { continue; }
             plan.tokens[entries[kind]] = route / geometry.routes_per_row;
             plan.destinations[entries[kind]++] = route;
             if (layer.gpu_mask_offset != SIZE_MAX) {
@@ -2072,7 +2172,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
         auto * ownership = host + layer.host_plan_offset + layer.ownership_offset;
         for (uint32_t w = 0, selected_index = 0; w < layer.distinct.size(); ++w) {
             const auto kind = layer.classes[w];
-            if (kind == 2) { continue; }
+            if (kind >= 2) { continue; }
             for (size_t b = 0; b < expert.banks.size(); ++b) {
                 const auto & bank = expert.banks[b];
                 sources[b * geometry.expert_count + layer.distinct[w]] = kind == 0 ?
@@ -2083,7 +2183,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
             selected_index += kind == 1;
         }
         for (uint32_t route = 0; route < geometry.route_capacity; ++route) {
-            ownership[route] = layer.classes[layer.weights[route]];
+            ownership[route] = layer.skipped[route] ? 3 : layer.classes[layer.weights[route]];
             layer.cpu_ownership[route] = ownership[route] == 2;
         }
     }
@@ -2117,7 +2217,7 @@ bool core_session::build_plan(uint32_t i, const core_layer * shared) {
     copy_expected += layer.selected_count != 0;
     counters.distinct_experts += layer.distinct.size();
     counters.resident_experts += groups[0]; counters.transfer_experts += groups[1];
-    counters.cpu_experts += layer.distinct.size() - groups[0] - groups[1];
+    counters.cpu_experts += std::count(layer.classes.begin(), layer.classes.end(), 2);
     counters.resident_routes += entries[0]; counters.transfer_routes += entries[1]; counters.cpu_routes += layer.cpu_count;
     return true;
 }
@@ -2189,11 +2289,18 @@ bool core_session::execute_cpu(uint32_t i) {
     const auto & geometry = expert.region.geometry;
     int32_t status = GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK;
     // Additive import requires zero CPU values on GPU routes.
-    if (!device_tail || layer.gpu_mask_offset == SIZE_MAX) {
+    if (device_tail && layer.gpu_mask_offset != SIZE_MAX) {
+        for (uint32_t route = 0; route < geometry.route_capacity; ++route) {
+            if (layer.skipped[route]) {
+                memset(host + layer.cpu_offset + size_t(route) * (layer.output_bytes / geometry.route_capacity), 0,
+                    layer.output_bytes / geometry.route_capacity);
+            }
+        }
+    } else {
         for (uint32_t route = 0; route < geometry.route_capacity;) {
-            if (layer.classes[layer.weights[route]] == 2) { ++route; continue; }
+            if (layer.classes[layer.weights[route]] == 2 && !layer.skipped[route]) { ++route; continue; }
             const uint32_t first = route++;
-            while (route < geometry.route_capacity && layer.classes[layer.weights[route]] != 2) { ++route; }
+            while (route < geometry.route_capacity && (layer.classes[layer.weights[route]] != 2 || layer.skipped[route])) { ++route; }
             const size_t stride = layer.output_bytes / geometry.route_capacity;
             memset(host + layer.cpu_offset + size_t(first) * stride, 0, size_t(route - first) * stride);
         }
@@ -2242,6 +2349,16 @@ bool core_session::execute_cpu(uint32_t i) {
             if (!status && result.published_routes != layer.cpu_count) { status = GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_COMPUTE_FAILED; }
         }
         counters.cpu_us += (now_ns() - started) / 1000;
+        if (!status && tune_misses && !prefill && result.compute_ns) {
+            uint64_t jobs = 0;
+            for (const auto kind : layer.classes) { jobs += kind == 2; }
+            if (jobs && layer.expert_bytes <= UINT64_MAX / jobs && result.compute_ns <= UINT64_MAX - window_cpu_ns &&
+                    jobs <= UINT64_MAX - window_cpu_experts && jobs * layer.expert_bytes <= UINT64_MAX - window_cpu_bytes) {
+                window_cpu_ns += result.compute_ns;
+                window_cpu_bytes += jobs * layer.expert_bytes;
+                window_cpu_experts += jobs;
+            }
+        }
         ++counters.cpu_execute_calls;
         if (!status) { ++cpu_publications; ++scatter_completions; ++layer.branch_completed; }
     }
@@ -2258,6 +2375,16 @@ bool core_session::execute_experts(uint32_t i, uint32_t kind) {
     const auto & layer = layers[i];
     const auto & expert = *layer.descriptor->expert;
     const auto capacity = expert.region.geometry.route_capacity;
+    if (kind == 2) {
+        if (layer.skip_offset == SIZE_MAX) { return true; }
+        const auto & geometry = expert.region.geometry;
+        const auto * output = layer.descriptor->output;
+        const size_t values = size_t(geometry.route_capacity) * expert.output_width;
+        clear_skipped<<<unsigned((values + 255) / 256), 256, 0, stream>>>(static_cast<float *>(output->data),
+            data() + layer.device_plan_offset + layer.skip_offset, values, expert.output_width, geometry.routes_per_row,
+            output->nb[1] / sizeof(float), output->nb[2] / sizeof(float));
+        return cudaGetLastError() == cudaSuccess;
+    }
     if (expert.generic_body) {
         const auto & geometry = expert.region.geometry;
         ggml_cuda_mmid_execution execution;
@@ -2518,8 +2645,26 @@ bool core_session::capture_program() {
             publish_ready<<<1, 1024, 0, stream>>>(control(i, true), static_cast<const float *>(layer.descriptor->activation->data),
                 layer.input_bytes / sizeof(float), static_cast<const int32_t *>(layer.descriptor->ids->data),
                 layer.descriptor->ids->nb[1], geometry.routes_per_row, geometry.route_capacity,
-                reinterpret_cast<float *>(alias + layer.input_offset), reinterpret_cast<int32_t *>(alias + layer.ids_offset), layer.ids_stride);
+                reinterpret_cast<float *>(alias + layer.input_offset), reinterpret_cast<int32_t *>(alias + layer.ids_offset), layer.ids_stride,
+                layer.route_weights_offset == SIZE_MAX ? nullptr : static_cast<const float *>(layer.descriptor->route_weights->data),
+                layer.route_weights_offset == SIZE_MAX ? 0 : layer.descriptor->route_weights->nb[1] / sizeof(float),
+                layer.route_weights_offset == SIZE_MAX ? 0 : layer.descriptor->route_weights->nb[2] / sizeof(float),
+                layer.route_weights_offset == SIZE_MAX ? nullptr : reinterpret_cast<float *>(alias + layer.route_weights_offset),
+                layer.row_indices_offset == SIZE_MAX ? nullptr : static_cast<const int32_t *>(layer.descriptor->row_indices->data),
+                layer.row_indices_offset == SIZE_MAX ? 0 : layer.descriptor->row_indices->nb[0] / sizeof(int32_t),
+                layer.row_indices_offset == SIZE_MAX ? nullptr : reinterpret_cast<int32_t *>(alias + layer.row_indices_offset));
             return cudaGetLastError() == cudaSuccess;
+        }
+        if (layer.row_indices_offset != SIZE_MAX && cudaMemcpy2DAsync(host + layer.row_indices_offset, sizeof(int32_t),
+                layer.descriptor->row_indices->data, layer.descriptor->row_indices->nb[0], sizeof(int32_t), geometry.row_capacity,
+                cudaMemcpyDeviceToHost, stream) != cudaSuccess) { return false; }
+        if (layer.route_weights_offset != SIZE_MAX) {
+            const auto * weights = layer.descriptor->route_weights;
+            for (uint32_t row = 0; row < geometry.row_capacity; ++row) {
+                if (cudaMemcpy2DAsync(host + layer.route_weights_offset + size_t(row) * geometry.routes_per_row * sizeof(float), sizeof(float),
+                        static_cast<const uint8_t *>(weights->data) + row * weights->nb[2], weights->nb[1], sizeof(float), geometry.routes_per_row,
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) { return false; }
+            }
         }
         return cudaMemcpyAsync(host + layer.input_offset, layer.descriptor->activation->data,
                 layer.input_bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
@@ -2588,7 +2733,7 @@ bool core_session::capture_program() {
                                 auto * plan = copy_plan(data() + layer.device_plan_offset, capacity);
                                 copy_selected<<<unsigned(ggml_cuda_info().devices[parent->device].nsm) * 4, 256, 0, stream>>>(plan, runtime(), selected.count);
                             } else { guard_count<<<1, 1, 0, stream>>>(selected.count, runtime()); }
-                            if (!execute_experts(i, 1)) { return false; }
+                            if (!execute_experts(i, 1) || !execute_experts(i, 2)) { return false; }
                             wait_phase<<<1, 1, 0, stream>>>(control(i, true), runtime(), 2);
                             const size_t values = size_t(capacity) * expert.output_width;
                             if (expert.routed_operation) {
@@ -2655,7 +2800,7 @@ bool core_session::capture_program() {
                     });
                 }) || !make([&](cudaGraph_t graph, std::vector<cudaGraphNode_t> & dependencies) {
                     return capture(graph, stream, dependencies, [&] {
-                        if (!execute_experts(i, 1)) { return false; }
+                        if (!execute_experts(i, 1) || !execute_experts(i, 2)) { return false; }
                         return cudaGetLastError() == cudaSuccess;
                     });
                 }) || !make([&](cudaGraph_t graph, std::vector<cudaGraphNode_t> & dependencies) {
@@ -2690,7 +2835,7 @@ bool core_session::capture_program() {
                     auto * plan = copy_plan(data() + layer.device_plan_offset, capacity);
                     copy_selected<<<unsigned(ggml_cuda_info().devices[parent->device].nsm) * 4, 256, 0, stream>>>(plan, runtime(), selected.count);
                 } else { guard_count<<<1, 1, 0, stream>>>(selected.count, runtime()); }
-                if (!execute_experts(i, 1)) { return false; }
+                if (!execute_experts(i, 1) || !execute_experts(i, 2)) { return false; }
                 wait_phase<<<1, 1, 0, stream>>>(control(i, true), runtime(), 2);
                 return join_cpu(i, reinterpret_cast<const float *>(alias + layer.cpu_offset),
                     control(std::min(size_t(i) + 1, layers.size() - 1), true), handles[i]);
@@ -3157,6 +3302,17 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
     }
     // The program was checked above before advancing the epoch.
     if (!metadata_valid(graph, graph->execution_certificate, regions, count, false)) { return reject_before_effects(); }
+    const auto rows = graph->execution_certificate.n_rows;
+    if ((graph->execution_phases == nullptr) != (graph->n_execution_phases == 0) ||
+            (graph->execution_phases && graph->n_execution_phases != rows)) { return reject_before_effects(); }
+    execution_phases.clear();
+    if (graph->execution_phases || ggml_moe_fidelity_selection().keep_ranks || ggml_moe_fidelity_selection().tune_misses) {
+        execution_phases.assign(rows, GGML_GRAPH_EXECUTION_PHASE_UNKNOWN);
+        if (graph->execution_phases) { std::copy_n(graph->execution_phases, rows, execution_phases.data()); }
+        for (const auto phase : execution_phases) {
+            if (phase > GGML_GRAPH_EXECUTION_PHASE_GENERATION) { return reject_before_effects(); }
+        }
+    }
     compute_regions.clear();
     for (uint32_t i = 0; i < count; ++i) { compute_regions.push_back(static_cast<core_region *>(regions[i])); }
     ggml_cuda_set_device(parent->device);
@@ -3190,7 +3346,12 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
         deadline = now_ns() + (prefill ? prefill_timeout_ns : 2'000'000'000ull);
         if (supervisor_needs_wake) { condition.notify_all(); }
     }
+    prompt_rows += std::count(execution_phases.begin(), execution_phases.end(), uint8_t(GGML_GRAPH_EXECUTION_PHASE_PROMPT));
+    generation_rows += std::count(execution_phases.begin(), execution_phases.end(), uint8_t(GGML_GRAPH_EXECUTION_PHASE_GENERATION));
+    unknown_rows += execution_phases.empty() ? rows : std::count(execution_phases.begin(), execution_phases.end(), uint8_t(GGML_GRAPH_EXECUTION_PHASE_UNKNOWN));
     if (prefill) { return replay_prefill(graph); }
+    window_cpu_ns = window_cpu_bytes = window_cpu_experts = 0;
+    if (tune_misses) { miss_numerator = owner().source_miss_fraction(cpu_service, program->certificate()); }
     bool ok = acquire_owner(graph, false);
     for (uint32_t i = 0; i < layers.size() && ok; ++i) {
         auto & layer = layers[i];
@@ -3265,7 +3426,7 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
                 ggml_backend_moe_source_access_v1 access = {i, uint32_t(layers.size()), bank.source.tensor,
                     static_cast<const ggml_tensor *>(bank.source.witness), layer.probe_domain, layer.descriptor->ids,
                     layer.weights.data(), layer.distinct.data(), layer.classes.data(),
-                    uint32_t(layer.distinct.size()), expert.region.geometry.route_capacity};
+                    uint32_t(layer.distinct.size()), expert.region.geometry.route_capacity, layer.skipped.data(), expert.region.output};
                 if (!hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_SOURCE_ACCESS, epoch, &access)) { ok = false; break; }
             }
         }
@@ -3336,6 +3497,10 @@ ggml_status core_session::replay(ggml_cgraph * graph, void * const * regions, ui
         std::lock_guard<std::mutex> lock(mutex);
         effect_failure = true; closed = true; ++failures; ++counters.errors;
         stop();
+    }
+    if (ok && tune_misses && !execution_phases.empty() &&
+            std::all_of(execution_phases.begin(), execution_phases.end(), [](uint8_t phase) { return phase == GGML_GRAPH_EXECUTION_PHASE_GENERATION; })) {
+        owner().source_miss_observe(cpu_service, program->certificate(), window_cpu_ns, window_cpu_bytes, window_cpu_experts);
     }
     counters.last_epoch = epoch;
     replay_timer.finish();
@@ -3422,6 +3587,11 @@ void core_session::summary(const char * kind, int32_t drain_status) const {
             (unsigned long long) metadata_validation_wall_ns.load(std::memory_order_relaxed));
     }
     const auto transport_snapshot = transport_stats;
+    fprintf(stderr, "moe-source-miss-policy: program_instance=%llu tuning=%u fraction=%.5f keep_ranks=%u skipped_experts=%llu skipped_routes=%llu rank_layers=%zu prompt_rows=%llu generation_rows=%llu unknown_rows=%llu\n",
+        (unsigned long long) program_instance, unsigned(tune_misses), miss_numerator / 256.0,
+        ggml_moe_fidelity_selection().keep_ranks, (unsigned long long) skipped_experts, (unsigned long long) skipped_routes,
+        size_t(std::count_if(layers.begin(), layers.end(), [](const core_layer & layer) { return layer.route_weights_offset != SIZE_MAX; })),
+        (unsigned long long) prompt_rows, (unsigned long long) generation_rows, (unsigned long long) unknown_rows);
     fprintf(stderr, "moe-source-publication-summary: program_instance=%llu packet=%u captures=%llu launches=%llu\n",
         (unsigned long long) program_instance, unsigned(publication_graph != SIZE_MAX),
         (unsigned long long) publication_captures, (unsigned long long) publication_launches);

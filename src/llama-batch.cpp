@@ -226,6 +226,13 @@ bool llama_batch_allocr::init(
         }
     }
 
+    for (int32_t i = 0; i < n_tok; ++i) {
+        if (batch_inp.tokens[i].phase != LLAMA_BATCH_PHASE_UNKNOWN) {
+            phase.resize(n_tok, LLAMA_BATCH_PHASE_UNKNOWN);
+            phase[i] = batch_inp.tokens[i].phase;
+        }
+    }
+
     //
     // set up the internal llama_batch to point to our owned arrays
     //
@@ -317,6 +324,7 @@ bool llama_batch_allocr::init(
             /*.type         =*/ is_embd_vec.empty() ? nullptr : is_embd_vec.data(),
             /*.decision_order =*/ decision_order.empty() ? nullptr : decision_order.data(),
             /*.data         =*/ {},
+            /*.phase        =*/ phase.empty() ? nullptr : phase.data(),
         };
 
         ubatch_print(ubatch, debug);
@@ -844,6 +852,7 @@ void llama_batch_allocr::clear() {
     seq_id_unq  .clear();
     output      .clear();
     decision_order.clear();
+    phase.clear();
 
     for (auto & cur : seq_pos) {
         cur.clear();
@@ -893,6 +902,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->output    .resize(n_tokens);
     udata->type      .resize(mixed ? n_tokens : 0);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
+    udata->phase.resize(phase.empty() ? 0 : n_tokens);
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -922,6 +932,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         if (!decision_order.empty()) {
             udata->decision_order[i] = decision_order[idxs[i]];
         }
+        if (!phase.empty()) { udata->phase[i] = phase[idxs[i]]; }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -948,6 +959,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    const auto * row_phase = udata->phase.empty() ? nullptr : udata->phase.data();
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
@@ -967,6 +979,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.phase        =*/ row_phase,
     };
 
     if (debug > 0) {
@@ -1273,6 +1286,16 @@ bool llama_batch_ext::set_output(int32_t idx, bool output_last) {
     }
     tokens[idx].output = output_last;
     return true;
+}
+
+bool llama_batch_ext::set_phase(int32_t idx, llama_batch_phase phase) {
+    if (idx < 0 || size_t(idx) >= tokens.size() || phase < LLAMA_BATCH_PHASE_UNKNOWN || phase > LLAMA_BATCH_PHASE_GENERATION) { return false; }
+    tokens[idx].phase = uint8_t(phase);
+    return true;
+}
+
+bool llama_batch_ext_set_phase(llama_batch_ext * batch, int32_t idx, llama_batch_phase phase) {
+    return batch && batch->set_phase(idx, phase);
 }
 
 bool llama_batch_ext::set_decision_order(int32_t idx, int32_t order) {

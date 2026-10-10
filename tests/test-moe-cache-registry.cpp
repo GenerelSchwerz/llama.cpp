@@ -15,6 +15,123 @@
 #include <mutex>
 #include <stdexcept>
 
+void test_moe_miss_policy() {
+    if (getenv("GGML_TEST_MOE_INVALID_SELECTION")) {
+        CHECK(!ggml_moe_fidelity_selection().valid);
+        fprintf(stderr, "test-moe-cache: invalid hardware policy configuration rejected OK\n");
+        return;
+    }
+    ggml_moe_source_miss_policy fast_cpu, slow_cpu;
+    for (unsigned i = 0; i < 48; ++i) {
+        const bool a = ggml_moe_source_miss_observe(fast_cpu, 20, 1'000'000, 80'000'000, 10);
+        const bool b = ggml_moe_source_miss_observe(slow_cpu, 20, 1'000'000, 1'000'000, 10);
+        CHECK(a == (i == 47)); CHECK(b == (i == 47));
+    }
+    CHECK(fast_cpu.numerator == 26 && slow_cpu.numerator == 154);
+    CHECK(fast_cpu.updates == 1 && slow_cpu.updates == 1);
+    for (unsigned i = 0; i < 192; ++i) { ggml_moe_source_miss_observe(slow_cpu, 20, 1'000'000, 100'000'000, 10); }
+    CHECK(slow_cpu.updates == 3);
+    const auto stopped = slow_cpu.numerator;
+    for (unsigned i = 0; i < 200; ++i) { CHECK(!ggml_moe_source_miss_observe(slow_cpu, 1, 1'000'000, 1, 10)); }
+    CHECK(stopped == slow_cpu.numerator);
+    ggml_moe_source_miss_policy empty;
+    for (unsigned i = 0; i < 2001; ++i) { CHECK(!ggml_moe_source_miss_observe(empty, 20, 0, 0, 0)); }
+    CHECK(empty.updates == 0 && empty.numerator == 44);
+    CHECK(!ggml_moe_source_miss_observe(empty, std::numeric_limits<double>::quiet_NaN(), 100, 100, 10));
+
+    const int32_t ids[] = {2, 0, 1, 0, 1, 2};
+    const float weights[] = {.1f, .8f, .1f, .1f, .1f, .8f};
+    std::vector<uint8_t> skipped;
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 2, 3, 1, true, {0, 0, 1, 0, 0, 0}, skipped, {2, 2}));
+    CHECK((skipped == std::vector<uint8_t>{1, 0, 0, 1, 1, 0}));
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 2, 3, 1, false, {0, 0, 1, 0, 0, 0}, skipped, {2, 2}));
+    CHECK((skipped == std::vector<uint8_t>{0, 0, 0, 0, 1, 0}));
+    // Ties retain all experts at the cutoff, regardless of their ID column.
+    const float ties[] = {1, 1, 1, 1, 1, 1};
+    CHECK(ggml_moe_source_skip_routes(ids, ties, 2, 3, 1, true, std::vector<uint8_t>(6), skipped, {2, 2}));
+    CHECK(std::count(skipped.begin(), skipped.end(), 1) == 0);
+    for (uint32_t k : {1u, 2u, 5u, 13u, 64u}) {
+        std::vector<int32_t> routes(2 * k);
+        std::vector<float> values(2 * k);
+        for (uint32_t i = 0; i < k; ++i) {
+            routes[i] = routes[k + i] = i;
+            values[i] = float(i); values[k + i] = float(k - i);
+        }
+        std::vector<uint8_t> together, alone;
+        CHECK(ggml_moe_source_skip_routes(routes.data(), values.data(), 2, k, 1, true, std::vector<uint8_t>(2 * k), together, {2, 2}));
+        CHECK(ggml_moe_source_skip_routes(routes.data(), values.data(), 1, k, 1, true, std::vector<uint8_t>(k), alone, {2}));
+        CHECK(std::equal(alone.begin(), alone.end(), together.begin()));
+        CHECK(ggml_moe_source_skip_routes(routes.data(), values.data(), 2, k, 0, true, std::vector<uint8_t>(2 * k), skipped, {2, 2}));
+        CHECK(std::count(skipped.begin(), skipped.end(), 1) == 0);
+    }
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 2, 3, 1, true, std::vector<uint8_t>(6), skipped, {1, 2}));
+    CHECK((skipped == std::vector<uint8_t>{0, 0, 0, 1, 1, 0}));
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 1, 3, 1, true, std::vector<uint8_t>(3), skipped, {1}));
+    CHECK((skipped == std::vector<uint8_t>{0, 0, 0}));
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 1, 3, 1, true, std::vector<uint8_t>(3), skipped, {0}));
+    CHECK((skipped == std::vector<uint8_t>{0, 0, 0}));
+    CHECK(ggml_moe_source_skip_routes(ids, weights, 2, 3, 1, false, std::vector<uint8_t>(6), skipped, {1, 2}));
+    CHECK(std::count(skipped.begin(), skipped.end(), 1) == 0);
+    CHECK(!ggml_moe_source_skip_routes(ids, weights, 1, 3, 1, true, std::vector<uint8_t>(3), skipped, {3}));
+    const float invalid[] = {1, NAN, 2};
+    CHECK(!ggml_moe_source_skip_routes(ids, invalid, 1, 3, 1, true, std::vector<uint8_t>(3), skipped, {2}));
+    ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
+    auto * ids_tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, 2);
+    auto * scores = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, 8, 2);
+    auto * weights_tensor = ggml_get_rows(ctx.get(), scores, ids_tensor);
+    auto * values_tensor = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 16, 3, 2);
+    auto * output = ggml_mul(ctx.get(), values_tensor, weights_tensor);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, output);
+    CHECK(ggml_moe_source_route_weights(graph, ids_tensor) == weights_tensor);
+    const uint8_t phase_rows[] = {GGML_GRAPH_EXECUTION_PHASE_PROMPT, GGML_GRAPH_EXECUTION_PHASE_GENERATION};
+    graph->execution_phases = phase_rows; graph->n_execution_phases = 2;
+    const auto view = ggml_graph_view(graph, 0, graph->n_nodes);
+    CHECK(!view.execution_phases && !view.n_execution_phases);
+    auto * copy = ggml_graph_dup(ctx.get(), graph, false);
+    CHECK(!copy->execution_phases && !copy->n_execution_phases);
+    copy->execution_phases = phase_rows; copy->n_execution_phases = 2;
+    ggml_graph_cpy(graph, copy);
+    CHECK(!copy->execution_phases && !copy->n_execution_phases);
+    copy->execution_phases = phase_rows; copy->n_execution_phases = 2;
+    ggml_graph_clear(copy);
+    CHECK(!copy->execution_phases && !copy->n_execution_phases);
+    CHECK(!ggml_moe_source_route_weights(graph, ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, 2)));
+    auto * full_rows = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 16, 4);
+    ggml_set_input(full_rows);
+    auto * row_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 2);
+    ggml_set_input(row_ids);
+    auto * gathered = ggml_get_rows(ctx.get(), full_rows, row_ids);
+    auto * normalized = ggml_rms_norm(ctx.get(), gathered, 1e-5f);
+    auto * selected_graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(selected_graph, normalized);
+    CHECK(ggml_moe_source_row_indices(selected_graph, normalized, 2, 4) == row_ids);
+    CHECK(!ggml_moe_source_row_indices(selected_graph, normalized, 2, 5));
+    auto * other_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 2);
+    auto * ambiguous = ggml_add(ctx.get(), normalized, ggml_get_rows(ctx.get(), full_rows, other_ids));
+    ggml_build_forward_expand(selected_graph, ambiguous);
+    CHECK(!ggml_moe_source_row_indices(selected_graph, ambiguous, 2, 4));
+    bool identity = true;
+    auto * two_rows = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 16, 2);
+    ggml_set_input(two_rows);
+    auto * permuted = ggml_add(ctx.get(), ggml_get_rows(ctx.get(), two_rows, row_ids), ggml_get_rows(ctx.get(), two_rows, other_ids));
+    ggml_build_forward_expand(selected_graph, permuted);
+    CHECK(!ggml_moe_source_row_indices(selected_graph, permuted, 2, 2, &identity) && !identity);
+    auto * mixed_mapping = ggml_add(ctx.get(), two_rows, ggml_get_rows(ctx.get(), two_rows, row_ids));
+    ggml_build_forward_expand(selected_graph, mixed_mapping);
+    CHECK(!ggml_moe_source_row_indices(selected_graph, mixed_mapping, 2, 2, &identity) && !identity);
+    CHECK(!ggml_moe_source_row_indices(selected_graph, full_rows, 4, 4, &identity) && identity);
+    auto * square_ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, 3);
+    auto * square_scores = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, 8, 3);
+    auto * square_weights = ggml_get_rows(ctx.get(), square_scores, square_ids);
+    auto * square_values = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 16, 3, 3);
+    auto * square_graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(square_graph, ggml_mul(ctx.get(), square_values, square_weights));
+    CHECK(ggml_moe_source_route_weights(square_graph, square_ids) == square_weights);
+    CHECK(!ggml_moe_source_route_weights(square_graph, ggml_transpose(ctx.get(), square_ids)));
+    fprintf(stderr, "test-moe-cache: measured miss tuning, arbitrary rank order, ties, windows and request independence OK\n");
+}
+
 void test_moe_prefill_partition_policy() {
     {
         std::vector<int32_t> classes{1, 0, 1, 1, 1};

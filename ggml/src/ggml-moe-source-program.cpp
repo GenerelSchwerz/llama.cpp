@@ -14,6 +14,150 @@
 #include <type_traits>
 #include <unordered_map>
 
+bool ggml_moe_source_miss_observe(ggml_moe_source_miss_policy & state, double link, uint64_t ns, uint64_t bytes, uint64_t experts) {
+    if (state.updates >= 3 || state.windows >= 2000 || !std::isfinite(link) || link <= 0) { return false; }
+    ++state.windows;
+    if (ns && bytes && experts && experts <= UINT64_MAX - state.jobs) {
+        state.jobs += experts; state.cpu_ns += ns; state.cpu_bytes += bytes;
+    }
+    if (state.windows < (state.updates ? 96u : 48u) || state.jobs < 300) { return false; }
+    const double rate = state.cpu_bytes / state.cpu_ns;
+    const double fraction = std::clamp(std::round(link / (link + 1.85 * rate) * 20) / 20, 0.10, 0.60);
+    state.jobs = 0; state.cpu_ns = state.cpu_bytes = 0; state.windows = 0; ++state.updates;
+    const auto next = unsigned(std::floor(fraction * 256 + 0.5));
+    if (next == state.numerator) { return false; }
+    state.numerator = next;
+    return true;
+}
+
+bool ggml_moe_source_skip_routes(const int32_t * ids, const float * weights, uint32_t rows, uint32_t top_k,
+        uint32_t keep, bool independent, const std::vector<uint8_t> & resident, std::vector<uint8_t> & skipped, const std::vector<uint8_t> & phases) try {
+    if (!ids || !weights || !rows || !top_k || size_t(rows) > SIZE_MAX / top_k) { return false; }
+    const size_t count = size_t(rows) * top_k;
+    if (resident.size() != count || phases.size() != rows) { return false; }
+    for (const auto phase : phases) { if (phase > GGML_GRAPH_EXECUTION_PHASE_GENERATION) { return false; } }
+    skipped.assign(count, 0);
+    if (!independent && std::any_of(phases.begin(), phases.end(), [](uint8_t phase) {
+            return phase != GGML_GRAPH_EXECUTION_PHASE_GENERATION;
+        })) { return true; }
+    if (!keep || keep >= top_k) { return true; }
+    for (size_t i = 0; i < count; ++i) {
+        if (ids[i] < 0 || !std::isfinite(weights[i])) { return false; }
+    }
+    for (uint32_t first = 0; first < rows;) {
+        const uint32_t last = independent ? first + 1 : rows;
+        if (phases[first] != GGML_GRAPH_EXECUTION_PHASE_GENERATION) { first = last; continue; }
+        std::unordered_map<int32_t, uint32_t> best;
+        for (uint32_t row = first; row < last; ++row) {
+            for (uint32_t column = 0; column < top_k; ++column) {
+                const size_t i = size_t(row) * top_k + column;
+                uint32_t rank = 0;
+                for (uint32_t other = 0; other < top_k; ++other) {
+                    rank += weights[size_t(row) * top_k + other] > weights[i];
+                }
+                const auto entry = best.emplace(ids[i], rank);
+                if (!entry.second) { entry.first->second = std::min(entry.first->second, rank); }
+            }
+        }
+        for (size_t i = size_t(first) * top_k; i < size_t(last) * top_k; ++i) {
+            skipped[i] = !resident[i] && best.at(ids[i]) >= keep;
+        }
+        first = last;
+    }
+    return true;
+} catch (...) { return false; }
+
+const ggml_tensor * ggml_moe_source_row_indices(const ggml_cgraph * graph, const ggml_tensor * activation, uint32_t rows, uint32_t input_rows, bool * identity) {
+    if (identity) { *identity = false; }
+    if (!graph || !activation || !rows || !input_rows) { return nullptr; }
+    bool selected = false;
+    struct mapping { bool valid; const ggml_tensor * indices; };
+    const auto constant = [graph](const ggml_tensor * tensor) {
+        int depth = 0;
+        while (tensor && tensor->view_src) { if (++depth > graph->n_nodes) { return false; } tensor = tensor->view_src; }
+        return tensor && tensor->op == GGML_OP_NONE && !(tensor->flags & GGML_TENSOR_FLAG_INPUT);
+    };
+    std::function<mapping(const ggml_tensor *, int)> find = [&](const ggml_tensor * tensor, int depth) -> mapping {
+        if (!tensor || depth > graph->n_nodes || ggml_nrows(tensor) != rows) { return {false, nullptr}; }
+        if (constant(tensor)) { return {true, nullptr}; }
+        switch (tensor->op) {
+            case GGML_OP_GET_ROWS: {
+                const auto * source = tensor->src[0];
+                const auto * indices = tensor->src[1];
+                selected |= source && !constant(source);
+                if (source && !constant(source) && source->ne[1] == input_rows && source->ne[2] == 1 && source->ne[3] == 1 &&
+                        indices && indices->type == GGML_TYPE_I32 && indices->ne[0] == rows && indices->ne[1] == 1 &&
+                        indices->ne[2] == 1 && indices->ne[3] == 1 && indices->nb[0] >= sizeof(int32_t) && indices->nb[0] % sizeof(int32_t) == 0) { return {true, indices}; }
+                return {false, nullptr};
+            }
+            case GGML_OP_RMS_NORM: case GGML_OP_NORM: case GGML_OP_SCALE: case GGML_OP_UNARY:
+                return find(tensor->src[0], depth + 1);
+            case GGML_OP_CONT: case GGML_OP_RESHAPE: case GGML_OP_VIEW:
+                if (tensor->view_offs || !tensor->src[0] || tensor->ne[0] != tensor->src[0]->ne[0] ||
+                        !ggml_is_contiguous(tensor) || !ggml_is_contiguous(tensor->src[0])) { return {false, nullptr}; }
+                return find(tensor->src[0], depth + 1);
+            case GGML_OP_MUL_MAT:
+                if (!constant(tensor->src[0])) { return {false, nullptr}; }
+                return find(tensor->src[1], depth + 1);
+            case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_DIV: {
+                mapping result{true, nullptr};
+                for (int i = 0; i < 2; ++i) {
+                    if (constant(tensor->src[i])) { continue; }
+                    const auto next = find(tensor->src[i], depth + 1);
+                    result.valid &= next.valid && !(result.indices && next.indices && result.indices != next.indices);
+                    if (next.indices) { result.indices = next.indices; }
+                }
+                return result;
+            }
+            default:
+                return {false, nullptr};
+        }
+    };
+    const auto result = find(activation, 0);
+    if (identity) { *identity = !selected && rows == input_rows; }
+    return result.valid ? result.indices : nullptr;
+}
+
+const ggml_tensor * ggml_moe_source_route_weights(const ggml_cgraph * graph, const ggml_tensor * ids) {
+    if (!graph || !ids || ids->type != GGML_TYPE_I32 || ids->ne[2] != 1 || ids->ne[3] != 1) { return nullptr; }
+    const auto root = [graph](const ggml_tensor * value) {
+        int depth = 0;
+        while (value && value->view_src && !value->view_offs && ggml_is_contiguous(value) &&
+                ggml_is_contiguous(value->view_src) && ggml_nelements(value) == ggml_nelements(value->view_src)) {
+            if (++depth > graph->n_nodes) { return static_cast<const ggml_tensor *>(nullptr); }
+            value = value->view_src;
+        }
+        return value;
+    };
+    const ggml_tensor * found = nullptr;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL) { continue; }
+        for (const auto * weight : {node->src[0], node->src[1]}) {
+            if (!weight || weight->type != GGML_TYPE_F32 || weight->ne[0] != 1 ||
+                    weight->ne[1] != ids->ne[0] || weight->ne[2] != ids->ne[1] || weight->ne[3] != 1 ||
+                    weight->nb[0] != sizeof(float) || weight->nb[1] % sizeof(float) || weight->nb[2] % sizeof(float)) { continue; }
+            std::vector<const ggml_tensor *> pending{weight};
+            std::unordered_map<const ggml_tensor *, bool> visited;
+            bool matches = false;
+            while (!pending.empty()) {
+                const auto * current = pending.back(); pending.pop_back();
+                if (!current || !visited.emplace(current, true).second) { continue; }
+                if (current->op == GGML_OP_GET_ROWS && current->src[1] && root(ids) && root(current->src[1]) == root(ids)) { matches = true; break; }
+                // Only scalar routing transforms may establish ranking provenance.
+                if (current->op == GGML_OP_RESHAPE || current->op == GGML_OP_VIEW || current->op == GGML_OP_CONT ||
+                        current->op == GGML_OP_SCALE || current->op == GGML_OP_SOFT_MAX || current->op == GGML_OP_DIV) {
+                    pending.push_back(current->src[0]);
+                }
+            }
+            if (!matches) { continue; }
+            if (found && found != weight) { return nullptr; }
+            found = weight;
+        }
+    }
+    return found;
+}
+
 bool ggml_moe_source_prefill_partition(const std::vector<uint32_t> & counts, std::vector<int32_t> & classes, uint32_t cpu_row_budget) try {
     if (counts.size() != classes.size() || counts.size() > UINT32_MAX) { return false; }
     std::vector<uint32_t> candidates;
@@ -1176,6 +1320,25 @@ struct ggml_moe_source_program::impl {
             if (index(expert->region.activation) == SIZE_MAX || index(expert->region.ids) == SIZE_MAX) { return reject("layer_inputs", expert->region.output); }
             layer.activation = &tensors[index(expert->region.activation)];
             layer.ids = &tensors[index(expert->region.ids)];
+            if (!options.route_weights.empty()) {
+                if (options.route_weights.size() != experts.size()) { return reject("route_weight_count"); }
+                const auto * weight = options.route_weights[layers.size()];
+                if (weight) {
+                    const auto at = index(weight);
+                    if (at == SIZE_MAX || at >= expert->region.first_node || omitted[at]) { return reject("route_weight_dependency"); }
+                    layer.route_weights = &tensors[at];
+                }
+            }
+            if (!options.row_indices.empty()) {
+                if (options.row_indices.size() != experts.size()) { return reject("row_index_count"); }
+                if (options.row_identity.size() != experts.size()) { return reject("row_identity_count"); }
+                layer.row_identity = options.row_identity[layers.size()] != 0;
+                if (const auto * indices = options.row_indices[layers.size()]) {
+                    const auto at = index(indices);
+                    if (at == SIZE_MAX || (at < count && at >= expert->region.first_node) || omitted[at]) { return reject("row_index_dependency"); }
+                    layer.row_indices = &tensors[at];
+                }
+            }
             layer.output = &tensors[expert->region.last_node];
             while (cursor < expert->region.first_node) { layer.prelude.push_back(operation(cursor++)); }
             cursor = size_t(expert->region.last_node) + 1;

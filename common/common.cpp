@@ -1051,10 +1051,20 @@ void common_moe_hybrid_configure(const common_params & params) {
             throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
         }
     }
+    if (!params.moe_gpu_miss_tuning.empty() && params.moe_gpu_miss_tuning != "on" && params.moe_gpu_miss_tuning != "off") {
+        throw std::invalid_argument("--moe-gpu-miss-tuning must be on or off");
+    }
+    if (params.moe_miss_keep_ranks < -1) { throw std::invalid_argument("--moe-miss-keep-ranks must be nonnegative"); }
     // Configure the existing process selection before model/context preparation.
     if (!params.moe_hybrid.empty()) {
         common_set_env("GGML_MOE_HYBRID", params.moe_hybrid == "on" ? "required" : "off");
         if (params.moe_hybrid == "on") { common_set_env("GGML_MOE_HYBRID_EXECUTOR", "source"); }
+    }
+    if (!params.moe_gpu_miss_tuning.empty()) {
+        common_set_env("GGML_MOE_SOURCE_MISS_TUNING", params.moe_gpu_miss_tuning);
+    }
+    if (params.moe_miss_keep_ranks >= 0) {
+        common_set_env("GGML_MOE_SOURCE_KEEP_RANKS", std::to_string(params.moe_miss_keep_ranks));
     }
     if (!params.moe_gpu_miss_fraction.empty()) {
         common_set_env("GGML_MOE_SOURCE_GPU_MISS_FRACTION", params.moe_gpu_miss_fraction);
@@ -2441,6 +2451,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
         }
+        GGML_ASSERT(llama_batch_ext_set_phase(res, idx, t.phase));
     }
 
     return res;

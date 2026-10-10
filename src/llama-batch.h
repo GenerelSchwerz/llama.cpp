@@ -72,12 +72,14 @@ struct llama_ubatch {
         std::vector<int8_t>         type;
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
+        std::vector<uint8_t>        phase;
 
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    const uint8_t * phase = nullptr; // [n_tokens], NULL means UNKNOWN
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -109,6 +111,7 @@ struct llama_batch_ext {
         size_t       embd_off = 0; // index offset in the embd array
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        uint8_t      phase = LLAMA_BATCH_PHASE_UNKNOWN;
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
     };
@@ -139,6 +142,7 @@ struct llama_batch_ext {
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
+    bool set_phase(int32_t idx, llama_batch_phase phase);
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -223,6 +227,7 @@ private:
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
     std::vector<int32_t>        decision_order; // empty if no entry has one
+    std::vector<uint8_t>        phase;
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

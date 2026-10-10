@@ -25,6 +25,19 @@ GGML_API bool ggml_moe_source_learning_valid(const ggml_backend_moe_source_learn
 GGML_API bool ggml_moe_source_rank_statistics(const std::vector<ggml_moe_profile_bank_statistics> & banks, std::vector<int32_t> & ranks);
 GGML_API bool ggml_moe_source_prefill_partition(const std::vector<uint32_t> & counts, std::vector<int32_t> & classes, uint32_t cpu_row_budget);
 
+// Hardware service measurements, independent of residency and model statistics.
+struct ggml_moe_source_miss_policy {
+    unsigned numerator = 44;
+    unsigned windows = 0, updates = 0;
+    uint64_t jobs = 0;
+    double cpu_ns = 0, cpu_bytes = 0;
+};
+
+GGML_API bool ggml_moe_source_miss_observe(ggml_moe_source_miss_policy & state, double link_bytes_per_ns, uint64_t ns, uint64_t bytes, uint64_t experts);
+
+GGML_API bool ggml_moe_source_skip_routes(const int32_t * ids, const float * weights, uint32_t rows, uint32_t top_k,
+        uint32_t keep, bool independent, const std::vector<uint8_t> & resident, std::vector<uint8_t> & skipped, const std::vector<uint8_t> & phases);
+
 class ggml_moe_source_profile_learning;
 
 GGML_API bool ggml_moe_source_profile_initialize(ggml_moe_source_profile_learning & state, const int32_t * prior, uint32_t count, uint32_t n_experts);
@@ -139,6 +152,9 @@ struct ggml_moe_source_layer {
     const ggml_moe_source_expert * expert = nullptr;
     ggml_tensor * activation = nullptr;
     ggml_tensor * ids = nullptr;
+    ggml_tensor * route_weights = nullptr;
+    ggml_tensor * row_indices = nullptr;
+    bool row_identity = false;
     ggml_tensor * output = nullptr;
     std::vector<ggml_moe_source_operation> prelude;
     std::vector<ggml_moe_source_operation> overlap;
@@ -149,7 +165,14 @@ struct ggml_moe_source_allocation_dependency {
     const ggml_tensor * until = nullptr;
 };
 
+GGML_API const ggml_tensor * ggml_moe_source_row_indices(const ggml_cgraph * graph, const ggml_tensor * activation, uint32_t rows, uint32_t input_rows, bool * identity = nullptr);
+
+GGML_API const ggml_tensor * ggml_moe_source_route_weights(const ggml_cgraph * graph, const ggml_tensor * ids);
+
 struct ggml_moe_source_schedule_options {
+    std::vector<const ggml_tensor *> route_weights;
+    std::vector<const ggml_tensor *> row_indices;
+    std::vector<uint8_t> row_identity;
     bool overlap_independent_ordinary = false;
     std::vector<ggml_moe_source_allocation_dependency> allocation_dependencies;
     bool (*bind_leaf)(void * context, const ggml_tensor * original, ggml_backend_buffer_t * buffer, void ** data) = nullptr;

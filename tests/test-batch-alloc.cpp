@@ -1313,6 +1313,42 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+static void test_execution_phase(testing & t) {
+    llama_vocab vocab;
+    batch_builder bb;
+    bb.add(0, {1}, false);
+    bb.add(0, {0}, false);
+    bb.add(1, {1}, true);
+    bb.add(1, {0}, true);
+    const std::vector<uint8_t> phases = {LLAMA_BATCH_PHASE_PROMPT, LLAMA_BATCH_PHASE_GENERATION,
+        LLAMA_BATCH_PHASE_UNKNOWN, LLAMA_BATCH_PHASE_GENERATION};
+    for (int32_t i = 0; i < 4; ++i) { t.assert_true(bb.b.set_phase(i, llama_batch_phase(phases[i]))); }
+    t.assert_true(!bb.b.set_phase(-1, LLAMA_BATCH_PHASE_GENERATION));
+    t.assert_true(!bb.b.set_phase(4, LLAMA_BATCH_PHASE_GENERATION));
+    t.assert_true(!bb.b.set_phase(0, llama_batch_phase(3)));
+    llama_batch_allocr ba(1);
+    for (bool equal : {false, true}) {
+        t.assert_true(ba.init(bb.b, vocab, false));
+        uint32_t seen = 0;
+        for (;;) {
+            const auto ub = equal ? ba.split_equal(2, true, 0) : ba.split_simple(2);
+            if (!ub.n_tokens) { break; }
+            t.assert_true(ub.phase != nullptr);
+            for (uint32_t row = 0; row < ub.n_tokens; ++row) {
+                t.assert_equal(phases[ub.data->batch_idxs[row]], ub.phase[row]);
+                ++seen;
+            }
+        }
+        t.assert_equal(4u, seen);
+    }
+    bb.b.clear();
+    bb.add(0, {0}, true);
+    t.assert_true(ba.init(bb.b, vocab, false));
+    const auto tail = ba.split_simple(1);
+    t.assert_equal(1u, tail.n_tokens);
+    t.assert_true(tail.phase == nullptr);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1336,6 +1372,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("execution_phase", test_execution_phase);
 
     return t.summary();
 }

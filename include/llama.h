@@ -1080,7 +1080,15 @@ extern "C" {
     // Extended batch API
     //
 
+    enum llama_batch_phase {
+        LLAMA_BATCH_PHASE_UNKNOWN    = 0,
+        LLAMA_BATCH_PHASE_PROMPT     = 1,
+        LLAMA_BATCH_PHASE_GENERATION = 2,
+    };
+
     struct llama_batch_ext;
+    // UNKNOWN rows retain exact execution under approximate routing policies.
+    LLAMA_API bool llama_batch_ext_set_phase(struct llama_batch_ext * batch, int32_t idx, enum llama_batch_phase phase);
 
     struct llama_embd {
         const float * data;

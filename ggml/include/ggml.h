@@ -402,6 +402,12 @@ extern "C" {
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE = 3,
     };
 
+    enum ggml_graph_execution_phase {
+        GGML_GRAPH_EXECUTION_PHASE_UNKNOWN    = 0,
+        GGML_GRAPH_EXECUTION_PHASE_PROMPT     = 1,
+        GGML_GRAPH_EXECUTION_PHASE_GENERATION = 2,
+    };
+
     enum ggml_graph_execution_certificate_flag {
         GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE             = 0,
         GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED = 1u << 0,

@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -7344,6 +7345,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         bool failed = false;
         uint64_t bytes = 0, rounds = 0;
     };
+    std::mutex source_miss_mutex;
+    double source_link_bytes_per_ns = 0;
+    std::map<std::tuple<const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t>, ggml_moe_source_miss_policy> source_miss_policies;
     std::mutex source_adaptation_mutex;
     std::unique_ptr<source_adaptation_job> source_adaptation;
     ggml_cuda_moe_grouped_context * source_adaptation_owner = nullptr;
@@ -21326,4 +21330,28 @@ extern "C" bool ggml_backend_cuda_moe_profile_initialize_v1(ggml_backend_t backe
     if (!ctx->moe_grouped_context) { return false; }
     try { return ctx->moe_grouped_context->initialize_profile(profiles, n_profiles, ctx->stream(), copied_bytes, flags); }
     catch (...) { return false; }
+}
+
+// No residency map or resource is changed by the hardware split controller.
+double ggml_cuda_moe_grouped_context::source_link_rate(double measured) {
+    std::lock_guard<std::mutex> lock(impl_->source_miss_mutex);
+    if (!impl_->source_link_bytes_per_ns && std::isfinite(measured) && measured > 0) { impl_->source_link_bytes_per_ns = measured; }
+    return impl_->source_link_bytes_per_ns;
+}
+
+unsigned ggml_cuda_moe_grouped_context::source_miss_fraction(const void * service, const ggml_graph_execution_certificate & certificate) {
+    std::lock_guard<std::mutex> lock(impl_->source_miss_mutex);
+    return impl_->source_miss_policies[{service, certificate.owner_namespace, certificate.owner_generation, certificate.domain, certificate.n_rows, certificate.row_semantics}].numerator;
+}
+
+unsigned ggml_cuda_moe_grouped_context::source_miss_observe(const void * service, const ggml_graph_execution_certificate & certificate, uint64_t ns, uint64_t bytes, uint64_t experts) {
+    std::lock_guard<std::mutex> lock(impl_->source_miss_mutex);
+    auto & policy = impl_->source_miss_policies[{service, certificate.owner_namespace, certificate.owner_generation, certificate.domain, certificate.n_rows, certificate.row_semantics}];
+    const unsigned old = policy.numerator;
+    if (ggml_moe_source_miss_observe(policy, impl_->source_link_bytes_per_ns, ns, bytes, experts)) {
+        fprintf(stderr, "moe-source-miss-tuning: domain=%llu old=%.5f next=%.5f link_GBps=%.3f window_cpu_ns=%llu window_cpu_bytes=%llu updates=%u\n",
+            (unsigned long long) (uint64_t(certificate.domain) << 32 | certificate.n_rows), old / 256.0, policy.numerator / 256.0, impl_->source_link_bytes_per_ns,
+            (unsigned long long) ns, (unsigned long long) bytes, policy.updates);
+    }
+    return policy.numerator;
 }

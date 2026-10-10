@@ -565,6 +565,8 @@ struct common_params {
     bool moe_early_router = false;
     std::string moe_hybrid; // empty preserves the process environment
     std::string moe_gpu_miss_fraction;
+    std::string moe_gpu_miss_tuning;
+    int32_t moe_miss_keep_ranks = -1;
     std::string moe_profile_save;
     int32_t moe_profile_save_interval = 60;
 
@@ -1135,6 +1137,7 @@ struct common_batch {
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        llama_batch_phase phase = LLAMA_BATCH_PHASE_UNKNOWN;
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i

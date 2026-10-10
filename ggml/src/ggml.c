@@ -7724,6 +7724,8 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
         /*.execution_certificate =*/ { 0 },
+        /*.execution_phases =*/ NULL,
+        /*.n_execution_phases =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7753,6 +7755,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.order            =*/ cgraph0->order,
         /*.uid              =*/ 0,
         /*.execution_certificate =*/ { 0 },
+        /*.execution_phases =*/ NULL,
+        /*.n_execution_phases =*/ 0,
     };
 
     return cgraph;
@@ -7766,6 +7770,9 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+    dst->execution_certificate = (struct ggml_graph_execution_certificate) { 0 };
+    dst->execution_phases = NULL;
+    dst->n_execution_phases = 0;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];
@@ -7861,6 +7868,9 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
 }
 
 void ggml_graph_clear(struct ggml_cgraph * cgraph) {
+    cgraph->execution_certificate = (struct ggml_graph_execution_certificate) { 0 };
+    cgraph->execution_phases = NULL;
+    cgraph->n_execution_phases = 0;
     cgraph->n_leafs = 0;
     cgraph->n_nodes = 0;
     ggml_hash_set_reset(&cgraph->visited_hash_set);

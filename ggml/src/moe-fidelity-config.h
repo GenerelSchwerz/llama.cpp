@@ -10,6 +10,8 @@ struct ggml_moe_fidelity_config {
     bool reference = false;
     bool source_pool = false;
     unsigned pcie_num = 0;
+    bool tune_misses = false;
+    uint32_t keep_ranks = 0;
 };
 
 // One immutable selection is shared by the CPU and CUDA backends.

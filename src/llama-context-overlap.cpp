@@ -21,20 +21,21 @@ int32_t llama_context::decode_sampled_host(
     std::vector<llama_token> tokens(n_items);
     std::vector<llama_pos> positions(n_items);
     std::vector<llama_seq_id> seq_ids(n_items);
-    std::vector<llama_seq_id *> seq_ptrs(n_items);
-    std::vector<int32_t> n_seq_ids(n_items, 1);
-    std::vector<int8_t> outputs(n_items, 1);
     for (int32_t i = 0; i < n_items; ++i) {
         ggml_backend_tensor_get(sources[i], &tokens[i], 0, sizeof(llama_token));
         previous[i] = tokens[i];
         positions[i] = items[i].pos;
         seq_ids[i] = items[i].seq_id;
-        seq_ptrs[i] = &seq_ids[i];
     }
 
     // PLE hashes and KV token history need the real tokens before the next graph is queued.
-    llama_batch batch = {n_items, tokens.data(), nullptr, positions.data(), n_seq_ids.data(), seq_ptrs.data(), outputs.data()};
-    const int32_t ret = decode(batch);
+    llama_batch_ext ext(this);
+    for (int32_t i = 0; i < n_items; ++i) {
+        const auto idx = ext.add_token(seq_ids[i]);
+        if (idx < 0 || !ext.set_token_id(idx, tokens[i]) || !ext.set_token_pos(idx, &positions[i]) ||
+                !ext.set_output(idx, true) || !ext.set_phase(idx, LLAMA_BATCH_PHASE_GENERATION)) { return -3; }
+    }
+    const int32_t ret = decode(ext);
     if (ret == 0) {
         LLAMA_LOG_DEBUG("%s: decode overlap with host token inputs, n_seqs = %d\n", __func__, n_items);
     }

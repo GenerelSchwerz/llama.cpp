@@ -3038,14 +3038,24 @@ static enum ggml_status ggml_backend_sched_dispatch_split(
         struct ggml_cgraph * graph,
         uint64_t source_graph_uid,
         const struct ggml_graph_execution_certificate & certificate,
-        ggml_backend_sched_hybrid * hybrid = nullptr) {
+        ggml_backend_sched_hybrid * hybrid,
+        const uint8_t * phases, size_t n_phases) {
     graph->execution_certificate = ggml_backend_sched_split_certificate(source_graph_uid, graph->uid, certificate);
+    graph->execution_phases = phases;
+    graph->n_execution_phases = n_phases;
+    struct metadata_scope {
+        ggml_cgraph * graph;
+        ~metadata_scope() {
+            graph->execution_certificate = {};
+            graph->execution_phases = nullptr;
+            graph->n_execution_phases = 0;
+        }
+    } scope{graph};
 
     const enum ggml_status status = hybrid != nullptr ? (hybrid->source_api ?
         hybrid->source_api->compute(hybrid->device, graph, hybrid->dispatch.data(), hybrid->dispatch.size()) :
         hybrid->device_api->compute(hybrid->device, graph, hybrid->dispatch.data(), hybrid->dispatch.size())) :
         ggml_backend_graph_compute_async(backend, graph);
-    graph->execution_certificate = {};
     return status;
 }
 
@@ -3185,7 +3195,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 static enum ggml_status ggml_backend_sched_compute_splits(
         ggml_backend_sched_t sched,
         uint64_t source_graph_uid,
-        struct ggml_graph_execution_certificate certificate) {
+        struct ggml_graph_execution_certificate certificate,
+        const uint8_t * phases, size_t n_phases) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
     const bool required_grouped =
@@ -3306,7 +3317,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
             const auto prepared = ggml_backend_sched_hybrid_dispatch_prepare(sched, split_id, source_graph_uid, certificate, &hybrid);
             if (prepared != GGML_STATUS_SUCCESS) { return fail(prepared); }
             enum ggml_status ec = ggml_backend_sched_dispatch_split(
-                split_backend, &split->graph, source_graph_uid, certificate, hybrid);
+                split_backend, &split->graph, source_graph_uid, certificate, hybrid, phases, n_phases);
             if (ec != GGML_STATUS_SUCCESS) {
                 return fail(ec, hybrid);
             }
@@ -3700,7 +3711,15 @@ enum ggml_status ggml_backend_sched_graph_compute_ext(
         ggml_backend_sched_t sched,
         struct ggml_cgraph * graph,
         const struct ggml_graph_execution_certificate * certificate) {
-    enum ggml_status err = ggml_backend_sched_graph_compute_async_ext(sched, graph, certificate);
+    return ggml_backend_sched_graph_compute_with_phases(sched, graph, certificate, nullptr, 0);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_with_phases(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate,
+        const uint8_t * phases, size_t n_phases) {
+    enum ggml_status err = ggml_backend_sched_graph_compute_async_with_phases(sched, graph, certificate, phases, n_phases);
     if (ggml_backend_sched_moe_source_selected_v1(sched)) {
         if (err != GGML_STATUS_SUCCESS) { return err; }
         if (ggml_backend_sched_moe_source_drain_v1(sched) != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) { return GGML_STATUS_FAILED; }
@@ -3717,9 +3736,22 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
         ggml_backend_sched_t sched,
         struct ggml_cgraph * graph,
         const struct ggml_graph_execution_certificate * certificate) {
+    return ggml_backend_sched_graph_compute_async_with_phases(sched, graph, certificate, nullptr, 0);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_with_phases(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate,
+        const uint8_t * phases, size_t n_phases) {
     GGML_ASSERT(sched);
     struct ggml_graph_execution_certificate certificate_value = {};
     const bool certificate_valid = ggml_backend_sched_execution_certificate_valid(certificate);
+    if ((phases == nullptr) != (n_phases == 0) ||
+            (phases && (!certificate_valid || n_phases != certificate->n_rows))) { return GGML_STATUS_FAILED; }
+    for (size_t i = 0; i < n_phases; ++i) {
+        if (phases[i] > GGML_GRAPH_EXECUTION_PHASE_GENERATION) { return GGML_STATUS_FAILED; }
+    }
     const bool required_grouped = certificate != nullptr &&
         (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
     if (sched->hybrid != nullptr && (!certificate_valid || sched->callback_eval != nullptr ||
@@ -3753,7 +3785,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
     }
 
     if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
-        if (required_grouped || sched->hybrid != nullptr) {
+        if (required_grouped || sched->hybrid != nullptr || phases) {
             GGML_LOG_ERROR("%s: required grouped execution certificate does not match the source graph\n", __func__);
             return GGML_STATUS_FAILED;
         }
@@ -3766,7 +3798,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
         GGML_LOG_ERROR("%s: retired source bindings require checked preparation\n", __func__);
         return GGML_STATUS_FAILED;
     }
-    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value);
+    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value, phases, n_phases);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
@@ -4591,6 +4623,17 @@ const ggml_moe_fidelity_config & ggml_moe_fidelity_selection() {
             c.reference = c.source_pool = true;
         }
         const char * value = std::getenv(source_executor ? "GGML_MOE_SOURCE_GPU_MISS_FRACTION" : "GGML_MOE_FIDELITY_PCIE_FRAC");
+        const char * tuning = std::getenv("GGML_MOE_SOURCE_MISS_TUNING");
+        if (tuning && std::strcmp(tuning, "on") && std::strcmp(tuning, "off")) { c.valid = false; }
+        c.tune_misses = source_executor && !value && (!tuning || !std::strcmp(tuning, "on"));
+        const char * keep = std::getenv("GGML_MOE_SOURCE_KEEP_RANKS");
+        if (keep) {
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long rank = std::strtoul(keep, &end, 10);
+            if (errno || end == keep || *end || std::strchr(keep, '-') || rank > UINT32_MAX) { c.valid = false; }
+            else { c.keep_ranks = uint32_t(rank); }
+        }
         if (source_executor && !value) { value = "0.17"; }
         if (c.reference && !value) { c.valid = false; }
         if (value) {

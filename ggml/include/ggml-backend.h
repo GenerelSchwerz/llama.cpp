@@ -370,6 +370,10 @@ extern "C" {
     // Backends must synchronously validate and copy required fields before returning and must not retain its address.
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_with_phases(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate, const uint8_t * phases, size_t n_phases);
+    // phases has one ggml_graph_execution_phase per certified row, borrowed until this call returns.
+    // Backends must copy metadata they retain. A missing span means UNKNOWN for every row.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_with_phases(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate, const uint8_t * phases, size_t n_phases);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

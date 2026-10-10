@@ -3032,7 +3032,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_HYBRID"));
     add_opt(common_arg(
         {"--moe-gpu-miss-fraction"}, "F",
-        "fraction of distinct hybrid expert cache misses transferred to GPU, in [0,1] (default: 0.17); resident hits use GPU",
+        "fraction of distinct hybrid expert cache misses transferred to GPU, in [0,1] (initial default: 0.17, CPU-measured tuning); resident hits use GPU",
         [](common_params & params, const std::string & value) {
             size_t parsed = 0;
             double fraction;
@@ -3044,6 +3044,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_gpu_miss_fraction = value;
         }
     ).set_env("LLAMA_ARG_MOE_GPU_MISS_FRACTION"));
+    add_opt(common_arg(
+        {"--moe-gpu-miss-tuning"}, "on|off",
+        "CPU-measured hybrid miss split tuning (default: on); an explicit miss fraction disables tuning",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") { throw std::invalid_argument("--moe-gpu-miss-tuning must be on or off"); }
+            params.moe_gpu_miss_tuning = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_GPU_MISS_TUNING"));
+    add_opt(common_arg(
+        {"--moe-miss-keep-ranks"}, "N",
+        "approximate hybrid decode: retain at least the highest N weight ranks on cache misses (0 disables, default: 0); hits stay exact",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("--moe-miss-keep-ranks must be nonnegative"); }
+            params.moe_miss_keep_ranks = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_MISS_KEEP_RANKS"));
     add_opt(common_arg(
         {"--moe-profile-adapt"}, "MODE",
         "profile adaptation: off, occurrence or occurrence-sync (default: off)",

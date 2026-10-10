@@ -6265,9 +6265,23 @@ ggml_status llama_context::graph_compute(
     if (!make_graph_execution_certificate(ubatch, execution_intent, moe_graph_supports_required_grouped(gf), certificate)) {
         return GGML_STATUS_FAILED;
     }
+    std::vector<uint8_t> phases;
+    const auto & selection = ggml_moe_fidelity_selection();
+    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC && ubatch && (selection.keep_ranks || selection.tune_misses)) {
+        static_assert(int(LLAMA_BATCH_PHASE_UNKNOWN) == int(GGML_GRAPH_EXECUTION_PHASE_UNKNOWN) &&
+            int(LLAMA_BATCH_PHASE_PROMPT) == int(GGML_GRAPH_EXECUTION_PHASE_PROMPT) &&
+            int(LLAMA_BATCH_PHASE_GENERATION) == int(GGML_GRAPH_EXECUTION_PHASE_GENERATION), "phase ABI");
+        phases.assign(ubatch->n_tokens, GGML_GRAPH_EXECUTION_PHASE_UNKNOWN);
+        if (ubatch->phase) { std::copy_n(ubatch->phase, ubatch->n_tokens, phases.data()); }
+        for (const auto phase : phases) { if (phase > GGML_GRAPH_EXECUTION_PHASE_GENERATION) { return GGML_STATUS_FAILED; } }
+        if (use_sampled_input || execution_intent) {
+            if (std::find(phases.begin(), phases.end(), GGML_GRAPH_EXECUTION_PHASE_PROMPT) != phases.end()) { return GGML_STATUS_FAILED; }
+            std::fill(phases.begin(), phases.end(), GGML_GRAPH_EXECUTION_PHASE_GENERATION);
+        }
+    }
     const auto compute = [&]() {
         return certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ?
-            ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate) :
+            ggml_backend_sched_graph_compute_async_with_phases(sched.get(), gf, &certificate, phases.empty() ? nullptr : phases.data(), phases.size()) :
             ggml_backend_sched_graph_compute_async(sched.get(), gf);
     };
     ggml_status status;

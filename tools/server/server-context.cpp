@@ -276,6 +276,7 @@ struct server_batch {
                 view.add(t.token, t.pos[0], t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
+            view.tokens.back().phase = t.is_prompt ? LLAMA_BATCH_PHASE_PROMPT : LLAMA_BATCH_PHASE_GENERATION;
         }
     }
 };

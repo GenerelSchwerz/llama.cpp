@@ -1,6 +1,7 @@
 #pragma once
 
 void test_moe_prefill_partition_policy();
+void test_moe_miss_policy();
 
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/mmid.cuh"

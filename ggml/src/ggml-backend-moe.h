@@ -673,7 +673,8 @@ struct ggml_backend_moe_cpu_execute_result_v1 {
     uint32_t published_routes;
     uint32_t published_outputs;
     uint32_t reserved32;
-    uint64_t reserved[2];
+    uint64_t compute_ns; // CPU worker service only; excludes lane acquisition, binding and scatter.
+    uint64_t reserved[1];
 };
 
 struct ggml_backend_moe_cpu_service_state_v1 {
@@ -1013,6 +1014,8 @@ struct ggml_backend_moe_source_access_v1 {
     const int32_t * classes;
     uint32_t n_distinct;
     uint32_t n_routes;
+    const uint8_t * skipped_routes;
+    const struct ggml_tensor * output;
 };
 
 enum ggml_backend_moe_hybrid_test_phase_v1 {

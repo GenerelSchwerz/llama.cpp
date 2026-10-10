@@ -34,13 +34,19 @@ Example settings from the qualified single-GPU configuration; choose context, sl
 | Control | Default and meaning |
 |---|---|
 | `--moe-hybrid on` | Opt into the generic source executor with checked failures. Ordinary execution remains the default; `off` overrides inherited hybrid activation. |
-| `--moe-gpu-miss-fraction F` | Optional hardware tuning, default 0.17, finite in [0,1]. Fraction of distinct cache misses transferred to GPU, at 1/256 resolution; resident hits already use GPU. |
+| `--moe-gpu-miss-fraction F` | Explicit fixed fraction of distinct cache misses transferred to GPU, finite in [0,1] at 1/256 resolution. Overrides automatic tuning; resident hits already use GPU. |
+| `--moe-gpu-miss-tuning on\|off` | CPU-measured hardware tuning when no fraction is supplied (default: on). Starts at 0.17, measures CPU worker service and a bounded H2D sample, then makes up to three updates between successful decode windows. |
+| `--moe-miss-keep-ranks N` | Approximate decode only, off by default (`0`). On nonresident routes, retain at least the highest N actual weight ranks in each request window. Ties and resident hits execute. Omitted rows are zero; remaining weights are not renormalized. |
 | Shared GPU overlap | Enabled for source execution. Move independent operations ahead of expert completion only when dependencies permit. |
 | CPU runtime allocation permission | Enabled for source execution, including OpenMP runtime behavior. It is not a RAM/VRAM limit; backing, capacity and completion checks still apply. |
 
+Automatic split tuning changes placement, so CPU/GPU rounding and MTP acceptance may change. Its .10-.60 bound, .05 step, 48/96/96-window schedule and service multiplier are empirical hardware policy, not model profile statistics or residency adaptation. It reserves the largest permitted transfer scratch during preparation; explicit fractions or tuning off retain the fixed-fraction reservation. A new fraction applies to the next replay without recapture or residency reset. `moe-source-miss-link`, `moe-source-miss-tuning` and `moe-source-miss-policy` report effective measurements and decisions.
+
+Approximation requires a validated scalar routing-weight dependency; ID columns alone do not establish weight rank. Single-sequence verification windows retain any expert with a high rank anywhere in that window. Independent rows make separate decisions. Mixed speculative requests and graphs without unambiguous weight evidence execute exactly; `rank_layers` and omission counters expose actual use. Prompt rows, including one-token prompt tails, remain exact. The server supplies per-row phase metadata; library callers use `llama_batch_ext_set_phase` on generated inputs. Missing/unknown phase metadata and pruned regions without a proven row mapping stay exact. Only positively identified generation windows train the hardware split controller. This option can change generated text and needs workload quality evaluation before use.
+
 No hybrid environment variables are required. Host pinning value 0 requests automatic registration with bounded staging fallback; it does not guarantee every source is pinned or fits every machine. Choose cache capacity and loading mode for the available memory.
 
-Configuration is selected at process startup, before model/context preparation; the split is shared by contexts in that process. In a `models.ini` preset, use `moe-hybrid = on` and optionally `moe-gpu-miss-fraction = 0.17`. Target and auxiliary contexts retain their existing eligibility checks.
+Configuration is selected at process startup, before model/context preparation. Explicit fractions are process-wide; measured tuning is shared across prepared variants within the same device, CPU service and execution domain. In a `models.ini` preset, use `moe-hybrid = on` and optionally `moe-gpu-miss-fraction = 0.17`. Target and auxiliary contexts retain their existing eligibility checks.
 
 Legacy environment activation remains supported. `GGML_MOE_HYBRID=required` defaults to the source executor; explicit older executor selection remains available. CLI activation and miss fraction override their legacy environment settings. The older `fidelity` plus `reference-conversion` activation remains compatible; do not combine source mode with a different legacy pipeline.
 

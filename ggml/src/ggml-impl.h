@@ -403,6 +403,8 @@ struct ggml_cgraph {
 
     // execution-only metadata; it is not part of the graph topology
     struct ggml_graph_execution_certificate execution_certificate;
+    const uint8_t * execution_phases;
+    size_t n_execution_phases;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)
