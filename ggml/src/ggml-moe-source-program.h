@@ -179,9 +179,12 @@ class GGML_MOE_SOURCE_PROGRAM_API ggml_moe_source_body {
 public:
     static std::unique_ptr<ggml_moe_source_body> prepare(const ggml_backend_moe_cpu_region_query_v1 & query);
     std::unique_ptr<ggml_moe_source_body> compact(uint32_t route_capacity) const;
+    std::unique_ptr<ggml_moe_source_body> compact_after_roots(uint32_t route_capacity) const;
+    std::vector<const ggml_tensor *> root_projections() const;
     bool bind_routes(uint32_t count);
     bool gather_input(size_t input, const void * source, size_t source_bytes,
         const uint32_t * rows, const uint32_t * routes, uint32_t count, void * destination, size_t destination_bytes) const;
+    const ggml_tensor * original(const ggml_tensor * tensor) const;
     ggml_moe_source_body(const ggml_moe_source_body &) = delete;
     ggml_moe_source_body & operator=(const ggml_moe_source_body &) = delete;
 
@@ -197,6 +200,7 @@ private:
     };
     ggml_moe_source_body() = default;
     std::vector<ggml_tensor> tensors_;
+    std::vector<const ggml_tensor *> originals_;
     std::vector<const ggml_tensor *> nodes_, dynamic_inputs_, live_outputs_;
     std::vector<ggml_backend_moe_cpu_region_source_v1> sources_;
     std::vector<input_layout> input_layouts_;
@@ -224,6 +228,8 @@ public:
     bool matches(const ggml_cgraph * graph) const;
     bool matches(const ggml_cgraph * graph, const ggml_graph_execution_certificate & certificate) const;
     ggml_tensor * find(const ggml_tensor * original) const;
+    // The caller checks compaction and canonical device ownership before scheduling the cut.
+    std::unique_ptr<ggml_moe_source_body> prepare_body(size_t first_layer, size_t count) const;
     bool closed_cut(const ggml_tensor * const * cut, size_t count,
         const ggml_tensor * const * retained, size_t retained_count) const;
     const std::vector<ggml_moe_source_layer> & layers() const;

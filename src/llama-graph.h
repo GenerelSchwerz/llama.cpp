@@ -1108,6 +1108,7 @@ public:
                               bool (*is_cached)(const ggml_tensor *));
 
     void set_params(const llm_graph_params & params);
+    bool references_sampler(llama_seq_id seq_id) const;
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;

@@ -1074,6 +1074,10 @@ void ggml_gallocr_request_shrink(ggml_gallocr_t galloc) {
     }
 }
 
+bool ggml_gallocr_refresh_resizable_plan(ggml_gallocr_t galloc) {
+    return galloc != NULL && galloc->resizable && ggml_gallocr_resize_buffers(galloc);
+}
+
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {

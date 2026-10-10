@@ -832,8 +832,13 @@ struct ggml_cuda_mmq_mmid_prepared {
     ggml_cuda_pool_alloc<float> pair_scratch;
     mmq_args args = {};
     int64_t n_experts = 0;
+    const ggml_tensor * input = nullptr, * ids = nullptr;
+    cudaStream_t stream = nullptr;
+    int device = -1;
+    size_t guard = 0;
     ggml_tensor pair_up = {}, pair_gate = {}, pair_glu = {};
     bool paired = false;
+    ggml_cuda_mmq_sorted_routes sorted;
 };
 
 static ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_impl(
@@ -842,7 +847,8 @@ static ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_impl(
         const ggml_tensor * src1,
         const ggml_tensor * ids,
         ggml_tensor * dst,
-        size_t minimum_guard) {
+        size_t minimum_guard, const ggml_cuda_mmq_mmid_prepared * shared = nullptr,
+        const ggml_cuda_mmq_sorted_routes * sorted = nullptr) {
     if (src0 == nullptr || src1 == nullptr || ids == nullptr || dst == nullptr ||
             src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32 ||
             src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4) {
@@ -864,45 +870,60 @@ static ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_impl(
             static_cast<uint64_t>(ne_get_rows) > SIZE_MAX - input_guard) {
         return nullptr;
     }
+    if (sorted && (shared || n_expert_used != 1 || ne11 != 1 || nb2 != nb1 ||
+            !sorted->output_rows || !sorted->expert_bounds ||
+            sorted->output_capacity < size_t(ne_get_rows) + input_guard ||
+            sorted->expert_begin < 0 || sorted->expert_count <= 0 ||
+            sorted->bounds_capacity < size_t(sorted->expert_count) + 1 ||
+            int64_t(sorted->expert_begin) + sorted->expert_count > ne02)) { return nullptr; }
+    if (shared && (shared->paired || shared->sorted.output_rows || shared->input != src1 || shared->ids != ids ||
+            shared->device != ctx.device || shared->stream != ctx.stream() || shared->n_experts != ne02 ||
+            shared->guard < input_guard || shared->args.ncols_dst != ne_get_rows ||
+            mmq_get_q8_1_ds_layout(shared->args.type_x) != mmq_get_q8_1_ds_layout(src0->type))) {
+        return nullptr;
+    }
 
     auto * prepared = new (std::nothrow) ggml_cuda_mmq_mmid_prepared(ctx.pool());
     if (prepared == nullptr) {
         return nullptr;
     }
-    const size_t ne_get_rows_padded = static_cast<size_t>(ne_get_rows) + input_guard;
-    prepared->ids_src1.alloc(ne_get_rows);
-    prepared->ids_dst.alloc(ne_get_rows_padded);
-    prepared->expert_bounds.alloc(ne02 + 1);
-
-    const int si1 = ids->nb[1] / ggml_element_size(ids);
-    const int sis1 = nb12 / nb11;
-    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
-    ggml_cuda_launch_mm_ids_helper(
-        static_cast<const int32_t *>(ids->data), prepared->ids_src1.get(), prepared->ids_dst.get(),
-        prepared->expert_bounds.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, ctx.stream());
-    CUDA_CHECK(cudaGetLastError());
-
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        input_guard * sizeof(block_q8_1_mmq);
-    prepared->src1_q8_1.alloc(nbytes_src1_q8_1);
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    if (!shared) {
+        const size_t ne_get_rows_padded = static_cast<size_t>(ne_get_rows) + input_guard;
+        if (!sorted) {
+            prepared->ids_src1.alloc(ne_get_rows);
+            prepared->ids_dst.alloc(ne_get_rows_padded);
+            prepared->expert_bounds.alloc(ne02 + 1);
 
-    const float * src1_d = static_cast<const float *>(src1->data);
-    const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
-    const int64_t s12_src = src1->nb[2] / ggml_type_size(src1->type);
-    const int64_t s13_src = src1->nb[3] / ggml_type_size(src1->type);
-    const int64_t ne11_flat = ne12 * n_expert_used;
-    if (dedup_bcast) {
-        quantize_scatter_mmq_q8_1_cuda(
-            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
-            ne10, s12_src, ne10_padded, ne12, ne11_flat, n_expert_used, ctx.stream());
-    } else {
-        quantize_mmq_q8_1_cuda(
-            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
-            ne10, s11, s12_src, s13_src, ne10_padded, ne11_flat, 1, 1, ctx.stream());
+            const int si1 = ids->nb[1] / ggml_element_size(ids);
+            const int sis1 = nb12 / nb11;
+            ggml_cuda_launch_mm_ids_helper(
+                static_cast<const int32_t *>(ids->data), prepared->ids_src1.get(), prepared->ids_dst.get(),
+                prepared->expert_bounds.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+            input_guard * sizeof(block_q8_1_mmq);
+        prepared->src1_q8_1.alloc(nbytes_src1_q8_1);
+
+        const float * src1_d = static_cast<const float *>(src1->data);
+        const int64_t s11 = src1->nb[sorted ? 2 : 1] / ggml_type_size(src1->type);
+        const int64_t s12_src = src1->nb[2] / ggml_type_size(src1->type);
+        const int64_t s13_src = src1->nb[3] / ggml_type_size(src1->type);
+        const int64_t ne11_flat = ne12 * n_expert_used;
+        if (dedup_bcast) {
+            quantize_scatter_mmq_q8_1_cuda(
+                src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+                ne10, s12_src, ne10_padded, ne12, ne11_flat, n_expert_used, ctx.stream());
+        } else {
+            quantize_mmq_q8_1_cuda(
+                src1_d, sorted ? nullptr : prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+                ne10, s11, s12_src, s13_src, ne10_padded, ne11_flat, 1, 1, ctx.stream());
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
-
     const int64_t ts_src0 = ggml_type_size(src0->type);
     const int64_t ts_dst = ggml_type_size(dst->type);
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -920,14 +941,18 @@ static ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_impl(
 
     prepared->args = {
         static_cast<const char *>(src0->data), src0->type,
-        reinterpret_cast<const int *>(prepared->src1_q8_1.get()),
-        prepared->ids_dst.get(), prepared->expert_bounds.get(), static_cast<float *>(dst->data), nullptr,
+        shared ? shared->args.y : reinterpret_cast<const int *>(prepared->src1_q8_1.get()),
+        sorted ? sorted->output_rows : (shared ? shared->args.ids_dst : prepared->ids_dst.get()),
+        sorted ? sorted->expert_bounds : (shared ? shared->args.expert_bounds : prepared->expert_bounds.get()), static_cast<float *>(dst->data), nullptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt,
     };
     prepared->n_experts = ne02;
+    prepared->input = src1; prepared->ids = ids; prepared->stream = ctx.stream(); prepared->device = ctx.device;
+    prepared->guard = shared ? shared->guard : input_guard;
+    if (sorted) { prepared->sorted = *sorted; }
     return prepared;
 }
 
@@ -935,6 +960,19 @@ ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst) {
     return ggml_cuda_mmq_mmid_prepare_impl(ctx, src0, src1, ids, dst, 0);
+}
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_shared(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mmq_mmid_prepared * input) {
+    if (!input) { return nullptr; }
+    return ggml_cuda_mmq_mmid_prepare_impl(ctx, src0, src1, ids, dst, 0, input);
+}
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_sorted(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mmq_sorted_routes & routes) {
+    return ggml_cuda_mmq_mmid_prepare_impl(ctx, src0, src1, ids, dst, 0, nullptr, &routes);
 }
 
 ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_pair(
@@ -970,17 +1008,23 @@ bool ggml_cuda_mmq_mmid_launch_range(
         int32_t source_split,
         int32_t expert_begin,
         int32_t expert_count,
-        int64_t max_rows) {
+        int64_t max_rows,
+        const int32_t * output_rows,
+        size_t output_capacity) {
     if (prepared == nullptr || prepared->paired || resident_data == nullptr || staging_data == nullptr || source_map == nullptr ||
             source_split <= 0 || expert_begin < 0 || expert_count <= 0 ||
             static_cast<int64_t>(expert_begin) + expert_count > prepared->n_experts ||
-            max_rows <= 0 || max_rows > prepared->args.ncols_dst) {
+            max_rows <= 0 || max_rows > prepared->args.ncols_dst ||
+            (!output_rows && output_capacity) ||
+            (output_rows && output_capacity < size_t(prepared->args.ncols_dst) + prepared->guard) ||
+            (prepared->sorted.output_rows && (expert_begin != prepared->sorted.expert_begin || expert_count != prepared->sorted.expert_count))) {
         return false;
     }
 
     mmq_args args = prepared->args;
+    if (output_rows) { args.ids_dst = output_rows; }
     args.x = static_cast<const char *>(resident_data);
-    args.expert_bounds += expert_begin;
+    if (!prepared->sorted.output_rows) { args.expert_bounds += expert_begin; }
     args.nchannels_x = expert_count;
     args.nchannels_y = expert_count;
     // Routed experts need only the rows present in this wave.

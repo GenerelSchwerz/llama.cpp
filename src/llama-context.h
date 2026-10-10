@@ -169,6 +169,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve(uint32_t n_tokens = 0, uint32_t n_kv = 0);
+    void request_sched_reserve(bool sampler_only = false);
     sched_reserve_plan make_sched_reserve_plan(uint32_t n_tokens, uint32_t n_kv = 0) const;
     void prepare_sched_reserve(const sched_reserve_plan & plan);
     int attach_shared_workspace(llama_context & owner);
@@ -177,10 +178,12 @@ struct llama_context {
 
     void synchronize();
     int32_t reset_source_core_checked(bool all_variants = true);
+    int32_t retire_source_sampler(llama_seq_id seq_id);
     bool select_source_graph_variant(const ggml_graph_execution_certificate & certificate);
     int32_t close_source_core_checked();
     bool set_mtp_draft_vocab(const char * path);
     bool source_core_enabled() const;
+    bool source_graph_cache_enabled() const;
     void prepare_required_grouped_execution(llm_graph_result * res);
     bool begin_source_call();
     void end_source_call();
@@ -393,7 +396,7 @@ public:
     bool snapshot_moe_learning(std::vector<uint8_t> & bytes, uint32_t timeout_ms);
     static bool snapshot_moe_learning_contexts(const std::vector<llama_context *> & contexts, std::vector<uint8_t> & bytes, uint32_t timeout_ms);
     bool initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
-        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr);
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores = nullptr, bool source_preload = false);
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -536,6 +539,7 @@ private:
     bool workspace_in_flight = false;
 
     bool sched_need_reserve = true;
+    bool sched_sampler_reserve_only = false;
     uint32_t sched_reserved_tokens = 0;
     uint32_t sched_reserved_kv = 0;
     uint32_t sched_decode_outputs = 0;
@@ -654,6 +658,10 @@ private:
     std::array<uint64_t, 2> mtp_graph_buffer_generation = {};
     std::array<uint64_t, 2> mtp_graph_shrink_generation = {};
 
+    static constexpr uint32_t moe_source_max_programs = 8;
+    // Sampler retirement must not erase the measured service bounds.
+    uint32_t moe_source_region_capacity = 0;
+    uint32_t moe_source_prepared_capacity = 0;
     struct moe_source_graph_variant {
         std::array<llm_graph_result_ptr, 2> graphs;
         ggml_backend_sched_ptr scheduler;
@@ -661,12 +669,16 @@ private:
         ggml_graph_execution_certificate certificate = {};
         uint32_t outputs = 0;
         bool sampled_device = false;
+        uint32_t input_mode = 0;
+        uint32_t reserved_tokens = 0;
+        uint32_t reserved_kv = 0;
         uint64_t buffer_generation = 0;
         uint64_t shrink_generation = 0;
         uint64_t retirement_epoch = 0;
     };
     std::vector<moe_source_graph_variant> moe_source_graph_variants;
     uint32_t moe_source_active_outputs = 0;
+    uint32_t moe_source_active_input_mode = 0;
 
     llm_graph_result * gf_res_prev_active = nullptr;
 

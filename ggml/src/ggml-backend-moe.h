@@ -787,7 +787,9 @@ struct ggml_backend_moe_static_profile_v1 {
 };
 
 #define GGML_BACKEND_MOE_PROFILE_INITIALIZE_V1_PROC_NAME "ggml_backend_moe_profile_initialize_v1"
-// Flags must be zero; initialization preserves live frequency metadata.
+// Seed source placement and learning at a quiescent owner boundary, after learned-state restore.
+#define GGML_BACKEND_MOE_PLACEMENT_SOURCE_V1 (1u << 2)
+// Flags are zero or PLACEMENT_SOURCE_V1; initialization preserves live frequency metadata.
 typedef bool (*ggml_backend_moe_profile_initialize_v1_t)(ggml_backend_t backend,
     const struct ggml_backend_moe_static_profile_v1 * profiles, uint32_t n_profiles, uint32_t flags, uint64_t * copied_bytes);
 
@@ -800,7 +802,7 @@ struct ggml_backend_moe_source_statistics_v1 {
 };
 
 #define GGML_BACKEND_MOE_STATISTICS_INITIALIZE_V1_PROC_NAME "ggml_backend_moe_statistics_initialize_v1"
-// Full source statistics are projected at the canonical owner boundary. Flags must be zero.
+// Full source statistics are projected at the canonical owner boundary. Flags match profile initialization.
 typedef bool (*ggml_backend_moe_statistics_initialize_v1_t)(ggml_backend_t backend,
     const struct ggml_backend_moe_source_statistics_v1 * statistics, uint32_t n_statistics, uint32_t flags, uint64_t * copied_bytes);
 
@@ -865,6 +867,12 @@ struct ggml_backend_moe_hybrid_config_v1 {
     uint32_t n_statistics;
     uint32_t profile_adaptation; // zero disables, one selects synchronous occurrence adaptation, two selects asynchronous occurrence adaptation
     const double * const * statistics_scores; // optional derived scores; same source order as statistics
+    uint32_t max_source_programs; // zero keeps per-session limits; otherwise zero byte limits derive a largest-program envelope
+    void * resource_context;
+    const void * resource_program;
+    // Reserve managed private storage before allocation; zero bytes release the session reservation after disposal.
+    bool (*reserve_resources)(void * context, const void * program, const void * session, ggml_backend_t backend, const void * shared_owner,
+                              uint64_t device_bytes, uint64_t pinned_bytes, uint64_t shared_device_bytes);
 };
 
 enum ggml_backend_moe_hybrid_executor_v1 {

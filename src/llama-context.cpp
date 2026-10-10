@@ -1805,6 +1805,10 @@ llama_context::llama_context(
     }
 
     if (!restore_moe_learning()) { throw std::runtime_error("cannot restore learned source profile before execution"); }
+    if (source_core_enabled() && !initialize_moe_placement(moe_profiles, moe_statistics,
+            moe_statistics_scores.empty() ? nullptr : moe_statistics_scores.data(), true)) {
+        throw std::runtime_error("cannot initialize source profile residency before execution");
+    }
 
     // Initialize the full vocabulary token ids for backend samplers.
     {
@@ -2100,7 +2104,7 @@ void llama_context::reset_sched_workspace() {
     workspace_in_flight = false;
     sched_reserved_tokens = 0;
     sched_reserved_kv = 0;
-    sched_need_reserve = true;
+    request_sched_reserve();
 }
 
 void llama_context::acquire_shared_workspace() {
@@ -2126,7 +2130,7 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 
     // A backing generation change invalidates cached graph addresses.
     if (generation != sched_buffer_generation) {
-        GGML_ASSERT(reset_source_core_checked() == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+        GGML_ASSERT(reset_source_core_checked(!source_graph_cache_enabled()) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
         synchronize();
         ggml_backend_sched_reset(sched.get());
         for (auto & res : gf_res_prev) {
@@ -2136,13 +2140,19 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
         }
         gf_res_prev_active = nullptr;
         sched_buffer_generation = generation;
-        sched_need_reserve = true;
+        request_sched_reserve();
     }
 
     if (shrink_generation != sched_shrink_generation) {
         sched_shrink_generation = shrink_generation;
-        sched_need_reserve = true;
+        request_sched_reserve();
     }
+}
+
+void llama_context::request_sched_reserve(bool sampler_only) {
+    if (!sampler_only) { sched_sampler_reserve_only = false; }
+    else if (!sched_need_reserve) { sched_sampler_reserve_only = true; }
+    sched_need_reserve = true;
 }
 
 void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
@@ -2168,6 +2178,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     sched_need_reserve = false;
+    sched_sampler_reserve_only = false;
 
     const uint32_t n_tokens_max = plan.n_tokens_max;
     const uint32_t n_tokens_tg  = plan.n_tokens_decode;
@@ -2534,12 +2545,20 @@ bool llama_context::snapshot_moe_learning_contexts(const std::vector<llama_conte
 }
 
 bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_static_profile_v1> & profiles,
-        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores) {
+        const std::vector<ggml_backend_moe_source_statistics_v1> & statistics, const double * const * scores, bool source_preload) {
     if (profiles.empty() && statistics.empty()) { return scores == nullptr; }
     if (profiles.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || (!profiles.empty() && !statistics.empty()) ||
             statistics.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS ||
             !ggml_moe_source_scores_valid(statistics.data(), scores, uint32_t(statistics.size()))) { return false; }
-    if (source_core_enabled()) {
+    std::unique_lock<std::timed_mutex> preload_publication_lock(moe_source_publication_mutex, std::defer_lock);
+    std::unique_lock<std::mutex> preload_caller_lock(moe_source_mutex, std::defer_lock);
+    if (source_preload) {
+        if (!source_core_enabled() || !preload_publication_lock.try_lock()) { return false; }
+        preload_caller_lock.lock();
+        if (moe_source_callers || moe_source_closed.load() || moe_source_poisoned.load() || moe_profile_failed ||
+                !moe_source_graph_variants.empty() || ggml_backend_sched_moe_source_selected_v1(sched.get())) { return false; }
+    }
+    if (source_core_enabled() && !source_preload) {
         std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::try_to_lock);
         if (!publication_lock.owns_lock()) { return false; }
         std::lock_guard<std::mutex> caller_lock(moe_source_mutex);
@@ -2605,7 +2624,7 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
             return true;
         } catch (...) { return false; }
     }
-    if (moe_profile_failed || cparams.n_seq_max != 1) {
+    if (moe_profile_failed || (!source_preload && cparams.n_seq_max != 1)) {
         LLAMA_LOG_ERROR("moe-profile: GPU initialization requires a single quiescent request\n");
         return false;
     }
@@ -2640,6 +2659,7 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
     }
     for (const auto & profile : profiles) {
         if (!profile.down || !profile.down->buffer || !profile.experts || !profile.n_experts) { return false; }
+        if (source_preload && !is_moe_cached_tensor(profile.down)) { continue; }
         auto * buffer_type = ggml_backend_buffer_get_type(profile.down->buffer);
         auto * device = ggml_backend_buft_get_device(buffer_type);
         if (!device) { return false; }
@@ -2666,20 +2686,21 @@ bool llama_context::initialize_moe_placement(const std::vector<ggml_backend_moe_
     const int64_t start = ggml_time_us();
     uint64_t total = 0;
     bool ok = true;
+    const uint32_t flags = source_preload ? GGML_BACKEND_MOE_PLACEMENT_SOURCE_V1 : 0;
     for (size_t i = 0; i < backends.size(); ++i) {
         if (per_owner[i].empty() && per_owner_statistics[i].empty()) { continue; }
         uint64_t bytes = 0;
         const bool applied = per_owner_statistics[i].empty() ?
-            endpoints[i](backends[i].get(), per_owner[i].data(), per_owner[i].size(), 0, &bytes) :
-            scores ? scored_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_scores[i].data(), per_owner_statistics[i].size(), 0, &bytes) :
-            statistics_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_statistics[i].size(), 0, &bytes);
+            endpoints[i](backends[i].get(), per_owner[i].data(), per_owner[i].size(), flags, &bytes) :
+            scores ? scored_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_scores[i].data(), per_owner_statistics[i].size(), flags, &bytes) :
+            statistics_endpoints[i](backends[i].get(), per_owner_statistics[i].data(), per_owner_statistics[i].size(), flags, &bytes);
         if (!applied) { ok = false; break; }
         total += bytes;
     }
     const bool released = owner.release(&lease) == GGML_BACKEND_MOE_SOURCE_STATUS_V1_OK;
     moe_profile_failed = !ok || !released;
-    fprintf(stderr, "moe-profile: GPU update ranks=%zu statistics=%zu copied_bytes=%llu wall_us=%lld success=%d policy=frequency-aware live replacement\n",
-        profiles.size(), statistics.size(), (unsigned long long) total, (long long) (ggml_time_us() - start), !moe_profile_failed);
+    fprintf(stderr, "moe-profile: GPU update ranks=%zu statistics=%zu copied_bytes=%llu wall_us=%lld success=%d source_preload=%d policy=frequency-aware live replacement\n",
+        profiles.size(), statistics.size(), (unsigned long long) total, (long long) (ggml_time_us() - start), !moe_profile_failed, int(source_preload));
     return !moe_profile_failed;
 }
 
@@ -2902,7 +2923,7 @@ void llama_context::refresh_moe_layer_owners() {
         ++graph_execution_owner_generation;
     }
     moe_layer_owners   = std::move(owners);
-    sched_need_reserve = true;
+    request_sched_reserve();
 }
 
 void llama_context::place_moe_regions(llm_graph_result * res) {
@@ -2952,6 +2973,36 @@ void llama_context::place_moe_regions(llm_graph_result * res) {
     }
 }
 
+
+static bool measure_moe_regions(const llm_graph_result & graph, bool source_core, uint32_t & count, uint32_t & prepared_count) {
+    const auto & regions = graph.get_moe_regions();
+    if (regions.size() > UINT32_MAX) {
+        LLAMA_LOG_ERROR("moe-hybrid: region count exceeds the scheduler interface\n");
+        return false;
+    }
+    uint64_t prepared = 0;
+    count = 0;
+    for (const auto & region : regions) {
+        if (region.route == nullptr || region.route->ne[0] <= 0 || uint64_t(region.route->ne[0]) > UINT32_MAX ||
+                region.route->ne[1] <= 0 || uint64_t(region.route->ne[1]) > UINT32_MAX ||
+                uint64_t(region.route->ne[0]) > UINT32_MAX / uint64_t(region.route->ne[1])) {
+            LLAMA_LOG_ERROR("moe-hybrid: route geometry exceeds the scheduler interface layer=%d\n", region.layer);
+            return false;
+        }
+        const uint64_t projections = source_core ? std::max<size_t>(1,
+            std::count_if(region.body_operations.begin(), region.body_operations.end(),
+                [](const ggml_tensor * node) { return node && node->op == GGML_OP_MUL_MAT_ID && !ggml_is_empty(node); })) : 1;
+        const uint64_t region_capacity = std::max<uint64_t>(region.route->ne[0] + 1, projections);
+        if (projections > UINT32_MAX || region_capacity > UINT32_MAX || count > UINT32_MAX - projections || prepared > UINT32_MAX - region_capacity) {
+            LLAMA_LOG_ERROR("moe-hybrid: prepared region capacity exceeds the scheduler interface layer=%d\n", region.layer);
+            return false;
+        }
+        count += projections;
+        prepared += region_capacity;
+    }
+    prepared_count = prepared;
+    return true;
+}
 
 bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_decode,
         const ggml_graph_execution_certificate * certificate) {
@@ -3011,41 +3062,18 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
     uint32_t hybrid_region_count = 0;
     uint32_t hybrid_prepared_region_count = 0;
     if (hybrid_decode) {
-        const auto measure = [&](const llm_graph_result & graph, uint32_t & count, uint32_t & prepared_count) {
-            const auto & regions = graph.get_moe_regions();
-            if (regions.size() > UINT32_MAX) {
-                LLAMA_LOG_ERROR("moe-hybrid: region count exceeds the scheduler interface\n");
-                return false;
-            }
-            uint64_t prepared = 0;
-            count = 0;
-            for (const auto & region : regions) {
-                if (region.route == nullptr || region.route->ne[0] <= 0 || uint64_t(region.route->ne[0]) > UINT32_MAX ||
-                        region.route->ne[1] <= 0 || uint64_t(region.route->ne[1]) > UINT32_MAX ||
-                        uint64_t(region.route->ne[0]) > UINT32_MAX / uint64_t(region.route->ne[1])) {
-                    LLAMA_LOG_ERROR("moe-hybrid: route geometry exceeds the scheduler interface layer=%d\n", region.layer);
-                    return false;
-                }
-                const uint64_t projections = source_core_enabled() ? std::max<size_t>(1,
-                    std::count_if(region.body_operations.begin(), region.body_operations.end(),
-                        [](const ggml_tensor * node) { return node && node->op == GGML_OP_MUL_MAT_ID && !ggml_is_empty(node); })) : 1;
-                const uint64_t region_capacity = std::max<uint64_t>(region.route->ne[0] + 1, projections);
-                if (projections > UINT32_MAX || count > UINT32_MAX - projections || prepared > UINT32_MAX - region_capacity) {
-                    LLAMA_LOG_ERROR("moe-hybrid: prepared region capacity exceeds the scheduler interface layer=%d\n", region.layer);
-                    return false;
-                }
-                count += projections;
-                prepared += region_capacity;
-            }
-            prepared_count = prepared;
-            return true;
-        };
-        if (!measure(*res, hybrid_region_count, hybrid_prepared_region_count)) { return false; }
+        if (!measure_moe_regions(*res, source_core_enabled(), hybrid_region_count, hybrid_prepared_region_count)) { return false; }
         if (source_core_enabled() && gf_res_reserve) {
             uint32_t reserved_count = 0, reserved_prepared = 0;
-            if (!measure(*gf_res_reserve, reserved_count, reserved_prepared)) { return false; }
+            if (!measure_moe_regions(*gf_res_reserve, true, reserved_count, reserved_prepared)) { return false; }
             hybrid_region_count = std::max(hybrid_region_count, reserved_count);
             hybrid_prepared_region_count = std::max(hybrid_prepared_region_count, reserved_prepared);
+        }
+        if (source_core_enabled()) {
+            moe_source_region_capacity = std::max(moe_source_region_capacity, hybrid_region_count);
+            moe_source_prepared_capacity = std::max(moe_source_prepared_capacity, hybrid_prepared_region_count);
+            hybrid_region_count = moe_source_region_capacity;
+            hybrid_prepared_region_count = moe_source_prepared_capacity;
         }
     }
     for (auto & region : res->get_moe_regions()) {
@@ -3099,9 +3127,10 @@ bool llama_context::finalize_moe_regions(llm_graph_result * res, bool hybrid_dec
             config.max_regions = hybrid_region_count;
             config.max_prepared_regions = hybrid_prepared_region_count;
             if (source_core_enabled()) {
-                const uint64_t variants = uint64_t(std::min(cparams.n_ubatch, std::max(cparams.n_outputs_max, sched_decode_outputs))) + 1;
+                const uint64_t variants = moe_source_max_programs;
                 if (config.max_prepared_regions > UINT32_MAX / variants) { return false; }
                 config.max_prepared_regions *= variants;
+                config.max_source_programs = variants;
             }
             config.gpu_miss_quota = moe_hybrid_gpu_misses;
             config.admission_quota = moe_hybrid_demand_admission ? moe_hybrid_admission_misses : 0;
@@ -3194,6 +3223,11 @@ void llama_context::synchronize() {
     ++compute_sync_generation;
 }
 
+bool llama_context::source_graph_cache_enabled() const {
+    return source_core_enabled() && !graph_reuse_disable && cparams.phase_aware_workspace &&
+        !cparams.pipeline_parallel && !cparams.cb_eval;
+}
+
 bool llama_context::source_core_enabled() const {
     return moe_hybrid_required && moe_hybrid_executor == GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY &&
         ggml_moe_fidelity_selection().source_pool;
@@ -3236,6 +3270,46 @@ int32_t llama_context::reset_source_core_checked(bool all_variants) {
             ggml_backend_sched_moe_source_reset_graph_v1(sched.get());
         if (status) { moe_source_poisoned.store(true); return status; }
     }
+    if (all_variants) { moe_hybrid_graph_certificate = {}; }
+    return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+}
+
+int32_t llama_context::retire_source_sampler(llama_seq_id seq_id) {
+    if (!source_core_enabled()) { return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK; }
+    const auto references = [seq_id](const auto & graphs) {
+        return std::any_of(graphs.begin(), graphs.end(), [seq_id](const auto & graph) {
+            return graph && graph->references_sampler(seq_id);
+        });
+    };
+    const bool active_references = references(gf_res_prev);
+    const bool reserve_references = gf_res_reserve && gf_res_reserve->references_sampler(seq_id);
+    if (!active_references && !reserve_references &&
+            std::none_of(moe_source_graph_variants.begin(), moe_source_graph_variants.end(),
+                [&](const auto & variant) { return references(variant.graphs); })) {
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    }
+    synchronize();
+    std::unique_lock<std::timed_mutex> publication_lock(moe_source_publication_mutex, std::defer_lock);
+    if (!publication_lock.try_lock_for(std::chrono::seconds(5))) {
+        moe_source_poisoned.store(true);
+        return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT;
+    }
+    for (auto & variant : moe_source_graph_variants) {
+        if (!references(variant.graphs)) { continue; }
+        const auto status = ggml_backend_sched_moe_source_reset_graph_v1(variant.scheduler.get());
+        if (status) { moe_source_poisoned.store(true); return status; }
+        for (auto & graph : variant.graphs) { if (graph) { graph->reset(); } }
+        variant.active = nullptr;
+    }
+    if (active_references || (reserve_references && !gf_res_prev_active)) {
+        if (ggml_backend_sched_moe_source_selected_v1(sched.get())) {
+            const auto status = ggml_backend_sched_moe_source_reset_graph_v1(sched.get());
+            if (status) { moe_source_poisoned.store(true); return status; }
+        } else { ggml_backend_sched_reset(sched.get()); }
+        for (auto & graph : gf_res_prev) { if (graph) { graph->reset(); } }
+        gf_res_prev_active = nullptr;
+    }
+    if (reserve_references) { gf_res_reserve->reset(); }
     return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
 }
 
@@ -3246,16 +3320,15 @@ bool llama_context::select_source_graph_variant(const ggml_graph_execution_certi
     ggml_backend_sched_get_buffer_state(sched.get(), &generation, &shrink_generation);
     const auto retirement_epoch = ggml_backend_sched_moe_source_retirement_epoch_v1(sched.get());
     if (generation != sched_buffer_generation || retirement_epoch != sched_source_retirement_epoch) {
-        if (reset_source_core_checked()) { return false; }
+        if (reset_source_core_checked(!source_graph_cache_enabled())) { return false; }
         for (auto & graph : gf_res_prev) { if (graph) { graph->reset(); } }
         gf_res_prev_active = nullptr;
         sched_buffer_generation = generation;
         sched_shrink_generation = shrink_generation;
         sched_source_retirement_epoch = retirement_epoch;
     }
-    const uint32_t width_limit = std::min(cparams.n_ubatch, std::max(cparams.n_outputs_max, sched_decode_outputs));
-    if (!rows || rows > width_limit || graph_reuse_disable ||
-            sampled_inputs_device != use_sampled_input_async) {
+    const uint32_t input_mode = use_sampled_input_async ? 2 : unsigned(use_sampled_input);
+    if (!rows || rows > cparams.n_ubatch || !source_graph_cache_enabled()) {
         if (!moe_source_graph_variants.empty() && reset_source_core_checked()) { return false; }
         return true;
     }
@@ -3263,28 +3336,29 @@ bool llama_context::select_source_graph_variant(const ggml_graph_execution_certi
     if (!publication_lock.try_lock_for(std::chrono::seconds(5))) { moe_source_poisoned.store(true); return false; }
     if (moe_source_poisoned || moe_source_closed) { return false; }
     if (!memcmp(&moe_hybrid_graph_certificate, &certificate, sizeof(certificate)) &&
-            gf_res_prev_active && moe_source_active_outputs == n_outputs) { return true; }
-    if (!ggml_backend_sched_moe_source_selected_v1(sched.get()) || !gf_res_prev_active || !moe_hybrid_graph_certificate.n_rows ||
-        (moe_hybrid_graph_certificate.row_semantics != GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
-         !(moe_hybrid_graph_certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED))) { return true; }
-
+            moe_source_active_outputs == n_outputs &&
+            moe_source_active_input_mode == input_mode) { return true; }
+    const bool retain_active = ggml_backend_sched_moe_source_selected_v1(sched.get()) &&
+        moe_hybrid_graph_certificate.n_rows;
     try {
-        moe_source_graph_variants.reserve(uint64_t(width_limit) + 1);
+        moe_source_graph_variants.reserve(moe_source_max_programs);
     } catch (const std::exception &) {
         moe_source_poisoned.store(true);
         return false;
     }
+    auto found = std::find_if(moe_source_graph_variants.begin(), moe_source_graph_variants.end(),
+        [&](const auto & variant) { return variant.outputs == n_outputs && variant.input_mode == input_mode &&
+            !memcmp(&variant.certificate, &certificate, sizeof(certificate)); });
+    if (!retain_active && found == moe_source_graph_variants.end()) { return true; }
 
     // Each capture keeps its scheduler splits and public tensor backing alive.
     const auto drained = ggml_backend_sched_moe_source_drain_v1(sched.get());
     if (drained) { moe_source_poisoned.store(true); return false; }
     ggml_backend_sched_synchronize(sched.get());
     workspace_in_flight = false;
-    auto found = std::find_if(moe_source_graph_variants.begin(), moe_source_graph_variants.end(),
-        [&](const auto & variant) { return variant.outputs == n_outputs && !memcmp(&variant.certificate, &certificate, sizeof(certificate)); });
     moe_source_graph_variant next;
     if (found == moe_source_graph_variants.end()) {
-        if (moe_source_graph_variants.size() >= width_limit) {
+        if (moe_source_graph_variants.size() >= moe_source_max_programs - 1) {
             auto retired = std::move(moe_source_graph_variants.front());
             moe_source_graph_variants.erase(moe_source_graph_variants.begin());
             const auto status = ggml_backend_sched_moe_source_reset_v1(retired.scheduler.get());
@@ -3327,16 +3401,22 @@ bool llama_context::select_source_graph_variant(const ggml_graph_execution_certi
     previous.certificate = moe_hybrid_graph_certificate;
     previous.outputs = moe_source_active_outputs;
     previous.sampled_device = sampled_inputs_device;
+    previous.input_mode = moe_source_active_input_mode;
+    previous.reserved_tokens = sched_reserved_tokens;
+    previous.reserved_kv = sched_reserved_kv;
     previous.buffer_generation = sched_buffer_generation;
     previous.shrink_generation = sched_shrink_generation;
     previous.retirement_epoch = sched_source_retirement_epoch;
-    moe_source_graph_variants.push_back(std::move(previous));
+    if (retain_active) { moe_source_graph_variants.push_back(std::move(previous)); }
     gf_res_prev = std::move(next.graphs);
     sched = std::move(next.scheduler);
     gf_res_prev_active = next.active;
     moe_hybrid_graph_certificate = next.certificate;
     moe_source_active_outputs = next.outputs;
     sampled_inputs_device = next.sampled_device;
+    moe_source_active_input_mode = next.input_mode;
+    sched_reserved_tokens = next.reserved_tokens;
+    sched_reserved_kv = next.reserved_kv;
     sched_buffer_generation = next.buffer_generation;
     sched_shrink_generation = next.shrink_generation;
     sched_source_retirement_epoch = next.retirement_epoch;
@@ -3933,7 +4013,7 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 
     // TODO: not sure yet if we want to reserve here
-    //sched_need_reserve = true;
+    //request_sched_reserve();
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -3941,7 +4021,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
         // these flags change the graph shape
-        sched_need_reserve = true;
+        request_sched_reserve();
     }
 
     cparams.embeddings_nextn        = value;
@@ -3956,7 +4036,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-    sched_need_reserve = true;
+    request_sched_reserve();
 }
 
 bool llama_context::set_ple_prefetch(bool enabled) {
@@ -3991,7 +4071,7 @@ void llama_context::set_causal_attn(bool value) {
     cparams.causal_attn = value;
 
     // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
-    //sched_need_reserve = true;
+    //request_sched_reserve();
 }
 
 bool llama_context::get_causal_attn() const {
@@ -4008,12 +4088,16 @@ void llama_context::set_warmup(bool value) {
     cparams.warmup = value;
 
     // warmups are usually with small batches, so no need to reserve
-    //sched_need_reserve = true;
+    //request_sched_reserve();
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
+    }
+
+    if (retire_source_sampler(seq_id) != GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK) {
+        throw std::runtime_error("failed to retire source graphs before changing a sampler");
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
@@ -4025,7 +4109,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            request_sched_reserve(true);
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -4044,7 +4128,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        request_sched_reserve(true);
 
         return true;
     }
@@ -4053,7 +4137,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            request_sched_reserve(true);
         }
 
         sampling.samplers.erase(seq_id);
@@ -4063,7 +4147,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    request_sched_reserve(true);
 
     return true;
 }
@@ -4084,7 +4168,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     }
 
     moe_candidate_refresh_pending = true;
-    sched_need_reserve = true;
+    request_sched_reserve();
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -4123,7 +4207,7 @@ bool llama_context::set_adapter_cvec(
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
-    sched_need_reserve = true;
+    request_sched_reserve();
 
     return res;
 }
@@ -4318,7 +4402,22 @@ llm_graph_result * llama_context::process_ubatch(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    const bool source_cache = source_graph_cache_enabled();
+    sched_reserve_plan source_plan;
+    if (source_cache) {
+        acquire_shared_workspace();
+        source_plan = make_sched_reserve_plan(ubatch.n_tokens,
+            cparams.live_context_workspace && mctx ? mctx->get_attn_reserve_n_kv() : 0);
+        prepare_sched_reserve(source_plan);
+        if (!ggml_backend_sched_refresh_resizable_plan(sched.get())) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+    }
     if (!select_source_graph_variant(hybrid_rows ? requested_certificate : ggml_graph_execution_certificate{})) { ret = GGML_STATUS_FAILED; return nullptr; }
+    if (source_cache) {
+        sched_reserved_tokens = source_plan.n_tokens;
+        sched_reserved_kv = source_plan.live_kv ? source_plan.n_kv : 0;
+        sched_need_reserve = false;
+        sched_sampler_reserve_only = false;
+    }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -4455,6 +4554,7 @@ llm_graph_result * llama_context::process_ubatch(
         place_moe_regions(res);
         place_sampled_inputs(res);
         sampled_inputs_device = use_sampled_input_async;
+        moe_source_active_input_mode = use_sampled_input_async ? 2 : unsigned(use_sampled_input);
         const bool allocated = rebuild_async ? ggml_backend_sched_alloc_graph_async(sched.get(), gf) :
                                                ggml_backend_sched_alloc_graph(sched.get(), gf);
         if (!allocated) {
@@ -4751,7 +4851,9 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
     llama_batch batch = {n_items, tokens.data(), nullptr, positions.data(), n_seq_ids.data(), seq_ptrs.data(), outputs.data()};
     use_sampled_input = true;
     use_sampled_input_async = previous != nullptr;
-    sched_need_reserve |= move_tokens || (use_sampled_input_async && !sampled_inputs_device);
+    if (!source_graph_cache_enabled() && (move_tokens || (use_sampled_input_async && !sampled_inputs_device))) {
+        request_sched_reserve();
+    }
     const int64_t preceding_tokens = n_queued_tokens;
     const uint64_t preceding_generation = compute_sync_generation;
     int32_t ret;
@@ -4848,7 +4950,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     embd_seq.clear();
 
     try {
-        sched_reserve(n_tokens);
+        if (!source_graph_cache_enabled() || (sched_need_reserve && !sched_sampler_reserve_only)) { sched_reserve(n_tokens); }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to reserve compute workspace: %s\n", __func__, err.what());
         return -2;
@@ -5178,7 +5280,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_
 
     if (!live_exact_batch_plan) {
         try {
-            sched_reserve(n_tokens_all);
+            if (!source_graph_cache_enabled() || (sched_need_reserve && !sched_sampler_reserve_only)) { sched_reserve(n_tokens_all); }
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: failed to reserve compute workspace: %s\n", __func__, err.what());
             return -2;
@@ -5254,7 +5356,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_
 
     if (live_exact_batch_plan) {
         try {
-            sched_reserve(n_tokens_all, mctx->get_attn_reserve_n_kv());
+            if (!source_graph_cache_enabled() || (sched_need_reserve && !sched_sampler_reserve_only)) { sched_reserve(n_tokens_all, mctx->get_attn_reserve_n_kv()); }
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: failed to reserve live-context workspace: %s\n", __func__, err.what());
             return -2;
@@ -5324,7 +5426,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, const llama_decode_
                 moe_hybrid_graph_certificate = {};
                 n_outputs = 0;
                 ++graph_execution_owner_generation;
-                sched_need_reserve = true;
+                request_sched_reserve();
                 LLAMA_LOG_ERROR("%s: failed required target window drained; target memory and graph state invalidated\n", __func__);
                 return -3;
             }
@@ -5897,8 +5999,18 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 llm_graph_result * llama_context::get_gf_res_prev() {
     auto & res = gf_res_prev[n_outputs > 0];
+    const auto max_nodes = source_graph_cache_enabled() ?
+        std::max<int64_t>(gf_res_reserve->get_max_nodes(), graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch))) :
+        gf_res_reserve->get_max_nodes();
+    if (res && res->get_max_nodes() < max_nodes) {
+        GGML_ASSERT(reset_source_core_checked(false) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
+        ggml_backend_sched_synchronize(sched.get());
+        workspace_in_flight = false;
+        gf_res_prev_active = nullptr;
+        res.reset();
+    }
     if (!res) {
-        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        res.reset(new llm_graph_result(max_nodes));
     }
     return res.get();
 }
@@ -6005,6 +6117,13 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    if (source_core_enabled()) {
+        uint32_t regions = 0, prepared = 0;
+        if (!measure_moe_regions(*res, true, regions, prepared)) { return nullptr; }
+        moe_source_region_capacity = std::max(moe_source_region_capacity, regions);
+        moe_source_prepared_capacity = std::max(moe_source_prepared_capacity, prepared);
+    }
+
     if (cparams.decode_boundary_overlap && n_tokens == n_seqs) {
         size_t size = 0;
         for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
@@ -6057,7 +6176,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
-        /*.samplers    =*/ sampling.samplers,
+        /*.samplers    =*/ source_core_enabled() && !is_reserve && n_outputs == 0 ? std::map<llama_seq_id, llama_sampler *>{} : sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -7181,7 +7300,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     // the training graph is different, need to reserve again
-    sched_need_reserve = true;
+    request_sched_reserve();
     sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);

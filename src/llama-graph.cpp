@@ -1470,6 +1470,11 @@ bool llm_graph_result::can_decode_sampled() const {
     });
 }
 
+bool llm_graph_result::references_sampler(llama_seq_id seq_id) const {
+    // Inactive samplers can still own dummy graph work and input bindings.
+    return params.samplers.count(seq_id) != 0;
+}
+
 const std::vector<ggml_tensor *> & llm_graph_result::get_inp_tensors() {
     const size_t used = ggml_used_mem(get_ctx());
     if (used != inp_tensors_context_used) {
@@ -1805,6 +1810,20 @@ bool llm_graph_result::discover_moe_regions(const std::vector<llama_moe_source_g
         auto * node = ggml_graph_node(get_gf(), i);
         if (!node || !positions.emplace(node, i).second) { return false; }
     }
+    std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
+    for (int i = 0; i < count; ++i) {
+        const auto * node = ggml_graph_node(get_gf(), i);
+        const auto append = [&](const ggml_tensor * input) {
+            if (!input) { return; }
+            auto & uses = readers[input];
+            if (uses.empty() || uses.back() != i) { uses.push_back(i); }
+        };
+        for (const auto * input : node->src) {
+            append(input);
+            if (input) { append(input->view_src); }
+        }
+        append(node->view_src);
+    }
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, uint32_t>> sources_by_tensor;
     for (size_t index = 0; index < sources.size(); ++index) {
         const auto & source = sources[index];
@@ -1850,10 +1869,11 @@ bool llm_graph_result::discover_moe_regions(const std::vector<llama_moe_source_g
                     tensor->view_src->op != GGML_OP_NONE) { return false; }
             llm_graph_moe_live_out live;
             live.tensor = tensor;
-            for (int i = 0; i < count; ++i) {
-                auto * consumer = ggml_graph_node(get_gf(), i);
-                if (body.count(consumer)) { continue; }
-                if (ggml_backend_sched_region_consumes_v1(consumer, tensor)) {
+            const auto uses = readers.find(tensor);
+            if (uses != readers.end()) {
+                for (const int i : uses->second) {
+                    auto * consumer = ggml_graph_node(get_gf(), i);
+                    if (body.count(consumer)) { continue; }
                     if (i <= last) { return false; }
                     live.consumers.push_back(consumer);
                 }

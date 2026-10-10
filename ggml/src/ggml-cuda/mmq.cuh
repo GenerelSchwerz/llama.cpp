@@ -1835,50 +1835,9 @@ void ggml_cuda_mul_mat_q_mapped(
         const int32_t * source_map, int32_t source_split,
         const int32_t * source_wait_class = nullptr, const uint32_t * stage_ready = nullptr);
 
-struct ggml_cuda_mmq_mmid_prepared;
-
-ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        const ggml_tensor * ids,
-        ggml_tensor * dst);
-
-bool ggml_cuda_mmq_mmid_launch_range(
-        ggml_backend_cuda_context & ctx,
-        const ggml_cuda_mmq_mmid_prepared * prepared,
-        const void * resident_data,
-        const void * staging_data,
-        const int32_t * source_map,
-        int32_t source_split,
-        int32_t expert_begin,
-        int32_t expert_count,
-        int64_t max_rows);
-
-void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared);
-
-// Keep both bank sources and maps alive through all waves. Finish after every routed expert is computed.
-ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_pair(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
-bool ggml_cuda_mmq_mmid_launch_pair_range(
-        ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared,
-        const void * resident_up, const void * staging_up, const void * resident_gate, const void * staging_gate,
-        const int32_t * source_map, int32_t source_split, int32_t expert_begin, int32_t expert_count, int64_t max_rows);
-bool ggml_cuda_mmq_mmid_finish_pair(ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared);
-
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo);
 
 bool ggml_cuda_should_fuse_mmq_id(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, int cc, size_t smpbo);
 
 void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst);
-
-struct ggml_cuda_mmq_routed_resources {
-    size_t rows = 0;
-    size_t padded_rows = 0;
-    size_t quantized_bytes = 0;
-    size_t scale_count = 0;
-    size_t fixup_elements = 0;
-};
-
-bool ggml_cuda_mmq_routed_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmq_routed_resources & resources, bool bound = true);

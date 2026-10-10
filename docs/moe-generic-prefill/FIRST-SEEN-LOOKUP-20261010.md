@@ -1,0 +1,27 @@
+# Preserve route order with a direct prefill lookup
+
+## Measured problem and minimal change
+
+Diagnostic267 samples about45ms repeated leaf user CPU in core_session::build_plan; frozen272 repeated main compact-plan counters are about40ms. The route loop searches every prior distinct expert for every routed ID. The first-seen order affects later classification and must remain unchanged. Earlier dense route-index experiments changed surrounding behavior and lost serving throughput; they do not establish that a smaller lookup substitution will improve serving.
+
+The candidate reuses layer.prefill_expert_rows as a temporary expert-ID to first-seen-index map during nonshared prefill planning. Existing preflight allocates exactly expert_count entries. Initialize them to-1, validate the routed ID before indexing, and assign a new index only when the ID first occurs. Preserve slot/reciprocal-owner checks, distinct order, counts, route weights, CPU IDs/rows/destinations and all partition policy. Existing code clears and populates the final expert row counts before any consumer uses them. Shared body plans retain their existing copies and do not use the temporary map. Decode retains its existing small linear search. No new allocation, owner, API, kernel, graph cache or model predicate.
+
+## Lifetime and arithmetic
+
+replay_prefill reads back IDs and waits before calling build_plan. The same layer's prior body completes before its next replay. CPU projection work and owner execute_bounded_prefill receive row counts only after planning returns. Shared body plans use separate layer vectors and do not overwrite the first layer's final counts. All GPU consumers, original quantization, operators and staging remain unchanged. A failed ID/slot check rejects planning before execution, as before.
+
+## Evidence
+
+External first-seen-plan-cpu-278 compiles the exact old and new production route loops against bounded fixture storage. An independent control is the frozen272 linear loop, not a second implementation of the new lookup. All output plan fields match in5040 cases, covering2652000 valid routes,1-4097 experts,1-2048 rows,1/4/8 routes per row, padded IDs, repeated/skewed IDs, routed/nonrouted operations and prefill/decode flags. Negative/out-of-range IDs, invalid slots and reciprocal-owner mismatches reject identically. Address and undefined-behavior sanitizers pass; both child process groups are empty. This is algorithm qualification, not model speed evidence or complete CUDA integration proof.
+
+The existing main-prefill source-access hook additionally reads the actual upstream IDs tensor with its original strides and compares every route index and expert ID against an independent linear first-seen reconstruction. It covers both eligible complete bodies and CPU-enabled original-projection execution through the existing numerical fixtures. first-seen-plan-tests-277 runs the original10 gates plus CPU-enabled prefill under ordered locks, plainj18 and finite whole-tree teardown. Inspect terminal results before freezing or serving. Frozen272 remains the control. No speed, target completion, commit, push or default promotion is claimed until matched serving and work/resource checks finish.
+
+## Terminal qualification and serving observation
+
+277 passes all11 commands,264 main-source original-oracle numerical replays at unchanged maximum relative MSE1.60269249e-7, and1456 actual first-seen plan checks. CPU-enabled projection, complete-body, overlap, direct/view-reader, owner and tail fixtures pass. Whole guard and child trees are empty. Frozen279 source14 and binary10 match the qualified mutable source/build; only core CUDA source and tests differ from272. No arithmetic kernel source changes.
+
+ABBA280-283 completes all four processes with eight exact64-ID output sequences. Repeated prefill means1517.180 ->1532.315 tok/s (+0.998%), first-token1.355985 ->1.340257s, main compact planning39.136 ->19.069ms and main replay1089.267 ->1069.562ms. Both candidate repeated rates1530.44/1534.19 exceed controls1526.74/1507.62. This is a bounded small observation, not the missing1700/full-specialized parity result.
+
+All cold main source work matches. First three arms have equal reported main/body work; final control283 has1164 more selected routes,99353600 more paid bytes, two more waves and seven fewer compact chunks on its repeated request. Fixed workspace37124736bytes, pool capacity384494592bytes/peak100288512bytes and sampled GPU peak12363MiB match all four. Cold rates and preparation vary substantially, so no cold gain is established. Repeated decode59.142 ->58.433 tok/s (-1.20%) is observational; no universal no-regression claim. Retain the local algorithm simplification with these limits. Full report: external FIRST-SEEN-PLAN-ABBA-REPORT.json. All jobs are terminal/tree-empty; no commit, push or default promotion.
+
+Existing ggml_cuda_mmq_mmid_prepare_pair in mmq.cu:978-1006 combines two products into private interleaved scratch and finish_pair applies GLU. The complete generic body currently needs original root outputs for graph-derived readers/gathers, including retained-output cases. This is not a direct replacement of the current root loop. A future paired-product optimization must preserve those readers and checked precision/layout, use existing interfaces where possible, and earn separate component/model evidence before a larger storage change.

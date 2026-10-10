@@ -178,3 +178,65 @@ void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream,
         const ggml_cuda_mmid_execution * execution = nullptr);
+
+struct ggml_cuda_mmq_mmid_prepared;
+
+struct ggml_cuda_mmq_sorted_routes {
+    const int32_t * output_rows = nullptr;
+    size_t output_capacity = 0;
+    const int32_t * expert_bounds = nullptr;
+    size_t bounds_capacity = 0;
+    int32_t expert_begin = 0;
+    int32_t expert_count = 0;
+};
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst);
+
+// Keep the input preparation alive until every borrowed reader completes on the same stream.
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_shared(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mmq_mmid_prepared * input);
+
+// Borrow checked sorted-route tables until this stream finishes the launch.
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_sorted(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mmq_sorted_routes & routes);
+
+struct ggml_cuda_mmq_routed_resources {
+    size_t rows = 0;
+    size_t padded_rows = 0;
+    size_t quantized_bytes = 0;
+    size_t scale_count = 0;
+    size_t fixup_elements = 0;
+};
+
+bool ggml_cuda_mmq_routed_requirements(int device, const ggml_tensor * dst, ggml_cuda_mmq_routed_resources & resources, bool bound = true);
+
+bool ggml_cuda_mmq_mmid_launch_range(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_data,
+        const void * staging_data,
+        const int32_t * source_map,
+        int32_t source_split,
+        int32_t expert_begin,
+        int32_t expert_count,
+        int64_t max_rows,
+        const int32_t * output_rows = nullptr,
+        size_t output_capacity = 0);
+
+void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared);
+
+// Keep both bank sources and maps alive through all waves. Finish after every routed expert is computed.
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
+bool ggml_cuda_mmq_mmid_launch_pair_range(
+        ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_up, const void * staging_up, const void * resident_gate, const void * staging_gate,
+        const int32_t * source_map, int32_t source_split, int32_t expert_begin, int32_t expert_count, int64_t max_rows);
+bool ggml_cuda_mmq_mmid_finish_pair(ggml_backend_cuda_context & ctx, const ggml_cuda_mmq_mmid_prepared * prepared);

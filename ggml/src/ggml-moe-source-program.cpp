@@ -277,7 +277,7 @@ std::unique_ptr<ggml_moe_source_body> ggml_moe_source_body::prepare(const ggml_b
     if (count > PTRDIFF_MAX / sizeof(ggml_tensor)) { return nullptr; }
     auto result = std::unique_ptr<ggml_moe_source_body>(new ggml_moe_source_body());
     result->tensors_.resize(size_t(count));
-    std::vector<const ggml_tensor *> originals;
+    auto & originals = result->originals_;
     originals.reserve(size_t(count));
     std::unordered_map<const ggml_tensor *, size_t> indices;
     const auto append = [&](const ggml_tensor * tensor) {
@@ -366,6 +366,7 @@ std::unique_ptr<ggml_moe_source_body> ggml_moe_source_body::compact(uint32_t cap
     query.source_generation = sources_.empty() ? 1 : sources_[0].generation;
     auto result = prepare(query);
     if (!result) { return nullptr; }
+    result->originals_ = originals_;
     result->row_capacity_ = ids->ne[1]; result->routes_per_row_ = ids->ne[0]; result->route_capacity_ = capacity; result->compact_ = true;
     result->input_layouts_.resize(dynamic_inputs_.size());
     result->route_dimensions_.resize(result->tensors_.size());
@@ -478,6 +479,71 @@ std::unique_ptr<ggml_moe_source_body> ggml_moe_source_body::compact(uint32_t cap
     return result;
 } catch (const std::bad_alloc &) { return nullptr; }
 
+std::vector<const ggml_tensor *> ggml_moe_source_body::root_projections() const {
+    std::vector<const ggml_tensor *> roots;
+    if (compact_) { return roots; }
+    for (const auto * node : nodes_) {
+        if (node->op == GGML_OP_MUL_MAT_ID &&
+                std::find(nodes_.begin(), nodes_.end(), node->src[1]) == nodes_.end()) {
+            roots.push_back(original(node));
+        }
+    }
+    return roots;
+}
+
+std::unique_ptr<ggml_moe_source_body> ggml_moe_source_body::compact_after_roots(uint32_t capacity) const try {
+    const auto roots = root_projections();
+    if (roots.empty()) { return nullptr; }
+    auto result = compact(capacity);
+    if (!result) { return nullptr; }
+    const auto is_root = [&](const ggml_tensor * tensor) {
+        const auto * identity = result->original(tensor);
+        return std::find(roots.begin(), roots.end(), identity) != roots.end();
+    };
+    std::vector<const ggml_tensor *> inputs;
+    std::vector<input_layout> layouts;
+    const auto used = [&](const ggml_tensor * tensor) {
+        if (std::find(result->live_outputs_.begin(), result->live_outputs_.end(), tensor) != result->live_outputs_.end()) { return true; }
+        for (const auto * node : result->nodes_) {
+            if (is_root(node)) { continue; }
+            if (node->view_src == tensor) { return true; }
+            for (const auto * src : node->src) { if (src == tensor) { return true; } }
+        }
+        return false;
+    };
+    for (size_t i = 0; i < result->dynamic_inputs_.size(); ++i) {
+        if (i != result->ids_input_ && !used(result->dynamic_inputs_[i])) { continue; }
+        inputs.push_back(result->dynamic_inputs_[i]);
+        layouts.push_back(result->input_layouts_[i]);
+    }
+    for (const auto * node : result->nodes_) {
+        if (!is_root(node)) { continue; }
+        const auto * full = result->original(node);
+        if (!full || full->type != GGML_TYPE_F32 || full->nb[0] != sizeof(float) ||
+                full->ne[1] != result->routes_per_row_ || full->ne[2] != result->row_capacity_ ||
+                full->ne[3] != 1 || uint64_t(full->ne[0]) > SIZE_MAX / sizeof(float)) { return nullptr; }
+        inputs.push_back(node);
+        layouts.push_back({full->ne[2], full->ne[1], full->nb[2], full->nb[1], size_t(full->ne[0]) * sizeof(float)});
+    }
+    result->nodes_.erase(std::remove_if(result->nodes_.begin(), result->nodes_.end(), is_root), result->nodes_.end());
+    for (const auto * input : inputs) {
+        if (!is_root(input)) { continue; }
+        auto * tensor = const_cast<ggml_tensor *>(input);
+        tensor->op = GGML_OP_NONE;
+        memset(tensor->op_params, 0, sizeof(tensor->op_params));
+        std::fill(std::begin(tensor->src), std::end(tensor->src), nullptr);
+        tensor->view_src = nullptr;
+        tensor->view_offs = 0;
+    }
+    result->sources_.erase(std::remove_if(result->sources_.begin(), result->sources_.end(),
+        [&](const ggml_backend_moe_cpu_region_source_v1 & source) { return !used(source.tensor); }), result->sources_.end());
+    const auto * ids = result->dynamic_inputs_[result->ids_input_];
+    result->ids_input_ = std::find(inputs.begin(), inputs.end(), ids) - inputs.begin();
+    result->dynamic_inputs_ = std::move(inputs);
+    result->input_layouts_ = std::move(layouts);
+    return result;
+} catch (const std::bad_alloc &) { return nullptr; }
+
 bool ggml_moe_source_body::bind_routes(uint32_t count) {
     if (!compact_ || !count || count > route_capacity_) { return false; }
     for (size_t i = 0; i < tensors_.size(); ++i) {
@@ -488,6 +554,12 @@ bool ggml_moe_source_body::bind_routes(uint32_t count) {
         for (int d = dimension + 1; d < GGML_MAX_DIMS; ++d) { tensor.nb[d] = tensor.nb[d - 1] * tensor.ne[d - 1]; }
     }
     return true;
+}
+
+const ggml_tensor * ggml_moe_source_body::original(const ggml_tensor * tensor) const {
+    const auto found = std::find_if(tensors_.begin(), tensors_.end(),
+        [&](const ggml_tensor & value) { return &value == tensor; });
+    return found == tensors_.end() ? nullptr : originals_[size_t(found - tensors_.begin())];
 }
 
 bool ggml_moe_source_body::gather_input(size_t input, const void * source, size_t source_bytes,
@@ -702,6 +774,7 @@ struct ggml_moe_source_program::impl {
     std::vector<const ggml_tensor *> originals;
     std::vector<const ggml_tensor *> validation_tensors;
     std::unordered_map<const ggml_tensor *, size_t> original_indices;
+    std::vector<std::vector<size_t>> readers;
     std::vector<source_tensor_witness<ggml_moe_source_tensor_byte_comparable>> witnesses;
     std::vector<ggml_tensor> tensors;
     std::vector<uint8_t> omitted, body_storage;
@@ -720,6 +793,30 @@ struct ggml_moe_source_program::impl {
     size_t index(const ggml_tensor * tensor) const {
         const auto it = original_indices.find(tensor);
         return it == original_indices.end() ? SIZE_MAX : it->second;
+    }
+
+    size_t clone_index(const ggml_tensor * tensor) const {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(tensor), base = reinterpret_cast<uintptr_t>(tensors.data());
+        if (address < base || (address - base) % sizeof(ggml_tensor)) { return SIZE_MAX; }
+        const size_t i = (address - base) / sizeof(ggml_tensor);
+        return i < tensors.size() ? i : SIZE_MAX;
+    }
+
+    bool closed_cut(const ggml_tensor * const * cut, size_t count,
+            const ggml_tensor * const * retained, size_t retained_count) const {
+        const auto contains = [](const ggml_tensor * const * values, size_t n, const ggml_tensor * value) {
+            return std::find(values, values + n, value) != values + n;
+        };
+        for (size_t k = 0; k < count; ++k) {
+            const size_t i = clone_index(cut[k]);
+            if (i == SIZE_MAX) { return false; }
+            if (contains(retained, retained_count, cut[k])) { continue; }
+            if (tensors[i].flags & GGML_TENSOR_FLAG_OUTPUT) { return false; }
+            for (const size_t reader : readers[i]) {
+                if (!contains(cut, count, &tensors[reader])) { return false; }
+            }
+        }
+        return true;
     }
 
     size_t root(size_t i) const {
@@ -898,6 +995,16 @@ struct ggml_moe_source_program::impl {
             add(originals[i]->view_src);
         }
         if (originals.size() > INT_MAX) { return reject("metadata_capacity"); }
+        readers.resize(originals.size());
+        for (size_t i = 0; i < originals.size(); ++i) {
+            const auto append = [&](const ggml_tensor * input) {
+                if (!input) { return; }
+                auto & uses = readers[index(input)];
+                if (uses.empty() || uses.back() != i) { uses.push_back(i); }
+            };
+            for (const auto * input : originals[i]->src) { append(input); }
+            append(originals[i]->view_src);
+        }
         witnesses.reserve(originals.size());
         tensors.resize(originals.size());
         omitted.resize(originals.size());
@@ -1139,29 +1246,114 @@ ggml_tensor * ggml_moe_source_program::find(const ggml_tensor * original) const 
     return i < state->tensors.size() && (!state->omitted[i] || state->body_storage[i]) ? &state->tensors[i] : nullptr;
 }
 
+std::unique_ptr<ggml_moe_source_body> ggml_moe_source_program::prepare_body(size_t first_layer, size_t count) const try {
+    if (!state || !count || first_layer >= state->layers.size() || count > state->layers.size() - first_layer ||
+            !matches(state->source)) { return nullptr; }
+    const auto & first = *state->layers[first_layer].expert;
+    const auto & last = *state->layers[first_layer + count - 1].expert;
+    const size_t begin = first.region.first_node, end = size_t(last.region.last_node) + 1;
+    const auto * ids = first.region.ids;
+    const auto generation = first.cpu_source_generation;
+    if (!ids || !generation || begin >= end || end > size_t(state->source_node_count)) { return nullptr; }
+    std::vector<ggml_backend_moe_cpu_region_source_v1> sources;
+    for (size_t i = first_layer; i < first_layer + count; ++i) {
+        const auto & expert = *state->layers[i].expert;
+        const auto & geometry = expert.region.geometry;
+        if (!expert.routed_operation || expert.region.first_node != expert.region.last_node ||
+                expert.region.ids != ids || expert.cpu_source_generation != generation ||
+                geometry.row_capacity != first.region.geometry.row_capacity ||
+                geometry.routes_per_row != first.region.geometry.routes_per_row ||
+                geometry.expert_count != first.region.geometry.expert_count) { return nullptr; }
+        for (const auto & bank : expert.banks) {
+            auto source = bank.source;
+            source.tensor = static_cast<const ggml_tensor *>(source.witness);
+            if (!source.tensor || source.tensor->op != GGML_OP_NONE || source.tensor->view_src ||
+                    source.tensor->type != bank.metadata.type || bank.metadata.op != GGML_OP_NONE ||
+                    memcmp(source.tensor->ne, bank.metadata.ne, sizeof(bank.metadata.ne)) ||
+                    memcmp(source.tensor->nb, bank.metadata.nb, sizeof(bank.metadata.nb)) ||
+                    source.data != source.tensor->data || source.bytes != ggml_nbytes(source.tensor) ||
+                    source.expert_stride != source.tensor->nb[2] || source.generation != generation) { return nullptr; }
+            const auto found = std::find_if(sources.begin(), sources.end(),
+                [&](const ggml_backend_moe_cpu_region_source_v1 & value) { return value.tensor == source.tensor; });
+            if (found == sources.end()) { sources.push_back(source); }
+            else if (found->data != source.data || found->bytes != source.bytes ||
+                    found->expert_stride != source.expert_stride || found->generation != source.generation) { return nullptr; }
+        }
+    }
+    std::vector<const ggml_tensor *> nodes, inputs, outputs, cut, retained;
+    const auto inside = [&](const ggml_tensor * tensor) {
+        const size_t i = state->index(tensor);
+        return i >= begin && i < end;
+    };
+    for (size_t i = first_layer; i < first_layer + count; ++i) {
+        for (const auto * tensor : {state->layers[i].expert->region.activation, ids}) {
+            if (!tensor) { return nullptr; }
+            if (inside(tensor)) { continue; }
+            const size_t index = state->index(tensor);
+            if (index == SIZE_MAX || (index >= begin && index < size_t(state->source_node_count))) { return nullptr; }
+            if (std::find(inputs.begin(), inputs.end(), tensor) == inputs.end()) { inputs.push_back(tensor); }
+        }
+    }
+    const auto add_input = [&](const ggml_tensor * tensor, bool indexed) {
+        if (!tensor || inside(tensor)) { return true; }
+        const size_t i = state->index(tensor);
+        if (i == SIZE_MAX || (i >= begin && i < size_t(state->source_node_count))) { return false; }
+        if (std::find_if(sources.begin(), sources.end(),
+                [&](const ggml_backend_moe_cpu_region_source_v1 & source) { return source.tensor == tensor; }) != sources.end()) { return true; }
+        if (std::find(inputs.begin(), inputs.end(), tensor) != inputs.end()) { return true; }
+        const bool broadcast = tensor->ne[1] == 1 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+        if ((indexed || broadcast) && tensor->op == GGML_OP_NONE && !tensor->view_src && tensor->data &&
+                !(tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+            for (const auto * src : tensor->src) { if (src) { return false; } }
+            sources.push_back({tensor, tensor, tensor->data, ggml_nbytes(tensor), tensor->nb[2], generation});
+        } else if (std::find(inputs.begin(), inputs.end(), tensor) == inputs.end()) { inputs.push_back(tensor); }
+        return true;
+    };
+    for (size_t i = begin; i < end; ++i) {
+        const auto * node = state->originals[i];
+        const bool metadata = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_PERMUTE;
+        if (state->omitted[i] || (!metadata && (!ggml_op_is_pure(node->op) || node->view_src)) ||
+                (node->op == GGML_OP_MUL_MAT_ID && (node->src[2] != ids || !node->src[0] ||
+                    node->src[0]->ne[2] != first.region.geometry.expert_count))) { return nullptr; }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const bool indexed = (node->op == GGML_OP_ADD_ID && s == 1) ||
+                (node->op == GGML_OP_GET_ROWS && s == 0 && node->src[1] == ids);
+            if (!add_input(node->src[s], indexed)) { return nullptr; }
+        }
+        if (!add_input(node->view_src, false)) { return nullptr; }
+        nodes.push_back(node);
+        cut.push_back(&state->tensors[i]);
+    }
+    if (std::find(inputs.begin(), inputs.end(), ids) == inputs.end()) { return nullptr; }
+    for (size_t i = begin; i < end; ++i) {
+        const auto * node = state->originals[i];
+        bool live = (state->tensors[i].flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || i + 1 == end;
+        for (const size_t j : state->readers[i]) {
+            if (j >= begin && j < end) { continue; }
+            live = true;
+            break;
+        }
+        if (live) { outputs.push_back(node); retained.push_back(&state->tensors[i]); }
+    }
+    if (!state->closed_cut(cut.data(), cut.size(), retained.data(), retained.size())) { return nullptr; }
+    std::vector<ggml_tensor *> graph_nodes;
+    for (const auto * node : nodes) { graph_nodes.push_back(const_cast<ggml_tensor *>(node)); }
+    ggml_cgraph graph = {};
+    graph.nodes = graph_nodes.data(); graph.n_nodes = graph.size = int(graph_nodes.size());
+    ggml_backend_moe_cpu_region_query_v1 query = {};
+    query.struct_size = sizeof(query); query.graph = &graph; query.source_generation = generation; query.ids = ids;
+    query.body_nodes = nodes.data(); query.n_body_nodes = nodes.size();
+    query.dynamic_inputs = inputs.data(); query.n_dynamic_inputs = inputs.size();
+    query.sources = sources.data(); query.n_sources = sources.size();
+    query.live_outputs = outputs.data(); query.n_live_outputs = outputs.size();
+    return ggml_moe_source_body::prepare(query);
+} catch (const std::bad_alloc &) { return nullptr; }
+
 bool ggml_moe_source_program::closed_cut(const ggml_tensor * const * cut, size_t count,
         const ggml_tensor * const * retained, size_t retained_count) const {
     if (!state || !cut || !count || !retained || !retained_count) { return false; }
-    const auto contains = [](const ggml_tensor * const * values, size_t n, const ggml_tensor * value) {
-        return std::find(values, values + n, value) != values + n;
-    };
-    for (size_t k = 0; k < count; ++k) {
-        const auto * value = cut[k];
-        const auto found = std::find_if(state->tensors.begin(), state->tensors.end(),
-            [&](const ggml_tensor & tensor) { return &tensor == value; });
-        if (!value || found == state->tensors.end()) { return false; }
-        if (contains(retained, retained_count, value)) { continue; }
-        const size_t index = size_t(found - state->tensors.begin());
-        const auto * original = state->originals[index];
-        if (state->tensors[index].flags & GGML_TENSOR_FLAG_OUTPUT) { return false; }
-        for (size_t j = 0; j < state->originals.size(); ++j) {
-            const auto * consumer = state->originals[j];
-            bool reads = consumer->view_src == original;
-            for (const auto * input : consumer->src) { reads |= input == original; }
-            if (reads && !contains(cut, count, &state->tensors[j])) { return false; }
-        }
-    }
-    return true;
+    return state->closed_cut(cut, count, retained, retained_count);
 }
 
 const std::vector<ggml_moe_source_layer> & ggml_moe_source_program::layers() const { return state->layers; }

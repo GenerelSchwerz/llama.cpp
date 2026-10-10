@@ -463,6 +463,34 @@ struct ggml_cuda_moe_graph_binding {
     uint32_t slot_index = UINT32_MAX;
 };
 
+struct ggml_cuda_moe_prefill_body_bank {
+    ggml_cuda_moe_graph_binding binding;
+    ggml_tensor * node = nullptr;
+    ggml_cuda_moe_prefill_source_binding source;
+};
+
+struct ggml_cuda_moe_prefill_wave {
+    uint32_t n_banks = 0, n_slots = 0;
+    const void * resident[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+    const void * staged[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+    const int32_t * source_map_host = nullptr;
+    const int32_t * source_map_device = nullptr;
+    int32_t expert_begin = 0, expert_count = 0;
+    int64_t max_rows = 0;
+};
+
+// Execute submits readers on the supplied context stream before the owner releases the wave.
+struct ggml_cuda_moe_prefill_body {
+    const ggml_cuda_moe_prefill_body_bank * banks = nullptr;
+    uint32_t n_banks = 0;
+    // Private map storage stays alive and unchanged until stream completion.
+    int32_t * source_map_host = nullptr;
+    uint32_t source_map_capacity = 0;
+    void * context = nullptr;
+    bool (*execute)(void * context, ggml_backend_cuda_context & compute, const ggml_cuda_moe_prefill_wave & wave) = nullptr;
+    bool (*canceled)(void * context) = nullptr;
+};
+
 struct ggml_cuda_moe_hybrid_selection {
     uint32_t status;
     uint32_t admissions;
@@ -1296,6 +1324,7 @@ public:
             const int32_t * unique_experts,
             uint32_t n_unique_experts);
     size_t prefill_staging_capacity_bytes() const;
+    bool prefill_body_fits(const ggml_tensor * const * banks, uint32_t count) const;
     ggml_cuda_moe_grouped_decode_result execute_bounded_prefill(
             ggml_backend_cuda_context & context,
             ggml_cuda_moe_graph_group_dispatch * group,
@@ -1312,7 +1341,8 @@ public:
             ggml_tensor * paired_node = nullptr,
             ggml_tensor * paired_output = nullptr,
             const ggml_cuda_moe_prefill_cpu_partition * cpu_partition = nullptr,
-            const ggml_cuda_moe_prefill_source_binding * source_binding = nullptr);
+            const ggml_cuda_moe_prefill_source_binding * source_binding = nullptr,
+            const ggml_cuda_moe_prefill_body * body = nullptr);
     ggml_cuda_moe_grouped_decode_result prepare_host_staged_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,

@@ -961,6 +961,107 @@ struct ggml_backend_sched_hybrid_region {
 struct ggml_backend_sched_source_cpu {
     ggml_backend_moe_cpu_service_v1_t service = nullptr;
     const ggml_backend_moe_cpu_region_service_api_v1 * api = nullptr;
+    struct resource_entry {
+        const void * program;
+        const void * session;
+        ggml_backend_t backend;
+        const void * shared_owner;
+        uint64_t device_bytes;
+        uint64_t pinned_bytes;
+        uint64_t shared_device_bytes;
+    };
+    std::mutex resource_mutex;
+    std::vector<resource_entry> resources;
+    uint32_t max_programs = 0;
+    uint64_t device_limit = 0;
+    uint64_t pinned_limit = 0;
+
+    static bool reserve_resources(void * opaque, const void * program, const void * session, ggml_backend_t backend, const void * shared_owner,
+                                  uint64_t device_bytes, uint64_t pinned_bytes, uint64_t shared_device_bytes) try {
+        auto * owner = static_cast<ggml_backend_sched_source_cpu *>(opaque);
+        if (!owner || !program || !session || !backend || (shared_device_bytes && !shared_owner)) { return false; }
+        std::lock_guard<std::mutex> lock(owner->resource_mutex);
+        if (!device_bytes && !pinned_bytes && !shared_device_bytes) {
+            auto retired = std::find_if(owner->resources.begin(), owner->resources.end(),
+                [&](const auto & entry) { return entry.session == session; });
+            if (retired != owner->resources.end()) {
+                if (retired->program != program || retired->backend != backend) { return false; }
+                owner->resources.erase(retired);
+            }
+            return true;
+        }
+        auto pending = owner->resources;
+        auto found = std::find_if(pending.begin(), pending.end(),
+            [&](const auto & entry) { return entry.session == session; });
+        if (found != pending.end()) {
+            if (found->program != program || found->backend != backend) { return false; }
+            pending.erase(found);
+        }
+        if (device_bytes || pinned_bytes || shared_device_bytes) {
+            pending.push_back({program, session, backend, shared_owner, device_bytes, pinned_bytes, shared_device_bytes});
+        }
+        struct program_usage {
+            const void * program;
+            uint64_t pinned_bytes = 0;
+            std::unordered_map<ggml_backend_dev_t, uint64_t> devices;
+        };
+        std::vector<program_usage> programs;
+        std::unordered_map<ggml_backend_dev_t, uint64_t> device_totals;
+        std::unordered_map<const void *, std::pair<ggml_backend_dev_t, uint64_t>> shared_totals;
+        uint64_t pinned_total = 0;
+        for (const auto & entry : pending) {
+            auto usage = std::find_if(programs.begin(), programs.end(),
+                [&](const auto & item) { return item.program == entry.program; });
+            if (usage == programs.end()) {
+                if (programs.size() >= owner->max_programs) { return false; }
+                programs.push_back({entry.program, 0, {}});
+                usage = programs.end() - 1;
+            }
+            const auto device = ggml_backend_get_device(entry.backend);
+            if (!device) { return false; }
+            auto & total = device_totals[device];
+            auto & program_device = usage->devices[device];
+            if (entry.device_bytes > UINT64_MAX - total || entry.pinned_bytes > UINT64_MAX - pinned_total ||
+                    entry.device_bytes > UINT64_MAX - program_device || entry.pinned_bytes > UINT64_MAX - usage->pinned_bytes) { return false; }
+            total += entry.device_bytes;
+            pinned_total += entry.pinned_bytes;
+            program_device += entry.device_bytes;
+            usage->pinned_bytes += entry.pinned_bytes;
+            if (entry.shared_device_bytes) {
+                auto & shared = shared_totals[entry.shared_owner];
+                if (shared.first && shared.first != device) { return false; }
+                shared.first = device;
+                shared.second = std::max(shared.second, entry.shared_device_bytes);
+            }
+        }
+        uint64_t pinned_largest = 0;
+        std::unordered_map<ggml_backend_dev_t, uint64_t> device_largest, device_shared;
+        for (const auto & usage : programs) {
+            pinned_largest = std::max(pinned_largest, usage.pinned_bytes);
+            for (const auto & item : usage.devices) { device_largest[item.first] = std::max(device_largest[item.first], item.second); }
+        }
+        if (!owner->max_programs || (!owner->pinned_limit && pinned_largest > UINT64_MAX / owner->max_programs)) { return false; }
+        const auto pinned_limit = owner->pinned_limit ? owner->pinned_limit : pinned_largest * owner->max_programs;
+        if (pinned_total > pinned_limit) { return false; }
+        for (const auto & item : shared_totals) {
+            auto & total = device_totals[item.second.first];
+            auto & shared = device_shared[item.second.first];
+            if (item.second.second > UINT64_MAX - total || item.second.second > UINT64_MAX - shared) { return false; }
+            total += item.second.second;
+            shared += item.second.second;
+        }
+        for (const auto & item : device_totals) {
+            uint64_t limit = owner->device_limit;
+            if (!limit) {
+                const auto largest = device_largest[item.first], shared = device_shared[item.first];
+                if (largest > (UINT64_MAX - shared) / owner->max_programs) { return false; }
+                limit = largest * owner->max_programs + shared;
+            }
+            if (item.second > limit) { return false; }
+        }
+        owner->resources.swap(pending);
+        return true;
+    } catch (...) { return false; }
 };
 
 struct ggml_backend_sched_hybrid {
@@ -1010,6 +1111,9 @@ struct ggml_backend_sched_hybrid {
         if (!cpu) {
             source_cpu = std::make_shared<ggml_backend_sched_source_cpu>();
             source_cpu->api = cpu_api;
+            source_cpu->max_programs = config.max_source_programs;
+            source_cpu->device_limit = config.device_bytes;
+            source_cpu->pinned_limit = config.pinned_bytes;
             ggml_backend_moe_cpu_service_config_v1 cpu_config = {};
             cpu_config.struct_size = sizeof(cpu_config); cpu_config.abi_version = 1;
             cpu_config.source_owner = &source_owner; cpu_config.n_threads = config.n_threads;
@@ -1018,6 +1122,10 @@ struct ggml_backend_sched_hybrid {
             const auto status = cpu_api->create(&cpu_config, &cpu);
             source_cpu->service = cpu;
             if (status) { return status; }
+        }
+        if (config.max_source_programs) {
+            config.resource_context = source_cpu.get();
+            config.reserve_resources = ggml_backend_sched_source_cpu::reserve_resources;
         }
         return device ? GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK : source_api->create(&config, &device);
     }
@@ -1313,12 +1421,19 @@ static int32_t ggml_backend_sched_moe_hybrid_create(
         if (source_core) {
             state->source_cpu = std::make_shared<ggml_backend_sched_source_cpu>();
             state->source_cpu->api = state->cpu_api;
+            state->source_cpu->max_programs = config->max_source_programs;
+            state->source_cpu->device_limit = config->device_bytes;
+            state->source_cpu->pinned_limit = config->pinned_bytes;
         }
         status = state->cpu_api->create(&cpu_config, &state->cpu);
         if (state->source_cpu) { state->source_cpu->service = state->cpu; }
     }
     if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
         return status;
+    }
+    if (source_core && config->max_source_programs) {
+        state->config.resource_context = state->source_cpu.get();
+        state->config.reserve_resources = ggml_backend_sched_source_cpu::reserve_resources;
     }
     status = source_core ? state->source_api->create(&state->config, &state->device) : state->device_api->create(config, &state->device);
     if (status != GGML_BACKEND_MOE_CPU_REGION_STATUS_V1_OK) {
@@ -1339,7 +1454,8 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
             config->source_owner->struct_size != sizeof(*config->source_owner) ||
             config->source_owner->abi_version != GGML_BACKEND_MOE_SOURCE_OWNER_V1_VERSION ||
             config->cpu_module_acquire == nullptr || config->module_retain == nullptr || config->module_release == nullptr ||
-            config->max_regions == 0 || config->max_prepared_regions < config->max_regions ||
+            config->max_regions == 0 || config->max_prepared_regions < config->max_regions || config->max_source_programs > 64 ||
+            (config->max_source_programs && (config->executor != GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY || !ggml_moe_fidelity_selection().source_pool)) ||
             config->admission_quota > config->gpu_miss_quota ||
             config->demand_admission > 1 || config->resident_batch > 1 ||
             config->executor > GGML_BACKEND_MOE_HYBRID_EXECUTOR_V1_FIDELITY ||
@@ -1396,7 +1512,7 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
             saved.gpu_miss_quota == config->gpu_miss_quota && saved.admission_quota == config->admission_quota &&
             saved.demand_admission == config->demand_admission &&
             saved.resident_batch == config->resident_batch && saved.profile_adaptation == config->profile_adaptation &&
-            saved.executor == config->executor &&
+            saved.executor == config->executor && saved.max_source_programs == config->max_source_programs &&
             profiles_match && statistics_match &&
             saved.cpu_bytes == config->cpu_bytes && saved.device_bytes == config->device_bytes &&
             saved.pinned_bytes == config->pinned_bytes && owner.owner == config->source_owner->owner &&
@@ -1410,7 +1526,9 @@ static int32_t ggml_backend_sched_moe_hybrid_configure_impl_v1(
         if (existing) { return existing->ensure_source(shared); }
     }
     std::unique_ptr<ggml_backend_sched_hybrid> state;
-    const auto status = ggml_backend_sched_moe_hybrid_create(config, shared, state);
+    auto scoped_config = *config;
+    scoped_config.resource_program = sched;
+    const auto status = ggml_backend_sched_moe_hybrid_create(&scoped_config, shared, state);
     if (status) { return status; }
     sched->hybrids[backend_id] = state.release();
     if (!sched->hybrid) { sched->hybrid = sched->hybrids[backend_id]; }
@@ -1436,6 +1554,7 @@ int32_t ggml_backend_sched_moe_source_clone_v1(ggml_backend_sched_t sched, ggml_
         ggml_backend_sched_free(clone);
         return GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED;
     }
+    ggml_backend_sched_set_copy_callback(clone, sched->callback_copy, sched->callback_copy_user_data);
     for (int i = 0; i < sched->n_backends; ++i) {
         const auto * entry = sched->hybrids[i];
         if (!entry) { continue; }
@@ -3368,6 +3487,10 @@ void ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched) {
     ggml_gallocr_request_shrink(sched->galloc);
 }
 
+bool ggml_backend_sched_refresh_resizable_plan(ggml_backend_sched_t sched) {
+    return sched && ggml_gallocr_refresh_resizable_plan(sched->galloc);
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; ++i) {
@@ -3422,8 +3545,11 @@ int32_t ggml_backend_sched_moe_source_retire_v1(ggml_backend_sched_t sched) {
 
 static bool ggml_backend_sched_retire_buffer_bindings(void * user_data) {
     auto * sched = static_cast<ggml_backend_sched_t>(user_data);
-    return !ggml_backend_sched_moe_source_selected_v1(sched) ||
-        ggml_backend_sched_moe_source_retire_v1(sched) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    if (ggml_backend_sched_moe_source_selected_v1(sched)) {
+        return ggml_backend_sched_moe_source_retire_v1(sched) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK;
+    }
+    ggml_backend_sched_synchronize(sched);
+    return true;
 }
 
 int32_t ggml_backend_sched_moe_source_reset_v1(ggml_backend_sched_t sched) {

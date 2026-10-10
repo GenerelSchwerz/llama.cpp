@@ -57,6 +57,8 @@ GGML_API bool           ggml_gallocr_set_resizable(ggml_gallocr_t galloc, ggml_g
 GGML_API bool           ggml_gallocr_share_resizable_plan(ggml_gallocr_t galloc, ggml_gallocr_t peer);
 GGML_API void           ggml_gallocr_get_resizable_state(ggml_gallocr_t galloc, uint64_t * generation, uint64_t * shrink_generation);
 GGML_API void           ggml_gallocr_request_shrink(ggml_gallocr_t galloc);
+// Publish retained plan requirements without rebuilding a graph. Replacement still invokes retirement callbacks.
+GGML_API bool           ggml_gallocr_refresh_resizable_plan(ggml_gallocr_t galloc);
 
 // Called before existing backing is replaced. False keeps backing and generations unchanged.
 // Do not allocate, reset or free any allocator that shares this backing in the callback.

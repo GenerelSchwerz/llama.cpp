@@ -1,0 +1,31 @@
+# Reuse the existing reader index for closure checks
+
+## Evidence and current candidate
+
+Unchanged frozen222 CPU diagnostic267 passes two uncached2049-input/64-output requests with exact control output IDs, source routing, main CPU-off and whole-cgroup teardown. CPU-only266 first qualifies bounded own-child attachment and offline DWARF stack extraction.267 samples only the owned server with user cpu-clock at199Hz, uses CLOCK_MONOTONIC, and filters the two saved client first-token windows. Profiled throughput is not an unprofiled speed comparison. Active CPU samples exclude blocked and kernel time; sums across threads and inclusive stacks are not additive wall-time savings.
+
+The public ggml_moe_source_program::closed_cut accounts for approximately100.50ms cold and80.40ms repeated sampled user CPU in these windows. The windows also include the one-row prompt tail and possible following decode submission; their CPU workers must not be attributed to main all-GPU prefill. The saved CUDA212 trace has no CPU sampling/callchain/OSRT tables, so267 provides new function evidence rather than reinterpreting those missing records.
+
+The public closure method rescans every original tensor for every nonretained cut value, reading src and view_src to discover consumers. The same program already constructs readers from every recursively collected original tensor at preparation, including all src and view_src edges with duplicate consumer elimination. Its existing impl::closed_cut performs the same clone-identity, retained-value, exported-output and external-reader checks using that index. build_prefill_body already uses this indexed method.
+
+The localized candidate delegates the public method to that existing implementation after preserving all argument checks. It removes duplicated graph-wide work. There is no new index, allocation, owner, executor, sampler contract, graph cache, kernel or arithmetic. The immutable prepared graph remains protected by existing program witnesses and matches checks before compute. A changed original graph must invalidate its prepared program, as before. No public API changes.
+
+## Qualification
+
+268 is queued/running with plainj18 and the original10 commands under the ordered build/GPU locks and finite guarded teardown. Existing program cases cover foreign and misaligned clones, retained values and exported roots; direct/view-reader and skew-tail numerical cases remain required. The source is experimental until these gates and a matched frozen candidate/control comparison finish. No performance gain is claimed yet. Broader allocator/sampler graph reuse remains a distinct design question.
+
+External evidence: /home/gencoolpc/moe-cache-tests/results/generic-prefill-gap-20261009/cpu-prefill-attribution-267/ANALYSIS.json and indexed-cut-build-tests-268. The rejected body-completion experiment remains in DEFERRED-BODY-ABBA-REPORT.json; it is not part of this candidate.
+
+## Qualification complete; throughput comparison running
+
+268 passes the original10 gates and224 numerical replays at unchanged maximum relative MSE1.60269249e-7.271 additionally passes1700 differential closure cases over both overlap graph layouts and source/view readers. Public find intentionally hides omitted expert internals: the independent scan still includes those reader edges while selecting exposed values as cuts.269 initially ran body-program rather than the actual overlap fixture;270 stopped at that setup assumption before comparisons. Both records are preserved.271 corrects setup without changing production delegation or relaxing closure rejection.
+
+Frozen272 source14/binary10 matches the qualified mutable tree. Relative to222, only the production ggml-moe-source-program.cpp function and test file differ; only libggml-base.so and test-moe-cache binary hashes differ. All CUDA/server arithmetic binaries are identical. Matched unprofiled ABBA273-276 runs two uncached2049-input/64-output requests per process with noMTP, main CPU-off and identical profile/adaptation/resources. No speed claim is available until every arm, exact output, routed work, residency/resource and whole-tree gate is inspected.
+
+## Matched serving result273-276
+
+All four processes are terminal/passed/tree-empty; all eight64-ID output sequences match exactly. Both candidate repeated rates1522.48/1522.31 exceed both controls1436.66/1449.12. Means are1442.887 ->1522.394 tok/s (+5.510%) and client first-token1.423291 ->1.348958s. Cold1054.745 ->1080.659 tok/s (+2.46%) is variable and does not establish a cold-speed qualification. Repeated decode58.619 ->59.034 tok/s is observational. Final per-instance counters show repeated main preparation64.94 ->41.59ms, while main replay1086.81 ->1087.39ms remains essentially unchanged. Do not use the zero replay timer printed inside the first main-prefill summary before its enclosing timer ends.
+
+The first three arms273/274/275 have identical reported source work, body work, fixed workspace and12363MiB sampled peak. Last candidate276 has942 more selected routes,15744000 more paid bytes (about0.061%), three more waves, five fewer chunks and2MiB higher sampled peak. Fixed workspace/pool capacities and all arithmetic binaries remain equal. Preserve this adaptive variation; do not call all four exact-work/equal-resource or universal no-regression qualification. The independent CPU hotspot, asymptotic source simplification, strict numerical/reader qualification and bounded repeated serving gain support retaining this small change. The1700 target and full specialized parity remain open. No commit/push/default promotion. INDEXED-CUT-ABBA-REPORT.json contains all counters and limitations.
+
+Next measured metadata candidate: build_plan accounts for about45ms repeated leaf CPU samples in267, and main compact_plan counters in earlier traces are about44ms. Its first-seen route loop linearly searches distinct experts for every route. Investigate a bounded per-expert lookup using existing prefill workspace, preserving first-seen order, slot/owner checks, route multiplicities, selection policy and CPU-enabled behavior. No implementation yet; keep this separate from the qualified closure change. Avoid a new allocation or policy owner.
