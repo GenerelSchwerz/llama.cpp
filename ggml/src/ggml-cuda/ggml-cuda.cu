@@ -3028,7 +3028,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          check_leaf_inputs = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3061,7 +3062,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || (!check_leaf_inputs && src->op == GGML_OP_NONE) || src == logits_may_alias) {
                     continue;
                 }
 
@@ -3294,6 +3295,44 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     match.weights      = weights;
     match.dst          = cgraph->nodes[output_idx];
     match.node_count   = node_count;
+    return true;
+}
+
+
+struct ggml_cuda_rms_norm_gated_match {
+    ggml_tensor * norm;
+    ggml_tensor * mul;
+    ggml_tensor * gate;
+    ggml_tensor * dst;
+    int node_count;
+    ggml_unary_op gate_op;
+};
+
+static bool ggml_cuda_match_rms_norm_gated(const ggml_cgraph * cgraph, int i, ggml_cuda_rms_norm_gated_match & match) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+        return false;
+    }
+    ggml_tensor * norm  = cgraph->nodes[i];
+    ggml_tensor * mul   = cgraph->nodes[i + 1];
+    ggml_tensor * unary = cgraph->nodes[i + 2];
+    ggml_tensor * dst   = cgraph->nodes[i + 3];
+    const ggml_unary_op gate_op = ggml_get_unary_op(unary);
+    if ((gate_op != GGML_UNARY_OP_SILU && gate_op != GGML_UNARY_OP_SIGMOID) || norm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            norm->src[0]->type != GGML_TYPE_F32 || unary->src[0]->type != GGML_TYPE_F32 ||
+            norm->view_src || mul->view_src || !ggml_is_contiguous_rows(norm->src[0]) ||
+            !ggml_is_contiguous_rows(unary->src[0]) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(norm, mul) || !ggml_are_same_shape(norm, unary) || !ggml_are_same_shape(norm, dst) ||
+            !((dst->src[0] == mul && dst->src[1] == unary) || (dst->src[0] == unary && dst->src[1] == mul))) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+    ggml_tensor * gate = unary->src[0];
+    if (!weight || weight == norm || weight->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(weight) ||
+            gate == norm || gate == mul || gate->view_src == norm || gate->view_src == mul) {
+        return false;
+    }
+    match = { norm, mul, gate, dst, 4, gate_op };
     return true;
 }
 
@@ -4059,7 +4098,32 @@ static bool ggml_cuda_hc_pre_emit_ok(const ggml_tensor * dst, int device) {
     return true;
 }
 
+static bool ggml_cuda_match_rms_gate_emit(ggml_cgraph * graph, int i, int device, ggml_cuda_rms_norm_gated_match & match) {
+    if (!ggml_cuda_match_rms_norm_gated(graph, i, match) || !(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return false; }
+    const int output = i + match.node_count - 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, i, match.node_count, &output, 1, false, true)) { return false; }
+    const ggml_tensor * x = match.norm->src[0];
+    const ggml_tensor * weight = match.mul->src[match.mul->src[0] == match.norm ? 1 : 0];
+    uintptr_t begin, end;
+    if (!ggml_are_same_shape(x, match.norm) || !ggml_are_same_shape(match.norm, match.dst) ||
+            !ggml_cuda_prepared_range(match.dst, device, begin, end) || begin % sizeof(float) ||
+            (end - begin)/sizeof(float) > INT_MAX || x->ne[2] > 65535 || x->ne[3] > 65535) { return false; }
+    const ggml_tensor * reads[] = {x, weight, match.gate};
+    for (const ggml_tensor * read : reads) {
+        uintptr_t rb, re;
+        if (!ggml_cuda_prepared_range(read, device, rb, re) || rb % sizeof(float) ||
+                (re - rb)/sizeof(float) > INT_MAX || (begin < re && rb < end)) { return false; }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (read->ne[d] <= 0 || read->ne[d] > INT_MAX || read->nb[d] % sizeof(float) || read->nb[d]/sizeof(float) > INT64_MAX) { return false; }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_norm_emit_match {
+    ggml_tensor * gate = nullptr;
+    ggml_unary_op gate_op = GGML_UNARY_OP_COUNT;
     ggml_tensor * hc_pre = nullptr;
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
@@ -4092,6 +4156,16 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
             ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     ggml_cuda_norm_emit_match match;
+    ggml_cuda_rms_norm_gated_match gated;
+    if (ggml_cuda_match_rms_gate_emit(graph, i, device, gated)) {
+        match.norm = gated.norm;
+        match.mul = gated.mul;
+        match.dst = gated.dst;
+        match.gate = gated.gate;
+        match.gate_op = gated.gate_op;
+        match.last = i + gated.node_count - 1;
+        return match;
+    }
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -4222,6 +4296,8 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
 }
 
 struct ggml_cuda_norm_q8_match {
+    ggml_tensor * gate = nullptr;
+    ggml_unary_op gate_op = GGML_UNARY_OP_COUNT;
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
@@ -4252,6 +4328,17 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
             ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
     ggml_cuda_norm_q8_match match;
+    ggml_cuda_rms_norm_gated_match gated;
+    if (ggml_cuda_match_rms_gate_emit(graph, i, device, gated)) {
+        if (norm->ne[0] % QK8_1) { return {}; }
+        match.norm = gated.norm;
+        match.mul = gated.mul;
+        match.dst = gated.dst;
+        match.gate = gated.gate;
+        match.gate_op = gated.gate_op;
+        match.last = i + gated.node_count - 1;
+        return match;
+    }
     match.norm = match.dst = norm;
     match.last = i;
     if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
@@ -6130,6 +6217,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_rms_norm_gated_match match;
+        if (ggml_cuda_match_rms_norm_gated(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1, false, true)) {
+                ggml_cuda_op_rms_norm_gated(*cuda_ctx, match.norm, match.mul, match.gate, match.dst, match.gate_op);
+                return match.node_count - 1;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -7372,6 +7470,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary,
                         affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data, affine_injection.hc.scale);
                 };
+                const auto * gate_typed = !norm_emits.empty() && norm_emits[i].gate ? &norm_emits[i] : nullptr;
+                const auto * gate_q8 = !q8_emits.empty() && q8_emits[i].gate ? &q8_emits[i] : nullptr;
+                if (gate_typed || gate_q8) {
+                    ggml_tensor * norm = gate_typed ? gate_typed->norm : gate_q8->norm;
+                    ggml_tensor * mul = gate_typed ? gate_typed->mul : gate_q8->mul;
+                    ggml_tensor * gate = gate_typed ? gate_typed->gate : gate_q8->gate;
+                    ggml_tensor * dst = gate_typed ? gate_typed->dst : gate_q8->dst;
+                    const auto gate_op = gate_typed ? gate_typed->gate_op : gate_q8->gate_op;
+                    const int last = gate_typed ? gate_typed->last : gate_q8->last;
+                    GGML_ASSERT(!gate_q8 || (gate_q8->norm == norm && gate_q8->mul == mul && gate_q8->gate == gate &&
+                        gate_q8->dst == dst && gate_q8->gate_op == gate_op && gate_q8->last == last));
+                    ggml_cuda_rms_gate_images images;
+                    const auto typed_image = [&](int g) -> void * {
+                        if (g < 0) { return nullptr; }
+                        shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
+                        return shared_inputs[g].get();
+                    };
+                    if (gate_typed) {
+                        images.f16 = typed_image(gate_typed->f16);
+                        images.bf16 = typed_image(gate_typed->bf16);
+                    }
+                    if (gate_q8) {
+                        const int g = gate_q8->image;
+                        const int reader = q8_reuse.groups[g].node;
+                        const ggml_tensor * input = cgraph->nodes[reader]->src[1];
+                        q8_inputs[g].alloc(mmvq_sizes[reader]);
+                        images.q8 = q8_inputs[g].get();
+                        images.cols = input->ne[0];
+                        images.padded = GGML_PAD(input->ne[0], MATRIX_ROW_PADDING);
+                    }
+                    ggml_cuda_op_rms_norm_gated(*cuda_ctx, norm, mul, gate, dst, gate_op, &images);
+                    i = last;
+                    continue;
+                }
                 if (!norm_emits.empty() && norm_emits[i].hc_pre) {
                     ggml_cuda_hc_pre_emit_data images;
                     const auto typed_image = [&](int g) -> void * {
@@ -7962,6 +8094,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 i += shared.reduction.node_count - 1;
                 continue;
             }
+            ggml_cuda_rms_norm_gated_match norm_match;
+            if (ggml_cuda_match_rms_norm_gated(cgraph, i, norm_match)) {
+                add_alloc_deps(i, i + norm_match.node_count - 1);
+                i += norm_match.node_count - 1;
+                continue;
+            }
+
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

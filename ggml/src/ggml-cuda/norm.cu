@@ -340,6 +340,12 @@ struct ggml_cuda_norm_load {
     __device__ __forceinline__ float operator()(const float * x, int col) const { return x[col]; }
 };
 
+template <ggml_unary_op Gate, typename Write> struct ggml_cuda_rms_gate_store;
+
+template <typename Write> struct ggml_cuda_norm_has_gate : std::false_type {};
+template <ggml_unary_op Gate, typename Write>
+struct ggml_cuda_norm_has_gate<ggml_cuda_rms_gate_store<Gate, Write>> : std::true_type {};
+
 template <int block_size, bool do_multiply, bool do_add, bool do_scale, typename Write, typename Read = ggml_cuda_norm_load>
 static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
                                     float *       dst,
@@ -473,7 +479,12 @@ static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
         }
     } else {
     for (int col = tid; col < ncols; col += block_size) {
-        if constexpr (do_multiply && do_add) {
+        if constexpr (ggml_cuda_norm_has_gate<Write>::value) {
+            static_assert(do_multiply && !do_add && !do_scale);
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const float gate = write.activation(col);
+            write.write(dst, dst_base, col, (scale * x[col] * mul[mul_col]) * gate);
+        } else if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
             write(dst, dst_base, col, scale * x[col] * mul[mul_col] + add[add_col]);
@@ -2799,4 +2810,93 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         ? (comb ? (mul ? hc_affine_injection_norm_kernel<256, true, true>(layout) : hc_affine_injection_norm_kernel<256, true, false>(layout)) : (mul ? hc_affine_injection_norm_kernel<256, false, true>(layout) : hc_affine_injection_norm_kernel<256, false, false>(layout)))
         : (comb ? (mul ? hc_affine_injection_norm_kernel<1024, true, true>(layout) : hc_affine_injection_norm_kernel<1024, true, false>(layout)) : (mul ? hc_affine_injection_norm_kernel<1024, false, true>(layout) : hc_affine_injection_norm_kernel<1024, false, false>(layout)));
     ggml_cuda_kernel_launch(kernel, launch, a, g);
+}
+
+struct ggml_cuda_rms_gate_data {
+    const float * x;
+    const float * weight;
+    const float * gate;
+    float * dst;
+    int cols;
+    int64_t x_stride[3];
+    int64_t weight_stride[3];
+    int64_t gate_stride[3];
+    uint3 weight_ne[4];
+    float eps;
+};
+
+template <ggml_unary_op Gate, typename Write>
+struct ggml_cuda_rms_gate_store {
+    static constexpr int width = Write::width;
+    Write write;
+    const float * gate;
+
+    __device__ __forceinline__ float activation(int col) const {
+        if constexpr (Gate == GGML_UNARY_OP_SILU) {
+            return ggml_cuda_op_silu_single(gate[col]);
+        } else {
+            static_assert(Gate == GGML_UNARY_OP_SIGMOID, "unsupported RMS gate");
+            return 1.0f / (1.0f + expf(-gate[col]));
+        }
+    }
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float value) const {
+        write(dst, base, col, value * activation(col));
+    }
+};
+
+template <int Block, ggml_unary_op Gate, typename Write>
+static __global__ void rms_norm_gated_f32(ggml_cuda_rms_gate_data a, Write write) {
+    const float * gate = a.gate + blockIdx.x*a.gate_stride[0] + blockIdx.y*a.gate_stride[1] + blockIdx.z*a.gate_stride[2];
+    rms_norm_f32_impl<Block, true, false, false>(a.x, a.dst, a.cols,
+        a.x_stride[0], a.x_stride[1], a.x_stride[2], a.eps, ggml_cuda_rms_gate_store<Gate, Write>{write, gate},
+        a.weight, a.weight_stride[0], a.weight_stride[1], a.weight_stride[2],
+        a.weight_ne[0], a.weight_ne[1], a.weight_ne[2], a.weight_ne[3]);
+}
+
+template <int Block, ggml_unary_op Gate>
+static void ggml_cuda_rms_gate_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_rms_gate_data & a,
+        dim3 grid, const ggml_cuda_rms_gate_images * images) {
+    const ggml_cuda_kernel_launch_params params(grid, dim3(Block), 32*sizeof(float), ctx.stream());
+    if (images && images->q8) {
+        const ggml_cuda_norm_emit_q8_store write{(block_q8_1 *) images->q8, init_fastdiv_values(images->cols), images->padded,
+            (half *) images->f16, (nv_bfloat16 *) images->bf16};
+        ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, ggml_cuda_norm_emit_q8_store>, params, a, write);
+    } else if (images && (images->f16 || images->bf16)) {
+        const ggml_cuda_norm_emit_store write{(half *) images->f16, (nv_bfloat16 *) images->bf16};
+        ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, ggml_cuda_norm_emit_store>, params, a, write);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_gated_f32<Block, Gate, ggml_cuda_norm_store>, params, a, ggml_cuda_norm_store{});
+    }
+}
+
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul,
+        ggml_tensor * gate, ggml_tensor * dst, ggml_unary_op gate_op, const ggml_cuda_rms_gate_images * images) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * weight = mul->src[mul->src[0] == norm ? 1 : 0];
+    ggml_cuda_rms_gate_data a{};
+    a.x = (const float *) x->data;
+    a.weight = (const float *) weight->data;
+    a.gate = (const float *) gate->data;
+    a.dst = (float *) dst->data;
+    a.cols = int(x->ne[0]);
+    a.eps = ggml_get_op_params_f32(norm, 0);
+    GGML_ASSERT(a.eps >= 0.0f && x->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    for (int d = 0; d < 3; ++d) {
+        a.x_stride[d] = x->nb[d + 1]/sizeof(float);
+        a.weight_stride[d] = weight->nb[d + 1]/sizeof(float);
+        a.gate_stride[d] = gate->nb[d + 1]/sizeof(float);
+    }
+    for (int d = 0; d < 4; ++d) { a.weight_ne[d] = init_fastdiv_values(weight->ne[d]); }
+    const dim3 grid(x->ne[1], x->ne[2], x->ne[3]);
+    if (gate_op == GGML_UNARY_OP_SIGMOID) {
+        if (images && (images->q8 || images->f16 || images->bf16) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
+        else if (a.cols < 1024) { ggml_cuda_rms_gate_launch<256, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
+        else { ggml_cuda_rms_gate_launch<1024, GGML_UNARY_OP_SIGMOID>(ctx, a, grid, images); }
+    } else {
+        GGML_ASSERT(gate_op == GGML_UNARY_OP_SILU);
+        if (images && (images->q8 || images->f16 || images->bf16) && a.cols <= 128) { ggml_cuda_rms_gate_launch<128, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
+        else if (a.cols < 1024) { ggml_cuda_rms_gate_launch<256, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
+        else { ggml_cuda_rms_gate_launch<1024, GGML_UNARY_OP_SILU>(ctx, a, grid, images); }
+    }
 }

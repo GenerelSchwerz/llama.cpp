@@ -64,3 +64,14 @@ struct ggml_cuda_hc_affine_emit_data {
 };
 
 void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr, ggml_tensor * scale = nullptr);
+
+struct ggml_cuda_rms_gate_images {
+    void * f16 = nullptr;
+    void * bf16 = nullptr;
+    void * q8 = nullptr;
+    int64_t cols = 1;
+    int64_t padded = 0;
+};
+
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul,
+        ggml_tensor * gate, ggml_tensor * dst, ggml_unary_op gate_op, const ggml_cuda_rms_gate_images * images = nullptr);
