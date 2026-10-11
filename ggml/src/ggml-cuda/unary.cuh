@@ -93,6 +93,17 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add);
+void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale, const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products);
+void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add);
+
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1);
+
+constexpr int GGML_CUDA_ORDERED_MUL_ADD_MAX = 128;
+void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count);
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post, ggml_tensor * tail = nullptr);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
@@ -121,3 +132,23 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last);
+
+struct ggml_cuda_scaled_unary_args {
+    const ggml_tensor * first;
+    const ggml_tensor * unary;
+    const ggml_tensor * last;
+};
+
+void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args);
+
+struct ggml_cuda_affine_unary_ops {
+    ggml_tensor * mul;
+    ggml_tensor * add;
+    ggml_tensor * unary;
+    ggml_tensor * post;
+    ggml_tensor * tail = nullptr;
+};
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops);
