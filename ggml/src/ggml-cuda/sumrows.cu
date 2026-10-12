@@ -51,3 +51,107 @@ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_kernel_launch(reduce_rows_f32_strided</*norm=*/false>, launch_params, src0_d_bytes, dst_d, ncols,
             src0->ne[1], src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3]);
 }
+
+struct mul_sum_rows_args {
+    const char * x;
+    const char * y;
+    float * dst;
+    uint3 ne1, ne2, yne[4];
+    int64_t xnb[3], ynb[3];
+    int ncols;
+};
+
+template <bool multiply>
+static __device__ __forceinline__ void mul_sum_rows_readers(const mul_sum_rows_args & args, const float * & x, const float * & y) {
+    const uint32_t row = blockIdx.x;
+    const uint2 row12 = fast_div_modulo(row, args.ne1);
+    const uint2 row23 = fast_div_modulo(row12.x, args.ne2);
+    const uint32_t i1 = row12.y;
+    const uint32_t i2 = row23.y;
+    const uint32_t i3 = row23.x;
+    x = (const float *) (args.x + i1 * args.xnb[0] + i2 * args.xnb[1] + i3 * args.xnb[2]);
+    if constexpr (multiply) {
+        y = (const float *) (args.y + fastmodulo(i1, args.yne[1]) * args.ynb[0] +
+                fastmodulo(i2, args.yne[2]) * args.ynb[1] + fastmodulo(i3, args.yne[3]) * args.ynb[2]);
+    } else {
+        y = nullptr;
+    }
+}
+
+static mul_sum_rows_args mul_sum_rows_get_args(const ggml_tensor * x, const ggml_tensor * y, ggml_tensor * dst) {
+    mul_sum_rows_args args{};
+    args.x = (const char *) x->data;
+    args.y = y ? (const char *) y->data : nullptr;
+    args.dst = (float *) dst->data;
+    args.ne1 = init_fastdiv_values(x->ne[1]);
+    args.ne2 = init_fastdiv_values(x->ne[2]);
+    args.ncols = x->ne[0];
+    for (int i = 0; i < 3; ++i) {
+        args.xnb[i] = x->nb[i + 1];
+        args.ynb[i] = y ? y->nb[i + 1] : 0;
+    }
+    for (int i = 0; i < 4; ++i) {
+        args.yne[i] = init_fastdiv_values(y ? y->ne[i] : 1);
+    }
+    return args;
+}
+
+struct row_gate_args {
+    mul_sum_rows_args reduction;
+    float * post[7];
+    int kind[7];
+    float scale, bias, low, high;
+};
+
+template <bool multiply, bool broadcast>
+static __global__ void row_gate_f32(row_gate_args args) {
+    ggml_cuda_pdl_lc();
+    const uint32_t row = blockIdx.x;
+    const float * x, * y;
+    mul_sum_rows_readers<multiply>(args.reduction, x, y);
+    const float sum = reduce_row_f32<multiply, broadcast>(x, args.reduction.ncols, y, args.reduction.yne[0]);
+    if (threadIdx.x != 0) {
+        return;
+    }
+    args.reduction.dst[row] = sum;
+    float values[7];
+    values[0] = __fmaf_rn(args.scale, sum, args.bias);
+    values[1] = values[0] > 0.0f ? 1.0f : values[0] < 0.0f ? -1.0f : 0.0f;
+    values[2] = fabsf(values[0]);
+    values[3] = fminf(fmaxf(values[2], args.low), args.high);
+    values[4] = sqrtf(values[3]);
+    values[5] = __fmul_rn(values[1], values[4]);
+    values[6] = 1.0f / (1.0f + expf(-values[5]));
+    for (int j = 0; j < 7; ++j) {
+        args.post[j][row] = values[args.kind[j]];
+    }
+}
+
+void ggml_cuda_op_row_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, ggml_tensor * sum, ggml_tensor * const * post, const int * kind) {
+    const ggml_tensor * x = mul ? mul->src[0] : sum->src[0];
+    const ggml_tensor * y = mul ? mul->src[1] : nullptr;
+    row_gate_args args{};
+    args.reduction = mul_sum_rows_get_args(x, y, sum);
+    memcpy(&args.scale, post[0]->op_params, sizeof(float));
+    memcpy(&args.bias, (const char *) post[0]->op_params + sizeof(float), sizeof(float));
+    for (int j = 0; j < 7; ++j) {
+        args.post[j] = (float *) post[j]->data;
+        args.kind[j] = kind[j];
+        if (kind[j] == 3) {
+            memcpy(&args.low, post[j]->op_params, sizeof(float));
+            memcpy(&args.high, (const char *) post[j]->op_params + sizeof(float), sizeof(float));
+        }
+    }
+    const int nrows = ggml_nrows(sum);
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const dim3 blocks(nrows, 1, 1);
+    const dim3 threads(nrows / nsm < 2 ? 512 : args.reduction.ncols < 1024 ? 32 : 128, 1, 1);
+    const ggml_cuda_kernel_launch_params params(blocks, threads, 0, ctx.stream());
+    if (!mul) {
+        ggml_cuda_kernel_launch(row_gate_f32<false, false>, params, args);
+    } else if (y->ne[0] == x->ne[0]) {
+        ggml_cuda_kernel_launch(row_gate_f32<true, false>, params, args);
+    } else {
+        ggml_cuda_kernel_launch(row_gate_f32<true, true>, params, args);
+    }
+}

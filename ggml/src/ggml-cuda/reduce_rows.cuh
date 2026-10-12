@@ -1,6 +1,7 @@
 #include "common.cuh"
 
-static __device__ __forceinline__ float reduce_row_f32(const float * x, const int ncols) {
+template <bool multiply = false, bool broadcast = false>
+static __device__ __forceinline__ float reduce_row_f32(const float * x, const int ncols, const float * y = nullptr, const uint3 y_ncols = {}) {
     const int col = threadIdx.x;
 
     float     sum        = 0.0f;
@@ -12,7 +13,11 @@ static __device__ __forceinline__ float reduce_row_f32(const float * x, const in
     for (int i = col; i < ncols;) {
         for (int j = 0; j < num_unroll; ++j) {
             if (i < ncols) {
-                temp[j] = x[i];
+                if constexpr (multiply) {
+                    temp[j] = __fmul_rn(x[i], y[broadcast ? fastmodulo(i, y_ncols) : i]);
+                } else {
+                    temp[j] = x[i];
+                }
             } else {
                 temp[j] = 0;
             }

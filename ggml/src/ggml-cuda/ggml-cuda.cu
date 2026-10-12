@@ -3179,6 +3179,155 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+static bool ggml_cuda_match_mul_sum_rows(const ggml_cgraph * graph, int i, bool allocated) {
+    if (i + 1 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_MUL || graph->nodes[i + 1]->op != GGML_OP_SUM_ROWS) {
+        return false;
+    }
+    const ggml_tensor * mul = graph->nodes[i];
+    const ggml_tensor * dst = graph->nodes[i + 1];
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * y = mul->src[1];
+    if (!x || !y || mul->view_src || dst->src[0] != mul || x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || y->nb[0] != sizeof(float) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(x, mul) || x->ne[0] <= 0 || x->ne[0] > INT_MAX ||
+            ggml_nrows(mul) <= 0 || ggml_nrows(mul) > INT_MAX || !ggml_can_repeat(y, x) ||
+            !ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL, GGML_OP_SUM_ROWS }, { i + 1 })) {
+        return false;
+    }
+    for (int j = 1; j < GGML_MAX_DIMS; ++j) {
+        if (x->nb[j] % sizeof(float) || y->nb[j] % sizeof(float)) {
+            return false;
+        }
+    }
+    if (!allocated) {
+        return true;
+    }
+    const uintptr_t out = (uintptr_t) dst->data;
+    const size_t out_size = ggml_nbytes(dst);
+    if (!out || out % sizeof(float) || out_size > UINTPTR_MAX - out) {
+        return false;
+    }
+    for (const ggml_tensor * input : { x, y }) {
+        const uintptr_t begin = (uintptr_t) input->data;
+        const size_t size = ggml_nbytes(input);
+        if (!begin || begin % sizeof(float) || size > UINTPTR_MAX - begin || (out < begin + size && begin < out + out_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ggml_cuda_row_gate_match {
+    ggml_tensor * mul;
+    ggml_tensor * sum;
+    ggml_tensor * post[7];
+    int kind[7];
+    int count;
+};
+
+static bool ggml_cuda_match_row_gate(const ggml_cgraph * graph, int i, bool allocated, ggml_cuda_row_gate_match & match) {
+    match = {};
+    int sum_idx = i;
+    if (graph->nodes[i]->op == GGML_OP_MUL) {
+        if (!ggml_cuda_match_mul_sum_rows(graph, i, allocated)) {
+            return false;
+        }
+        match.mul = graph->nodes[i];
+        ++sum_idx;
+    } else if (graph->nodes[i]->op != GGML_OP_SUM_ROWS) {
+        return false;
+    }
+    if (sum_idx + 7 >= graph->n_nodes) {
+        return false;
+    }
+    match.sum = graph->nodes[sum_idx];
+    const ggml_tensor * x = match.mul ? match.mul->src[0] : match.sum->src[0];
+    const ggml_tensor * y = match.mul ? match.mul->src[1] : nullptr;
+    if (!x || match.sum->view_src || x->type != GGML_TYPE_F32 || match.sum->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || !ggml_is_contiguous(match.sum) || match.sum->ne[0] != 1 ||
+            x->ne[0] <= 0 || x->ne[0] > INT_MAX || ggml_nrows(x) <= 0 || ggml_nrows(x) > INT_MAX ||
+            ggml_nrows(x) != ggml_nrows(match.sum)) {
+        return false;
+    }
+    for (int j = 1; j < GGML_MAX_DIMS; ++j) {
+        if (x->nb[j] % sizeof(float)) {
+            return false;
+        }
+    }
+    ggml_tensor * by_kind[7] = {};
+    for (int j = 0; j < 7; ++j) {
+        ggml_tensor * node = graph->nodes[sum_idx + j + 1];
+        match.post[j] = node;
+        if (node->view_src || node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || !ggml_are_same_shape(node, match.sum)) {
+            return false;
+        }
+        int kind = -1;
+        if (j == 0 && node->op == GGML_OP_SCALE && node->src[0] == match.sum) { kind = 0; }
+        if (j > 0 && j < 5) {
+            if (node->op == GGML_OP_CLAMP) { kind = 3; }
+            if (node->op == GGML_OP_SQRT) { kind = 4; }
+            if (node->op == GGML_OP_UNARY) {
+                switch (ggml_get_unary_op(node)) {
+                    case GGML_UNARY_OP_SGN: kind = 1; break;
+                    case GGML_UNARY_OP_ABS: kind = 2; break;
+                    default: return false;
+                }
+            }
+        }
+        if (j == 5 && node->op == GGML_OP_MUL) { kind = 5; }
+        if (j == 6 && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) { kind = 6; }
+        if (kind < 0 || by_kind[kind]) {
+            return false;
+        }
+        by_kind[kind] = node;
+        match.kind[j] = kind;
+    }
+    if (by_kind[1]->src[0] != by_kind[0] || by_kind[2]->src[0] != by_kind[0] ||
+            by_kind[3]->src[0] != by_kind[2] || by_kind[4]->src[0] != by_kind[3] ||
+            !((by_kind[5]->src[0] == by_kind[1] && by_kind[5]->src[1] == by_kind[4]) ||
+              (by_kind[5]->src[1] == by_kind[1] && by_kind[5]->src[0] == by_kind[4])) ||
+            by_kind[6]->src[0] != by_kind[5]) {
+        return false;
+    }
+    match.count = sum_idx + 8 - i;
+    ggml_op ops[9];
+    int outputs[8];
+    for (int j = 0; j < match.count; ++j) { ops[j] = graph->nodes[i + j]->op; }
+    for (int j = 0; j < 8; ++j) { outputs[j] = sum_idx + j; }
+    if (!ggml_can_fuse_subgraph(graph, i, match.count, ops, outputs, 8)) {
+        return false;
+    }
+    if (!allocated) {
+        return true;
+    }
+    for (int j = 0; j < 8; ++j) {
+        const ggml_tensor * dst = graph->nodes[outputs[j]];
+        const uintptr_t out = (uintptr_t) dst->data;
+        const size_t out_size = ggml_nbytes(dst);
+        if (!out || out % sizeof(float) || out_size > UINTPTR_MAX - out) {
+            return false;
+        }
+        for (const ggml_tensor * input : { x, y }) {
+            if (!input) { continue; }
+            const uintptr_t begin = (uintptr_t) input->data;
+            const size_t size = ggml_nbytes(input);
+            if (!begin || begin % sizeof(float) || size > UINTPTR_MAX - begin || (out < begin + size && begin < out + out_size)) {
+                return false;
+            }
+        }
+        for (int k = 0; k < j; ++k) {
+            const ggml_tensor * prev = graph->nodes[outputs[k]];
+            const uintptr_t begin = (uintptr_t) prev->data;
+            const size_t size = ggml_nbytes(prev);
+            if (out < begin + size && begin < out + out_size) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3454,6 +3603,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    ggml_cuda_row_gate_match row_gate;
+    if (ggml_cuda_match_row_gate(cgraph, i, true, row_gate)) {
+        ggml_cuda_op_row_gate(*cuda_ctx, row_gate.mul, row_gate.sum, row_gate.post, row_gate.kind);
+        return row_gate.count - 1;
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4546,6 +4701,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_row_gate_match row_gate;
+            if (ggml_cuda_match_row_gate(cgraph, i, false, row_gate)) {
+                add_alloc_deps(i, i + row_gate.count - 1);
+                i += row_gate.count - 1;
+                continue;
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
