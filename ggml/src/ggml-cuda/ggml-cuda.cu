@@ -3179,6 +3179,57 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+
+static bool ggml_cuda_match_cont_unary_mul(const ggml_cgraph * graph, int i, bool allocated) {
+    if (i + 2 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_CONT ||
+            graph->nodes[i + 1]->op != GGML_OP_UNARY || graph->nodes[i + 2]->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * cont = graph->nodes[i];
+    const ggml_tensor * unary = graph->nodes[i + 1];
+    const ggml_tensor * dst = graph->nodes[i + 2];
+    const ggml_tensor * source = cont->src[0];
+    const ggml_tensor * other = dst->src[0] == unary ? dst->src[1] : dst->src[1] == unary ? dst->src[0] : nullptr;
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    if (!source || !other || cont->view_src || unary->view_src || dst->view_src || unary->src[0] != cont ||
+            (op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SOFTPLUS) ||
+            (source->type != GGML_TYPE_F32 && source->type != GGML_TYPE_F16 && source->type != GGML_TYPE_BF16) ||
+            cont->type != source->type || unary->type != source->type || other->type != source->type || dst->type != source->type ||
+            source->nb[0] != ggml_element_size(source) ||
+            !ggml_is_contiguous_1(source) || !ggml_is_contiguous(cont) || !ggml_is_contiguous(unary) ||
+            !ggml_is_contiguous(other) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(cont, unary) || !ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, dst) ||
+            source->ne[0] <= 0 || ggml_nelements(source) <= 0 || ggml_nelements(source) > INT_MAX ||
+            ggml_nelements(source) != ggml_nelements(cont) ||
+            !ggml_can_fuse_subgraph(graph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 })) {
+        return false;
+    }
+    const size_t element_size = ggml_element_size(source);
+    for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+        if (source->nb[j] % element_size) {
+            return false;
+        }
+    }
+    if (!allocated) {
+        return true;
+    }
+    for (const ggml_tensor * input : { source, other }) {
+        const uintptr_t begin = (uintptr_t) input->data;
+        const size_t size = ggml_nbytes(input);
+        if (!begin || begin % element_size || size > UINTPTR_MAX - begin) {
+            return false;
+        }
+        for (const ggml_tensor * output : { cont, unary, dst }) {
+            const uintptr_t out = (uintptr_t) output->data;
+            const size_t out_size = ggml_nbytes(output);
+            if (!out || out % element_size || out_size > UINTPTR_MAX - out || (out < begin + size && begin < out + out_size)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3454,6 +3505,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (ggml_cuda_match_cont_unary_mul(cgraph, i, true)) {
+        ggml_cuda_op_cont_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4546,6 +4602,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_match_cont_unary_mul(cgraph, i, false)) {
+                add_alloc_deps(i, i + 2);
+                i += 2;
+                continue;
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
