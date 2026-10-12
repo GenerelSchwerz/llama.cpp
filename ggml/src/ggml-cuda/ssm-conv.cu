@@ -204,3 +204,320 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+template <int d_conv>
+static __global__ void ssm_conv_qk_f32(const float * x, const float * w, float * silu, float * q, float * k,
+        int64_t channels, int64_t tokens, int64_t seq_stride, int64_t head_size, int64_t heads, float eps_q, float eps_k,
+        float scale_q, float scale_k) {
+    ggml_cuda_pdl_lc();
+    const int64_t head = blockIdx.x;
+    const int64_t token = blockIdx.y;
+    const int64_t seq = blockIdx.z;
+    const int64_t col = threadIdx.x;
+    const int64_t channel = head*head_size + col;
+    const int64_t row = seq*tokens + token;
+    float y = 0.0f;
+    ggml_cuda_pdl_sync();
+    if (col < head_size && channel < channels) {
+        const int64_t x_offset = seq*seq_stride + channel*(tokens + d_conv - 1) + token;
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sum += x[x_offset + j] * w[channel*d_conv + j];
+        }
+        sum += 0.0f;
+        y = ggml_cuda_op_silu_single(sum);
+        silu[row*channels + channel] = y;
+    }
+    if (head < 2*heads) {
+        float sum = 0.0f;
+        sum += y*y;
+        extern __shared__ float shared[];
+        sum = block_reduce<block_reduce_method::SUM, 256>(sum, shared);
+        const bool is_q = head < heads;
+        const float eps = is_q ? eps_q : eps_k;
+        const float scale_out = is_q ? scale_q : scale_k;
+        const float scale = rsqrtf(sum / head_size + eps);
+        if (col < head_size) {
+            float * out = is_q ? q : k;
+            out[(row*heads + (is_q ? head : head - heads))*head_size + col] = scale_out * (scale*y);
+        }
+    }
+}
+
+template <int d_conv, int tile_t>
+static __global__ void ssm_conv_qk_tiled_f32(const float * x, const float * w, float * silu, float * q, float * k,
+        int64_t channels, int64_t tokens, int64_t seq_stride, int64_t head_size, int64_t heads, float eps_q, float eps_k,
+        float scale_q, float scale_k) {
+    ggml_cuda_pdl_lc();
+    const int64_t head = blockIdx.x;
+    const int64_t first = blockIdx.y*tile_t;
+    const int64_t seq = blockIdx.z;
+    const int64_t col = threadIdx.x;
+    const int64_t channel = head*head_size + col;
+    constexpr int window = d_conv - 1 + tile_t;
+    extern __shared__ float shared[];
+    float * partial = shared + head_size*window;
+    ggml_cuda_pdl_sync();
+    for (int64_t idx = col; idx < head_size*window; idx += 256) {
+        const int64_t c = head*head_size + idx/window;
+        const int64_t t = first + idx%window;
+        shared[idx] = c < channels && t < tokens + d_conv - 1 ? x[seq*seq_stride + c*(tokens + d_conv - 1) + t] : 0.0f;
+    }
+    float weight[d_conv] = { 0.0f };
+    if (col < head_size && channel < channels) {
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            weight[j] = w[channel*d_conv + j];
+        }
+    }
+    __syncthreads();
+    for (int i = 0; i < tile_t && first + i < tokens; ++i) {
+        const int64_t row = seq*tokens + first + i;
+        float y = 0.0f;
+        if (col < head_size && channel < channels) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sum += shared[col*window + i + j] * weight[j];
+            }
+            sum += 0.0f;
+            y = ggml_cuda_op_silu_single(sum);
+            silu[row*channels + channel] = y;
+        }
+        if (head < 2*heads) {
+            float sum = 0.0f;
+            sum += y*y;
+            sum = block_reduce<block_reduce_method::SUM, 256>(sum, partial);
+            const bool is_q = head < heads;
+            const float eps = is_q ? eps_q : eps_k;
+            const float scale_out = is_q ? scale_q : scale_k;
+            const float scale = rsqrtf(fmaf(sum, 1.0f/int(head_size), eps));
+            if (col < head_size) {
+                float * out = is_q ? q : k;
+                out[(row*heads + (is_q ? head : head - heads))*head_size + col] = scale_out * (scale*y);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_qk(ggml_backend_cuda_context & ctx, ggml_tensor * conv, ggml_tensor * silu,
+        ggml_tensor * q_norm, ggml_tensor * q_scale, ggml_tensor * k_norm, ggml_tensor * k_scale) {
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const int64_t d = q_scale->ne[0];
+    const int64_t h = q_scale->ne[1];
+    const int64_t c = silu->ne[0];
+    float eps_q, eps_k, scale_q, scale_k;
+    memcpy(&eps_q, q_norm->op_params, sizeof(float));
+    memcpy(&eps_k, k_norm->op_params, sizeof(float));
+    memcpy(&scale_q, q_scale->op_params, sizeof(float));
+    memcpy(&scale_k, k_scale->op_params, sizeof(float));
+    const int64_t tile = silu->ne[1] > 32 ? 32 : 1;
+    const dim3 blocks((c + d - 1)/d, (silu->ne[1] + tile - 1)/tile, silu->ne[2]);
+    auto launch = [&](auto width) {
+        if (tile > 1) {
+            const size_t shared = (d*(decltype(width)::value - 1 + 32) + 32)*sizeof(float);
+            const ggml_cuda_kernel_launch_params params = { blocks, dim3(256, 1, 1), shared, ctx.stream() };
+            ggml_cuda_kernel_launch(ssm_conv_qk_tiled_f32<decltype(width)::value, 32>, params,
+                (const float *) x->data, (const float *) w->data, (float *) silu->data,
+                (float *) q_scale->data, (float *) k_scale->data, c, silu->ne[1], x->nb[2]/sizeof(float), d, h, eps_q, eps_k, scale_q, scale_k);
+        } else {
+            const ggml_cuda_kernel_launch_params params = { blocks, dim3(256, 1, 1), 32*sizeof(float), ctx.stream() };
+            ggml_cuda_kernel_launch(ssm_conv_qk_f32<decltype(width)::value>, params,
+                (const float *) x->data, (const float *) w->data, (float *) silu->data,
+                (float *) q_scale->data, (float *) k_scale->data, c, silu->ne[1], x->nb[2]/sizeof(float), d, h, eps_q, eps_k, scale_q, scale_k);
+        }
+    };
+    switch (w->ne[0]) {
+        case 3:  launch(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch(std::integral_constant<int, 9 >{}); break;
+        case 15: launch(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("unsupported convolution width");
+    }
+}
+
+template <int d_conv>
+static __device__ __forceinline__ float ssm_conv_split_read(const float * history, const float * current,
+        int64_t t, int64_t c, int64_t s, int64_t h0, int64_t h1, int64_t h2, int64_t x0, int64_t x1, int64_t x2) {
+    return t < d_conv - 1 ? history[s*h2 + c*h1 + t*h0] : current[s*x2 + c*x1 + (t - (d_conv - 1))*x0];
+}
+
+template <int d_conv>
+static __global__ void ssm_conv_qk_split_f32(const float * history, const float * current, const float * w, float * silu, float * q, float * k,
+        int64_t h0, int64_t h1, int64_t h2, int64_t x0, int64_t x1, int64_t x2,
+        float * cache, int64_t cache_slot_stride, int64_t cache_seq_stride, int64_t copies, int64_t latest_start,
+        int64_t channels, int64_t tokens, int64_t seq_stride, int64_t head_size, int64_t heads, float eps_q, float eps_k,
+        float scale_q, float scale_k) {
+    ggml_cuda_pdl_lc();
+    const int64_t head = blockIdx.x;
+    const int64_t token = blockIdx.y;
+    const int64_t seq = blockIdx.z;
+    const int64_t col = threadIdx.x;
+    const int64_t channel = head*head_size + col;
+    const int64_t row = seq*tokens + token;
+    float y = 0.0f;
+    ggml_cuda_pdl_sync();
+    {
+        for (int64_t slot = blockIdx.y; slot < copies; slot += gridDim.y) {
+            const int64_t start = latest_start > slot ? latest_start - slot : 0;
+            for (int64_t idx = col; idx < head_size*(d_conv - 1); idx += blockDim.x) {
+                const int64_t c = head*head_size + idx/(d_conv - 1);
+                if (c < channels) {
+                    cache[slot*cache_slot_stride + seq*cache_seq_stride + head*head_size*(d_conv - 1) + idx] =
+                        ssm_conv_split_read<d_conv>(history, current, start + idx%(d_conv - 1), c, seq, h0, h1, h2, x0, x1, x2);
+                }
+            }
+        }
+    }
+    if (token >= tokens) {
+        return;
+    }
+    if (col < head_size && channel < channels) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sum += ssm_conv_split_read<d_conv>(history, current, token + j, channel, seq, h0, h1, h2, x0, x1, x2) * w[channel*d_conv + j];
+        }
+        sum += 0.0f;
+        y = ggml_cuda_op_silu_single(sum);
+        silu[row*channels + channel] = y;
+    }
+    if (head < 2*heads) {
+        float sum = 0.0f;
+        sum += y*y;
+        extern __shared__ float shared[];
+        sum = block_reduce<block_reduce_method::SUM, 256>(sum, shared);
+        const bool is_q = head < heads;
+        const float eps = is_q ? eps_q : eps_k;
+        const float scale_out = is_q ? scale_q : scale_k;
+        const float scale = rsqrtf(sum / head_size + eps);
+        if (col < head_size) {
+            float * out = is_q ? q : k;
+            out[(row*heads + (is_q ? head : head - heads))*head_size + col] = scale_out * (scale*y);
+        }
+    }
+}
+
+template <int d_conv, int tile_t>
+static __global__ void ssm_conv_qk_split_tiled_f32(const float * history, const float * current, const float * w, float * silu, float * q, float * k,
+        int64_t h0, int64_t h1, int64_t h2, int64_t x0, int64_t x1, int64_t x2,
+        float * cache, int64_t cache_slot_stride, int64_t cache_seq_stride, int64_t copies, int64_t latest_start,
+        int64_t channels, int64_t tokens, int64_t seq_stride, int64_t head_size, int64_t heads, float eps_q, float eps_k,
+        float scale_q, float scale_k) {
+    ggml_cuda_pdl_lc();
+    const int64_t head = blockIdx.x;
+    const int64_t first = blockIdx.y*tile_t;
+    const int64_t seq = blockIdx.z;
+    const int64_t col = threadIdx.x;
+    const int64_t channel = head*head_size + col;
+    constexpr int window = d_conv - 1 + tile_t;
+    extern __shared__ float shared[];
+    float * partial = shared + head_size*window;
+    ggml_cuda_pdl_sync();
+    {
+        for (int64_t slot = blockIdx.y; slot < copies; slot += gridDim.y) {
+            const int64_t start = latest_start > slot ? latest_start - slot : 0;
+            for (int64_t idx = col; idx < head_size*(d_conv - 1); idx += blockDim.x) {
+                const int64_t c = head*head_size + idx/(d_conv - 1);
+                if (c < channels) {
+                    cache[slot*cache_slot_stride + seq*cache_seq_stride + head*head_size*(d_conv - 1) + idx] =
+                        ssm_conv_split_read<d_conv>(history, current, start + idx%(d_conv - 1), c, seq, h0, h1, h2, x0, x1, x2);
+                }
+            }
+        }
+    }
+    if (first >= tokens) {
+        return;
+    }
+    for (int64_t idx = col; idx < head_size*window; idx += 256) {
+        const int64_t c = head*head_size + idx/window;
+        const int64_t t = first + idx%window;
+        shared[idx] = c < channels && t < tokens + d_conv - 1 ? ssm_conv_split_read<d_conv>(history, current, t, c, seq, h0, h1, h2, x0, x1, x2) : 0.0f;
+    }
+    float weight[d_conv] = { 0.0f };
+    if (col < head_size && channel < channels) {
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            weight[j] = w[channel*d_conv + j];
+        }
+    }
+    __syncthreads();
+    for (int i = 0; i < tile_t && first + i < tokens; ++i) {
+        const int64_t row = seq*tokens + first + i;
+        float y = 0.0f;
+        if (col < head_size && channel < channels) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                sum += shared[col*window + i + j] * weight[j];
+            }
+            sum += 0.0f;
+            y = ggml_cuda_op_silu_single(sum);
+            silu[row*channels + channel] = y;
+        }
+        if (head < 2*heads) {
+            float sum = 0.0f;
+            sum += y*y;
+            sum = block_reduce<block_reduce_method::SUM, 256>(sum, partial);
+            const bool is_q = head < heads;
+            const float eps = is_q ? eps_q : eps_k;
+            const float scale_out = is_q ? scale_q : scale_k;
+            const float scale = rsqrtf(fmaf(sum, 1.0f/int(head_size), eps));
+            if (col < head_size) {
+                float * out = is_q ? q : k;
+                out[(row*heads + (is_q ? head : head - heads))*head_size + col] = scale_out * (scale*y);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_qk_split(ggml_backend_cuda_context & ctx, ggml_tensor * conv, ggml_tensor * silu,
+        ggml_tensor * q_norm, ggml_tensor * q_scale, ggml_tensor * k_norm, ggml_tensor * k_scale, ggml_tensor * cache,
+        size_t slot_stride, size_t sequence_stride, int64_t copies, int64_t latest_start) {
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * history = x->src[0];
+    const ggml_tensor * current = x->src[1];
+    const ggml_tensor * w = conv->src[1];
+    const int64_t d = q_scale->ne[0];
+    const int64_t h = q_scale->ne[1];
+    const int64_t c = silu->ne[0];
+    float eps_q, eps_k, scale_q, scale_k;
+    memcpy(&eps_q, q_norm->op_params, sizeof(float));
+    memcpy(&eps_k, k_norm->op_params, sizeof(float));
+    memcpy(&scale_q, q_scale->op_params, sizeof(float));
+    memcpy(&scale_k, k_scale->op_params, sizeof(float));
+    const int64_t tile = silu->ne[1] > 32 ? 32 : 1;
+    const int64_t rows = std::max((silu->ne[1] + tile - 1)/tile, std::min<int64_t>(copies, 65535));
+    const dim3 blocks((c + d - 1)/d, rows, silu->ne[2]);
+    auto launch = [&](auto width) {
+        if (tile > 1) {
+            const size_t shared = (d*(decltype(width)::value - 1 + 32) + 32)*sizeof(float);
+            const ggml_cuda_kernel_launch_params params = { blocks, dim3(256, 1, 1), shared, ctx.stream() };
+            ggml_cuda_kernel_launch(ssm_conv_qk_split_tiled_f32<decltype(width)::value, 32>, params,
+                (const float *) history->data, (const float *) current->data, (const float *) w->data, (float *) silu->data,
+                (float *) q_scale->data, (float *) k_scale->data,
+                history->nb[0]/4, history->nb[1]/4, history->nb[2]/4, current->nb[0]/4, current->nb[1]/4, current->nb[2]/4,
+                cache ? (float *) cache->data : nullptr, slot_stride/4, sequence_stride/4, copies, latest_start, c, silu->ne[1], x->nb[2]/sizeof(float), d, h, eps_q, eps_k, scale_q, scale_k);
+        } else {
+            const ggml_cuda_kernel_launch_params params = { blocks, dim3(256, 1, 1), 32*sizeof(float), ctx.stream() };
+            ggml_cuda_kernel_launch(ssm_conv_qk_split_f32<decltype(width)::value>, params,
+                (const float *) history->data, (const float *) current->data, (const float *) w->data, (float *) silu->data,
+                (float *) q_scale->data, (float *) k_scale->data,
+                history->nb[0]/4, history->nb[1]/4, history->nb[2]/4, current->nb[0]/4, current->nb[1]/4, current->nb[2]/4,
+                cache ? (float *) cache->data : nullptr, slot_stride/4, sequence_stride/4, copies, latest_start, c, silu->ne[1], x->nb[2]/sizeof(float), d, h, eps_q, eps_k, scale_q, scale_k);
+        }
+    };
+    switch (w->ne[0]) {
+        case 3:  launch(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch(std::integral_constant<int, 9 >{}); break;
+        case 15: launch(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("unsupported convolution width");
+    }
+}

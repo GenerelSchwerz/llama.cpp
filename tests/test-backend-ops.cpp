@@ -4429,21 +4429,23 @@ struct test_ssm_conv_bias_silu : public test_case {
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
     const bool fuse_bias;
+    const int64_t qk_head;
+    const bool qk_extra;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SSM_CONV_BIAS_SILU";
+        return qk_head ? "SSM_CONV_SILU_QK" : "SSM_CONV_BIAS_SILU";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
+        return VARS_TO_STR6(type, ne_a, ne_b, fuse_bias, qk_head, qk_extra);
     }
 
     test_ssm_conv_bias_silu(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b,
-            bool fuse_bias)
-        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias) {}
+            bool fuse_bias, int64_t qk_head = 0, bool qk_extra = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias), qk_head(qk_head), qk_extra(qk_extra) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -4460,6 +4462,24 @@ struct test_ssm_conv_bias_silu : public test_case {
         }
 
         out = ggml_silu(ctx, out);
+        if (qk_head) {
+            const int64_t heads = out->ne[0] / (4*qk_head);
+            GGML_ASSERT(heads > 0);
+            const int64_t qk_size = qk_head*heads;
+            const int64_t value_size = out->ne[0] - 2*qk_size;
+            ggml_tensor * q = ggml_view_4d(ctx, out, qk_head, heads, out->ne[1], out->ne[2],
+                qk_head*sizeof(float), out->nb[1], out->nb[2], 0);
+            ggml_tensor * k = ggml_view_4d(ctx, out, qk_head, heads, out->ne[1], out->ne[2],
+                qk_head*sizeof(float), out->nb[1], out->nb[2], qk_size*sizeof(float));
+            ggml_tensor * v = ggml_view_4d(ctx, out, qk_head, value_size/qk_head, out->ne[1], out->ne[2],
+                qk_head*sizeof(float), out->nb[1], out->nb[2], 2*qk_size*sizeof(float));
+            ggml_tensor * q_norm = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f/qk_head), 1.0f/sqrtf(qk_head));
+            ggml_tensor * k_norm = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/qk_head), 1.0f/sqrtf(qk_head));
+            if (qk_extra) {
+                q_norm = ggml_add(ctx, q_norm, q);
+            }
+            out = ggml_concat(ctx, ggml_concat(ctx, q_norm, k_norm, 1), v, 1);
+        }
 
         ggml_set_name(out, "out");
         return out;
@@ -10058,6 +10078,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
+    }
+
+    for (int64_t d : { 32, 64, 96, 128, 192, 256 }) {
+        for (int64_t width : { 3, 4, 5, 9, 15 }) {
+            for (int64_t tokens : { 1, 4, 32, 33 }) {
+                test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32,
+                    { tokens + width - 1, 8*d, 2, 1 }, { width, 8*d, 1, 1 }, false, d));
+            }
+        }
+    }
+    for (int64_t d : { 32, 128, 256 }) {
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32,
+            { 7, 8*d, 1, 1 }, { 4, 8*d, 1, 1 }, false, d, true));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32,
+            { 7, 8*d, 1, 1 }, { 4, 8*d, 1, 1 }, true, d));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
