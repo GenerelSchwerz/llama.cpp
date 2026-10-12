@@ -100,6 +100,32 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_contiguous(
+        const float * x_ptr, void * vy_ptr, const uint32_t ne00, const uint32_t ne0) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x = x_ptr;
+    block_q8_1 * GGML_CUDA_RESTRICT y = (block_q8_1 *) vy_ptr;
+    const uint32_t i0 = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const uint64_t row = uint64_t(blockIdx.z)*gridDim.y + blockIdx.y;
+    const uint64_t ib = row*(ne0/QK8_1) + i0/QK8_1;
+    const uint32_t iqs = i0 % QK8_1;
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne00 ? x[row*ne00 + i0] : 0.0f;
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float sum = warp_reduce_sum<QK8_1>(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -568,7 +594,15 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    const bool contiguous = ne00 > 0 && ne00 <= ne0 && ne0 <= UINT32_MAX && ne1 > 0 && ne2 > 0 && ne3 > 0 &&
+        (ne1 == 1 || s01 == ne00) &&
+        (ne2 == 1 || (s02 > 0 && s02 % ne00 == 0 && s02 / ne00 == ne1)) &&
+        (ne3 == 1 || (s03 > 0 && s03 % ne00 == 0 && s03 / ne00 % ne1 == 0 && s03 / ne00 / ne1 == ne2));
+    if (contiguous) {
+        ggml_cuda_kernel_launch(quantize_q8_1_contiguous, launch_params, x, vy, uint32_t(ne00), uint32_t(ne0));
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
     GGML_UNUSED(type_src0);
 }
 
