@@ -3179,6 +3179,482 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+static bool ggml_cuda_dilated_conv_valid_view(const ggml_tensor * node) {
+    if (!node->view_src) {
+        return true;
+    }
+    const uintptr_t base = (uintptr_t) node->view_src->data;
+    return base && node->view_offs <= UINTPTR_MAX - base && (uintptr_t) node->data == base + node->view_offs;
+}
+
+struct ggml_cuda_dilated_conv_match {
+    ggml_cuda_dilated_conv_args args = {};
+    int node_count = 0;
+    ggml_cuda_dilated_conv_outputs outputs;
+};
+
+static bool ggml_cuda_match_dilated_conv(const ggml_cgraph * graph, int i, ggml_cuda_dilated_conv_match & match, bool allocated, bool retain = false) {
+    match = {};
+    const int start = i;
+    const ggml_tensor * first = graph->nodes[i];
+    if (first->op != GGML_OP_CONT || first->src[0]->op != GGML_OP_TRANSPOSE || first->src[0]->src[0]->op != GGML_OP_VIEW) {
+        return false;
+    }
+    const ggml_tensor * source = first->src[0]->src[0]->src[0];
+    const int64_t channels = first->ne[0];
+    const int64_t tokens = first->ne[1];
+    const int64_t sequences = first->ne[2];
+    if (source->type != GGML_TYPE_F32 || source->nb[0] != sizeof(float) || source->ne[1] != channels ||
+            source->ne[2] != sequences || source->ne[3] != 1 || first->ne[3] != 1 ||
+            channels <= 0 || tokens <= 0 || sequences <= 0 || ggml_nelements(first) > INT_MAX) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (source->nb[d] % sizeof(float) || source->nb[d] > INT64_MAX) {
+            return false;
+        }
+    }
+    const ggml_tensor * weights = nullptr;
+    ggml_tensor * sum = nullptr;
+    int64_t first_row = 0;
+    int64_t dilation = 0;
+    int64_t taps = 1;
+    for (int64_t tap = 0; tap < taps; ++tap) {
+        const ggml_tensor * act = first;
+        if (tap) {
+            if (i + 2 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_VIEW || graph->nodes[i + 1]->op != GGML_OP_TRANSPOSE ||
+                    graph->nodes[i + 2]->op != GGML_OP_CONT || graph->nodes[i + 1]->src[0] != graph->nodes[i] || graph->nodes[i + 2]->src[0] != graph->nodes[i + 1]) {
+                return false;
+            }
+            act = graph->nodes[i + 2];
+            i += 2;
+        }
+        const ggml_tensor * transposed = act->src[0];
+        const ggml_tensor * view = transposed->src[0];
+        const size_t source_offset = source->view_src ? source->view_offs : 0;
+        if (act->view_src || act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || !ggml_are_same_shape(act, first) ||
+                view->src[0] != source || view->view_offs < source_offset || (view->view_offs - source_offset) % sizeof(float) ||
+                view->ne[0] != tokens || view->ne[1] != channels || view->ne[2] != sequences || view->ne[3] != 1 ||
+                !ggml_are_same_shape(transposed, act) || view->nb[0] != source->nb[0] || view->nb[1] != source->nb[1] ||
+                view->nb[2] != source->nb[2] || transposed->nb[0] != view->nb[1] || transposed->nb[1] != view->nb[0] || transposed->nb[2] != view->nb[2]) {
+            return false;
+        }
+        const int64_t row = (view->view_offs - source_offset) / sizeof(float);
+        if (!tap) {
+            first_row = row;
+        } else if (tap == 1) {
+            if (row < first_row) {
+                return false;
+            }
+            dilation = row - first_row;
+        } else if (dilation > (INT64_MAX - first_row) / tap || row != first_row + tap * dilation) {
+            return false;
+        }
+        while (i + 3 < graph->n_nodes && ggml_cuda_is_view_or_noop(graph->nodes[i + 1]) &&
+                !(graph->nodes[i + 1]->op == GGML_OP_VIEW && graph->nodes[i + 2]->op == GGML_OP_CONT &&
+                  graph->nodes[i + 2]->src[0] == graph->nodes[i + 1] && graph->nodes[i + 3]->op == GGML_OP_RESHAPE &&
+                  graph->nodes[i + 3]->src[0] == graph->nodes[i + 2])) {
+            ++i;
+        }
+        if (i + 4 >= graph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * column = graph->nodes[++i];
+        const ggml_tensor * copied = graph->nodes[++i];
+        const ggml_tensor * coefficient = graph->nodes[++i];
+        if (column->op != GGML_OP_VIEW || copied->op != GGML_OP_CONT || copied->src[0] != column ||
+                coefficient->op != GGML_OP_RESHAPE || coefficient->src[0] != copied || copied->view_src ||
+                !ggml_is_contiguous(copied) || !ggml_is_contiguous(coefficient) || column->ne[0] != 1 || column->ne[1] != channels ||
+                column->ne[2] != 1 || column->ne[3] != 1 || coefficient->ne[0] != channels || ggml_nelements(coefficient) != channels) {
+            return false;
+        }
+        if (!tap) {
+            weights = column->src[0];
+            taps = weights->ne[0];
+            if ((weights->type != GGML_TYPE_F32 && weights->type != GGML_TYPE_F16 && weights->type != GGML_TYPE_BF16) ||
+                    weights->ne[1] != channels || weights->ne[2] != 1 || weights->ne[3] != 1 || weights->nb[0] != ggml_element_size(weights) ||
+                    taps <= 0 || taps > graph->n_nodes - start || weights->nb[1] % ggml_element_size(weights) || weights->nb[1] > INT64_MAX) {
+                return false;
+            }
+        }
+        const size_t weight_offset = weights->view_src ? weights->view_offs : 0;
+        if (column->src[0] != weights || column->type != weights->type || copied->type != weights->type || coefficient->type != weights->type ||
+                column->view_offs < weight_offset || column->view_offs - weight_offset != tap * weights->nb[0] ||
+                column->nb[0] != weights->nb[0] || column->nb[1] != weights->nb[1] || !ggml_are_same_shape(copied, column)) {
+            return false;
+        }
+        if (weights->type != GGML_TYPE_F32) {
+            if (++i >= graph->n_nodes) {
+                return false;
+            }
+            const ggml_tensor * cast = graph->nodes[i];
+            if (cast->op != GGML_OP_CPY || cast->src[0] != coefficient || cast->src[1] != cast || cast->view_src ||
+                    cast->type != GGML_TYPE_F32 || !ggml_is_contiguous(cast) || !ggml_are_same_shape(cast, coefficient) ||
+                    (cast->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(graph, i) != 2) {
+                return false;
+            }
+            coefficient = cast;
+        }
+        if (++i >= graph->n_nodes) {
+            return false;
+        }
+        ggml_tensor * term = graph->nodes[i++];
+        if (term->op != GGML_OP_MUL || term->src[0] != act || term->src[1] != coefficient || term->type != GGML_TYPE_F32 ||
+                term->view_src || !ggml_is_contiguous(term) || !ggml_are_same_shape(term, first)) {
+            return false;
+        }
+        if (tap) {
+            if (i >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_ADD || graph->nodes[i]->src[0] != sum || graph->nodes[i]->src[1] != term ||
+                    graph->nodes[i]->type != GGML_TYPE_F32 || graph->nodes[i]->view_src || !ggml_is_contiguous(graph->nodes[i]) || !ggml_are_same_shape(graph->nodes[i], first)) {
+                return false;
+            }
+            sum = graph->nodes[i++];
+        } else {
+            sum = term;
+        }
+    }
+    if (source->ne[0] < tokens || first_row > source->ne[0] - tokens || (taps > 1 && dilation > (source->ne[0] - tokens - first_row) / (taps - 1))) {
+        return false;
+    }
+    int stages[5] = { i - 1 }, values[5] = {}, n_stages = 1;
+    match.args = { source, weights, sum, { nullptr, nullptr }, first_row, dilation, false, 0 };
+    if ((retain || !(sum->flags & GGML_TENSOR_FLAG_OUTPUT)) && i < graph->n_nodes && graph->nodes[i]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(graph->nodes[i]) == GGML_UNARY_OP_SILU && graph->nodes[i]->src[0] == sum && !graph->nodes[i]->view_src &&
+            graph->nodes[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(graph->nodes[i])) {
+        stages[n_stages] = i; values[n_stages++] = 1;
+        match.args.apply_silu = true;
+        match.args.dst = graph->nodes[i++];
+    }
+    for (ggml_op op : { GGML_OP_CONT, GGML_OP_RESHAPE }) {
+        if ((retain || !(match.args.dst->flags & GGML_TENSOR_FLAG_OUTPUT)) && i < graph->n_nodes && graph->nodes[i]->op == op &&
+                graph->nodes[i]->src[0] == match.args.dst && graph->nodes[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(graph->nodes[i]) &&
+                ggml_nelements(graph->nodes[i]) == ggml_nelements(first)) {
+            stages[n_stages] = i; values[n_stages++] = match.args.apply_silu ? 1 : 0;
+            match.args.dst = graph->nodes[i++];
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        if ((!retain && (match.args.dst->flags & GGML_TENSOR_FLAG_OUTPUT)) || i >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_ADD) {
+            break;
+        }
+        ggml_tensor * add = graph->nodes[i];
+        const int position = add->src[0] == match.args.dst ? 0 : add->src[1] == match.args.dst ? 1 : -1;
+        const ggml_tensor * other = position < 0 ? nullptr : add->src[1 - position];
+        if (!other || add->type != GGML_TYPE_F32 || add->view_src || !ggml_is_contiguous(add) || other->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(other) || !ggml_are_same_shape(add, other) || !ggml_are_same_shape(add, match.args.dst)) {
+            break;
+        }
+        if (!r) { stages[n_stages] = i; values[n_stages++] = 2; }
+        match.args.residual[r] = other;
+        match.args.other_first |= position << r;
+        match.args.dst = add;
+        ++i;
+    }
+    const int last = i - 1;
+    std::vector<int> indices, outputs = { last };
+    std::vector<ggml_op> ops;
+    for (int j = start; j <= last; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        indices.push_back(j);
+        ops.push_back(node->op);
+        if (node->view_src == (source->view_src ? source->view_src : source) ||
+                node->view_src == (weights->view_src ? weights->view_src : weights) || node->op == GGML_OP_CPY) {
+            outputs.push_back(j);
+        }
+    }
+    if (retain) {
+        for (int k = 0; k < n_stages; ++k) {
+            const int index = stages[k];
+            ggml_tensor * node = graph->nodes[index];
+            if (index == last) {
+                continue;
+            }
+            int internal_uses = 0;
+            for (int j = index + 1; j <= last; ++j) {
+                for (const ggml_tensor * input : graph->nodes[j]->src) {
+                    internal_uses += input == node;
+                }
+            }
+            if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(graph, index) != internal_uses) {
+                if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || ggml_nelements(node) != ggml_nelements(first)) {
+                    return false;
+                }
+                outputs.push_back(index);
+                const int k_out = match.outputs.count++;
+                match.outputs.nodes[k_out] = node;
+                match.outputs.value[k_out] = values[k];
+            }
+        }
+    }
+    // Cast destinations have one self-use and one MUL use, checked above.
+    if (!ggml_can_fuse_subgraph_ext(graph, indices.data(), indices.size(), ops.data(), outputs.data(), outputs.size())) {
+        return false;
+    }
+    match.node_count = i - start;
+    if (!allocated) {
+        return true;
+    }
+    if (!ggml_cuda_dilated_conv_valid_view(source) || !ggml_cuda_dilated_conv_valid_view(weights) || !ggml_cuda_dilated_conv_valid_view(first->src[0]) || !ggml_cuda_dilated_conv_valid_view(first->src[0]->src[0])) {
+        return false;
+    }
+    for (int j = start; j <= last; ++j) {
+        if (!ggml_cuda_dilated_conv_valid_view(graph->nodes[j])) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * input : { source, weights, match.args.residual[0], match.args.residual[1] }) {
+        if (!input) {
+            continue;
+        }
+        const uintptr_t begin = (uintptr_t) input->data;
+        const size_t bytes = ggml_nbytes(input);
+        if (!begin || begin % ggml_element_size(input) || bytes > UINTPTR_MAX - begin) {
+            return false;
+        }
+        for (int j = start; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            const uintptr_t out = (uintptr_t) node->data;
+            const size_t out_bytes = ggml_nbytes(node);
+            const bool residual_alias = node == match.args.dst && (input == match.args.residual[0] || input == match.args.residual[1]) && begin == out && bytes == out_bytes;
+            if (!out || out % sizeof(float) || out_bytes > UINTPTR_MAX - out || (!residual_alias && out < begin + bytes && begin < out + out_bytes)) {
+                return false;
+            }
+        }
+    }
+    for (int k = 0; k < match.outputs.count; ++k) {
+        const ggml_tensor * kept = match.outputs.nodes[k];
+        const uintptr_t begin = (uintptr_t) kept->data;
+        const size_t bytes = ggml_nbytes(kept);
+        if (!ggml_cuda_dilated_conv_valid_view(kept) || !begin || begin % sizeof(float) || bytes > UINTPTR_MAX - begin) {
+            return false;
+        }
+        for (int j = start; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(node) || node == kept) {
+                continue;
+            }
+            const uintptr_t out = (uintptr_t) node->data;
+            const size_t out_bytes = ggml_nbytes(node);
+            if (out < begin + bytes && begin < out + out_bytes) {
+                bool same_value = false;
+                for (int l = 0; l < n_stages; ++l) {
+                    same_value |= stages[l] == j && values[l] == match.outputs.value[k];
+                }
+                if (!same_value || begin != out || bytes != out_bytes) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+struct ggml_cuda_dilated_conv_history_match {
+    ggml_cuda_dilated_conv_history_args args = {};
+    ggml_cuda_dilated_conv_outputs outputs;
+    int node_count = 0;
+};
+
+static bool ggml_cuda_match_dilated_conv_history(const ggml_cgraph * graph, int i, ggml_cuda_dilated_conv_history_match & match, bool allocated, bool retain = false) {
+    match = {};
+    const int start = i;
+    ggml_tensor * padded = graph->nodes[i];
+    if (padded->op != GGML_OP_CONCAT || ggml_get_op_params_i32(padded, 0) != 0 || padded->view_src || !ggml_is_contiguous(padded)) {
+        return false;
+    }
+    const ggml_tensor * old = padded->src[0];
+    const ggml_tensor * current = padded->src[1];
+    const int64_t history = old->ne[0], channels = old->ne[1], sequences = old->ne[2], tokens = current->ne[0];
+    if (old->type != GGML_TYPE_F32 || current->type != GGML_TYPE_F32 || padded->type != GGML_TYPE_F32 ||
+            history <= 0 || tokens <= 0 || channels <= 0 || sequences <= 0 || old->ne[3] != 1 || current->ne[3] != 1 ||
+            current->ne[1] != channels || current->ne[2] != sequences || padded->ne[0] != history + tokens ||
+            padded->ne[1] != channels || padded->ne[2] != sequences || padded->ne[3] != 1 ||
+            ggml_nelements(old) > INT_MAX || ggml_nelements(current) > INT_MAX) {
+        return false;
+    }
+    for (const ggml_tensor * input : { old, current }) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (input->nb[d] % sizeof(float) || input->nb[d] > INT64_MAX) {
+                return false;
+            }
+        }
+    }
+    const ggml_tensor * cache = nullptr;
+    ggml_tensor * first_copy = nullptr;
+    size_t first_offset = 0, slot_stride = 0, sequence_span = 0;
+    std::vector<int> copies;
+    ++i;
+    while (i + 1 < graph->n_nodes && graph->nodes[i]->op == GGML_OP_VIEW && graph->nodes[i]->src[0] == padded &&
+            graph->nodes[i + 1]->op == GGML_OP_CONT && graph->nodes[i + 1]->src[0] == graph->nodes[i]) {
+        const ggml_tensor * tail = graph->nodes[i];
+        const ggml_tensor * cont = graph->nodes[i + 1];
+        const size_t slot = copies.size();
+        const int64_t row = tokens > (int64_t) slot ? tokens - slot : 0;
+        if (tail->type != GGML_TYPE_F32 || tail->ne[0] != history || tail->ne[1] != channels || tail->ne[2] != sequences ||
+                tail->ne[3] != 1 || tail->nb[0] != sizeof(float) || tail->nb[1] != padded->nb[1] || tail->nb[2] != padded->nb[2] ||
+                tail->view_offs != row * sizeof(float) || cont->type != GGML_TYPE_F32 || cont->view_src ||
+                !ggml_is_contiguous(cont) || !ggml_are_same_shape(cont, tail)) {
+            return false;
+        }
+        i += 2;
+        while (i < graph->n_nodes && ggml_cuda_is_view_or_noop(graph->nodes[i])) {
+            ++i;
+        }
+        if (i >= graph->n_nodes) {
+            return false;
+        }
+        ggml_tensor * copy = graph->nodes[i];
+        const ggml_tensor * dst = copy->src[1];
+        if (copy->op != GGML_OP_CPY || copy->src[0] != cont || !dst || dst->type != GGML_TYPE_F32 || copy->type != GGML_TYPE_F32 ||
+                dst->ne[0] != history * channels || dst->ne[1] != sequences || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+                dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) || dst->nb[1] > INT64_MAX ||
+                (sequences > 1 && dst->nb[1] < history * channels * sizeof(float)) || !ggml_are_same_shape(copy, dst)) {
+            return false;
+        }
+        const ggml_tensor * root = dst->view_src ? dst->view_src : dst;
+        const size_t offset = dst->view_src ? dst->view_offs : 0;
+        if (!slot) {
+            cache = root;
+            first_copy = copy;
+            first_offset = offset;
+            sequence_span = ggml_nbytes(dst);
+            if (cache->type != GGML_TYPE_F32 || sequence_span > INT64_MAX) {
+                return false;
+            }
+        } else if (root != cache || dst->nb[1] != first_copy->nb[1]) {
+            return false;
+        }
+        if (slot == 1) {
+            if (offset < first_offset || offset - first_offset < sequence_span || offset - first_offset > INT64_MAX) {
+                return false;
+            }
+            slot_stride = offset - first_offset;
+        } else if (slot > 1 && (slot_stride > (SIZE_MAX - first_offset) / slot || offset != first_offset + slot * slot_stride)) {
+            return false;
+        }
+        if (copy->view_src != cache || copy->view_offs != offset) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (copy->nb[d] != dst->nb[d]) {
+                return false;
+            }
+        }
+        copies.push_back(i++);
+    }
+    while (i < graph->n_nodes && ggml_cuda_is_view_or_noop(graph->nodes[i])) {
+        ++i;
+    }
+    if (i >= graph->n_nodes || copies.size() > INT_MAX / ggml_nelements(old)) {
+        return false;
+    }
+    const int conv_start = i;
+    ggml_cuda_dilated_conv_match conv;
+    if (!ggml_cuda_match_dilated_conv(graph, i, conv, allocated, retain) || conv.args.source != padded ||
+            ggml_nelements(conv.args.dst) != ggml_nelements(current) ||
+            conv.args.first_row + (conv.args.weights->ne[0] - 1) * conv.args.dilation != history) {
+        return false;
+    }
+    const int last = i + conv.node_count - 1;
+    std::vector<int> indices, outputs = copies;
+    std::vector<ggml_op> ops;
+    outputs.push_back(last);
+    const ggml_tensor * weight_root = conv.args.weights->view_src ? conv.args.weights->view_src : conv.args.weights;
+    for (int j = start; j <= last; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        indices.push_back(j);
+        ops.push_back(node->op);
+        if ((cache && node->view_src == cache) || node->view_src == weight_root ||
+                (j >= conv_start && node->op == GGML_OP_CPY && node->src[1] == node)) {
+            outputs.push_back(j);
+        }
+    }
+    for (int k = 0; k < conv.outputs.count; ++k) {
+        for (int j = conv_start; j <= last; ++j) {
+            if (graph->nodes[j] == conv.outputs.nodes[k]) {
+                outputs.push_back(j);
+            }
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(graph, indices.data(), indices.size(), ops.data(), outputs.data(), outputs.size())) {
+        return false;
+    }
+    match.args = { conv.args, old, current, first_copy, (int) copies.size(), (int64_t) slot_stride };
+    match.outputs = conv.outputs;
+    match.node_count = last - start + 1;
+    if (!allocated) {
+        return true;
+    }
+    for (const ggml_tensor * input : { old, current, conv.args.weights, conv.args.residual[0], conv.args.residual[1] }) {
+        if (!input) {
+            continue;
+        }
+        if (!ggml_cuda_dilated_conv_valid_view(input)) {
+            return false;
+        }
+        const uintptr_t begin = (uintptr_t) input->data;
+        const size_t bytes = ggml_nbytes(input);
+        if (!begin || begin % ggml_element_size(input) || bytes > UINTPTR_MAX - begin) {
+            return false;
+        }
+        for (int j = start; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (!ggml_cuda_dilated_conv_valid_view(node)) {
+                return false;
+            }
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            const uintptr_t out = (uintptr_t) node->data;
+            const size_t out_bytes = ggml_nbytes(node);
+            const bool residual_alias = node == conv.args.dst && (input == conv.args.residual[0] || input == conv.args.residual[1]) && begin == out && bytes == out_bytes;
+            if (!out || out % ggml_element_size(node) || out_bytes > UINTPTR_MAX - out ||
+                    (!residual_alias && out < begin + bytes && begin < out + out_bytes)) {
+                return false;
+            }
+        }
+    }
+    if (cache) {
+        const uintptr_t begin = (uintptr_t) cache->data;
+        const size_t bytes = ggml_nbytes(cache);
+        if (!begin || bytes > UINTPTR_MAX - begin) {
+            return false;
+        }
+        for (int j = start; j <= last; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(node) || std::find(copies.begin(), copies.end(), j) != copies.end()) {
+                continue;
+            }
+            const uintptr_t out = (uintptr_t) node->data;
+            if (out < begin + bytes && begin < out + ggml_nbytes(node)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+
+static bool ggml_cuda_dilated_conv_streams(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int i, int count) {
+    for (const auto & entry : ctx.stream_context().concurrent_events) {
+        const auto & event = entry.second;
+        for (int j = i; j < i + count; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (node == entry.first || (node == event.join_node && j != i)) {
+                return false;
+            }
+            const auto stream = event.stream_mapping.find(node);
+            if (stream != event.stream_mapping.end() && stream->second != ctx.curr_stream_no && !ggml_cuda_is_view_or_noop(node)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3454,6 +3930,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    ggml_cuda_dilated_conv_history_match history;
+    if ((ggml_cuda_match_dilated_conv_history(cgraph, i, history, true, true) && ggml_cuda_dilated_conv_streams(*cuda_ctx, cgraph, i, history.node_count)) ||
+            (ggml_cuda_match_dilated_conv_history(cgraph, i, history, true) && ggml_cuda_dilated_conv_streams(*cuda_ctx, cgraph, i, history.node_count))) {
+        if (history.outputs.count) {
+            ggml_cuda_op_dilated_conv_outputs(*cuda_ctx, history.args.conv, history.outputs, &history.args);
+        } else {
+            ggml_cuda_op_dilated_conv_history(*cuda_ctx, history.args);
+        }
+        return history.node_count - 1;
+    }
+
+    ggml_cuda_dilated_conv_match dilated;
+    if ((ggml_cuda_match_dilated_conv(cgraph, i, dilated, true, true) && ggml_cuda_dilated_conv_streams(*cuda_ctx, cgraph, i, dilated.node_count)) ||
+            (ggml_cuda_match_dilated_conv(cgraph, i, dilated, true) && ggml_cuda_dilated_conv_streams(*cuda_ctx, cgraph, i, dilated.node_count))) {
+        if (dilated.outputs.count) {
+            ggml_cuda_op_dilated_conv_outputs(*cuda_ctx, dilated.args, dilated.outputs);
+        } else {
+            ggml_cuda_op_dilated_conv(*cuda_ctx, dilated.args);
+        }
+        return dilated.node_count - 1;
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4546,6 +5044,30 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_dilated_conv_history_match history;
+            if ((ggml_cuda_match_dilated_conv_history(cgraph, i, history, false, true) || ggml_cuda_match_dilated_conv_history(cgraph, i, history, false))) {
+                const int last = i + history.node_count - 1;
+                add_alloc_deps(i, last);
+                for (const ggml_tensor * input : { history.args.history, history.args.current, history.args.conv.weights, history.args.conv.residual[0], history.args.conv.residual[1] }) {
+                    if (input) {
+                        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(input), history.args.conv.dst);
+                    }
+                }
+                i = last;
+                continue;
+            }
+            ggml_cuda_dilated_conv_match dilated;
+            if ((ggml_cuda_match_dilated_conv(cgraph, i, dilated, false, true) || ggml_cuda_match_dilated_conv(cgraph, i, dilated, false))) {
+                const int last = i + dilated.node_count - 1;
+                add_alloc_deps(i, last);
+                for (const ggml_tensor * input : { dilated.args.source, dilated.args.weights, dilated.args.residual[0], dilated.args.residual[1] }) {
+                    if (input) {
+                        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(input), dilated.args.dst);
+                    }
+                }
+                i = last;
+                continue;
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
