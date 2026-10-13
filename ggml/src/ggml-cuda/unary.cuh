@@ -93,6 +93,17 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add);
+void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale, const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products);
+void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add);
+
+void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1);
+
+constexpr int GGML_CUDA_ORDERED_MUL_ADD_MAX = 128;
+void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count);
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post, ggml_tensor * tail = nullptr);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
@@ -120,4 +131,61 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
     up = fmaxf(fminf(up, limit), -limit);
 
     return ggml_cuda_op_silu_single(gate) * up;
+}
+
+void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last);
+
+struct ggml_cuda_scaled_unary_args {
+    const ggml_tensor * first;
+    const ggml_tensor * unary;
+    const ggml_tensor * last;
+};
+
+void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args);
+
+struct ggml_cuda_affine_unary_ops {
+    ggml_tensor * mul;
+    ggml_tensor * add;
+    ggml_tensor * unary;
+    ggml_tensor * post;
+    ggml_tensor * tail = nullptr;
+};
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops);
+
+struct ggml_cuda_mmvf_postop_store {
+    float * pre;
+    float * unary;
+    float * post;
+    float scale0;
+    float bias0;
+    float scale1;
+    float bias1;
+    ggml_unary_op op;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int index, float value) const {
+        dst[index] = value;
+        if (!unary) { return; }
+        const int64_t offset = dst - base + index;
+        if (pre) {
+            value = scale0 * value + bias0;
+            if (pre == base) { dst[index] = value; } else { pre[offset] = value; }
+        }
+        value = op == GGML_UNARY_OP_SILU ? ggml_cuda_op_silu_single(value) : 1.0f / (1.0f + expf(-value));
+        if (unary == base) { dst[index] = value; } else { unary[offset] = value; }
+        if (post) {
+            value = scale1 * value + bias1;
+            if (post == base) { dst[index] = value; } else { post[offset] = value; }
+        }
+    }
+};
+
+static inline ggml_cuda_mmvf_postop_store ggml_cuda_mmvf_postop_args(const ggml_cuda_scaled_unary_args & args) {
+    if (!args.unary) { return ggml_cuda_mmvf_postop_store{}; }
+    const bool before = args.first != args.unary, after = args.last != args.unary;
+    return ggml_cuda_mmvf_postop_store{before ? (float *) args.first->data : nullptr, (float *) args.unary->data,
+        after ? (float *) args.last->data : nullptr,
+        before ? ggml_get_op_params_f32(args.first, 0) : 1.0f, before ? ggml_get_op_params_f32(args.first, 1) : 0.0f,
+        after ? ggml_get_op_params_f32(args.last, 0) : 1.0f, after ? ggml_get_op_params_f32(args.last, 1) : 0.0f,
+        ggml_get_unary_op(args.unary)};
 }
