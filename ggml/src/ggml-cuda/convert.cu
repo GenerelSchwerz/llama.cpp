@@ -81,6 +81,24 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 }
 
+static __global__ void dequantize_block_q8_0_bf16(const block_q8_0 * __restrict__ x, uint4 * __restrict__ y, const int64_t k) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (8*i >= k) {
+        return;
+    }
+
+    const block_q8_0 & block = x[i/4];
+    const float d = block.d;
+    nv_bfloat16 values[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        values[j] = ggml_cuda_cast<nv_bfloat16>(d * block.qs[8*(i%4) + j]);
+    }
+    uint4 packed;
+    memcpy(&packed, values, sizeof(packed));
+    y[i] = packed;
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -262,6 +280,15 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
+}
+
+static void dequantize_block_q8_0_bf16_cuda(const void * vx, nv_bfloat16 * y, const int64_t k, cudaStream_t stream) {
+    if (k % QK8_0 != 0 || (uintptr_t) y % alignof(uint4) != 0) {
+        dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>(vx, y, k, stream);
+        return;
+    }
+    const int64_t num_blocks = (k + 8*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (8*CUDA_DEQUANTIZE_BLOCK_SIZE);
+    dequantize_block_q8_0_bf16<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const block_q8_0 *) vx, (uint4 *) y, k);
 }
 
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
@@ -508,7 +535,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_Q5_1:
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
-            return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+            return dequantize_block_q8_0_bf16_cuda;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_cuda;
         case GGML_TYPE_Q3_K:
