@@ -945,25 +945,32 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
-    template <int stride, int I, int J, typename T, data_layout dl>
+    // mma_b: the tile is the B operand of mma(), which takes its registers as the pairs {0, 2} and {1, 3}.
+    // Loading the 8x8 matrices in that order saves the register moves that would form the pairs. The tile data is the same.
+    template <int stride, bool mma_b = false, int I, int J, typename T, data_layout dl>
     static __device__ __forceinline__ void load_ldmatrix_swizzled(
             tile<I, J, T, dl> & t, const T * __restrict__ xs0, const int offset) {
 #if defined(TURING_MMA_AVAILABLE)
         static_assert(I == 8 || I == 16, "bad tile width");
         static_assert(J ==  8, "bad tile height");
-        const int i = threadIdx.x % t.I;
-        const int j = ((threadIdx.x / t.I) * (t.J / 2)) % t.J;
-        int offset_ij = offset + i * stride + j;
-        offset_ij = swizzle<stride, T>(offset_ij, i);
+        constexpr bool b_order = mma_b && I == 16;
+        const int i = b_order ? threadIdx.x % 8 + 8*(threadIdx.x / 16) : threadIdx.x % t.I;
+        const int j = b_order ? ((threadIdx.x / 8) % 2) * (t.J / 2) : ((threadIdx.x / t.I) * (t.J / 2)) % t.J;
+        // 32-bit shared byte address: with a generic pointer the compiler adds and subtracts the shared window base for every load.
+        const uint32_t addr = uint32_t(__cvta_generic_to_shared(xs0)) + swizzle<stride*sizeof(T), char>((offset + i*stride + j)*sizeof(T), i);
         int * xi = (int *) t.x;
-        if constexpr (I == 16) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        if constexpr (b_order) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+                : "r"(addr));
+        } else if constexpr (I == 16) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                 : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
-                : "l"(xs0 + offset_ij));
+                : "r"(addr));
         } else {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
                 : "=r"(xi[0]), "=r"(xi[1])
-                : "l"(xs0 + offset_ij));
+                : "r"(addr));
         }
 #elif defined(VOLTA_MMA_AVAILABLE)
 #pragma unroll
@@ -1021,17 +1028,16 @@ namespace ggml_cuda_mma {
         static_assert(dl == DATA_LAYOUT_I_MAJOR, "bad data layout");
         const int i = threadIdx.x % 16;
         const int j = I == 16 ? (threadIdx.x / 16) * (t.J / 2) : 0;
-        int offset_ij = offset + i * stride + j;
-        offset_ij = swizzle<stride, T>(offset_ij, i);
+        const uint32_t addr = uint32_t(__cvta_generic_to_shared(xs0)) + swizzle<stride*sizeof(T), char>((offset + i*stride + j)*sizeof(T), i);
         int * xi = (int *) t.x;
         if constexpr (I == 16) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
                 : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
-                : "l"(xs0 + offset_ij));
+                : "r"(addr));
         } else {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
                 : "=r"(xi[0]), "=r"(xi[1])
-                : "l"(xs0 + offset_ij));
+                : "r"(addr));
         }
 #elif defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         static_assert(dl == DATA_LAYOUT_I_MAJOR || dl == DATA_LAYOUT_I_MAJOR_MIRRORED, "bad data layout");

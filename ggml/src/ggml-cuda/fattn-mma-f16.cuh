@@ -617,6 +617,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
+    // With wide tiles CUDA swaps A and B for the KQ mma, so K is the B operand.
+#if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    constexpr bool K_is_mma_b = false;
+#else
+    constexpr bool K_is_mma_b = cols_per_warp != 8;
+#endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
@@ -669,7 +676,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                     T_A_KQ K_A;
-                    load_ldmatrix_swizzled<stride_tile_K>(K_A, tile_K, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
+                    load_ldmatrix_swizzled<stride_tile_K, K_is_mma_b>(K_A, tile_K, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
                     if constexpr (cols_per_warp == 8) {
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
                     } else {
@@ -695,7 +702,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
 
                     T_A_KQ K_A;
-                    load_ldmatrix_swizzled<stride_tile_K>(K_A, tile_K, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
+                    load_ldmatrix_swizzled<stride_tile_K, K_is_mma_b>(K_A, tile_K, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
 
                     if constexpr (cols_per_warp == 8) {
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[0]);
