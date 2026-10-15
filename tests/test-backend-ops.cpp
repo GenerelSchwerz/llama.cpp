@@ -11794,13 +11794,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // GQA 4 takes 2 heads per tile, GQA 6 with a small query batch 8 heads per tile
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 4, 1},  1024,   65, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 6, 1},  1024,   12, 1);
-    // decode and speculative-decoding batches take the 8- and 32-column tiles, ahead of the vector kernel
+    // decode and speculative-decoding batches take the 8-, 16- and 32-column tiles, ahead of the vector kernel
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 1},  4096,    1, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 1},  1024,    2, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 6, 1},   512,    3, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 1},   512,    4, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 8, { 2, 1},  1024,    1, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 8, { 2, 1},  1024,    4, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 4, 1},  1024,    3, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 256, 8, { 2, 1},  1024,    8, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 8, { 2, 1},  1024,   16, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 512, 1, {16, 1},  1024,    1, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 512, 1, {16, 1},  1024,    3, 1);

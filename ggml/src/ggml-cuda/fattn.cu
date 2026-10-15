@@ -438,11 +438,17 @@ static void ggml_cuda_flash_attn_ext_mma_quant_shape(
         ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
         return;
     }
-    // The 8-column shape for a single query token exists at D=256 only.
+    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode exist at D=256 only.
     if constexpr (D == 256) {
         if (ncols1 == 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8/ncols2, ncols2, type, type>(ctx, dst);
             return;
+        }
+        if constexpr (ncols2 == 8) {
+            if (ncols1 == 16/ncols2) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 16/ncols2, ncols2, type, type>(ctx, dst);
+                return;
+            }
         }
     }
     GGML_ASSERT(ncols1 == 32/ncols2); // the row has no other compiled width
@@ -676,8 +682,8 @@ static bool ggml_cuda_fattn_native_supported(
     if (gqa_ratio <= 4) {
         return false;
     }
-    // A single query token takes 8 columns: with 4 query tokens per tile, 3 of them would be empty.
-    *ncols1 = Q->ne[1] > 4 ? (wide_tile ? 8 : 4) : (Q->ne[1] > 1 ? 4 : 1);
+    // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
+    *ncols1 = Q->ne[1] > 4 ? (wide_tile ? 8 : 4) : (Q->ne[1] > 2 ? 4 : Q->ne[1]);
     *ncols2 = 8;
     return true;
 }

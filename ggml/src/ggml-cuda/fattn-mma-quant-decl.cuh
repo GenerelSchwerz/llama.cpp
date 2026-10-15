@@ -20,10 +20,11 @@
 // runs on, so both are declared.
 
 // D=256, the two rows that cover the extra tier: 8 heads per tile, and 2 heads per tile for an even GQA ratio.
-// Each also has an 8-column shape for a single query token (1x8) or up to 4 (4x2).
+// Each also has narrower shapes for decode: 1x8 and 2x8 for one or two query tokens, 4x2 for up to 4.
 #define DECL_FATTN_MMA_QUANT_CASE_D256(type_K, stem, tier, args) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256,  8, 8);) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256,  4, 8);) \
+    FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256,  2, 8);) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256,  1, 8);) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 32, 2);) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 16, 2);) \

@@ -174,10 +174,10 @@ jobs:
       matrix:
         include:
           - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16'
-            native_cases: 32
+            native_cases: 34
             fallback_cases: 5
           - fa_quants: 'all'
-            native_cases: 32
+            native_cases: 34
             fallback_cases: 5
     steps:
       - name: Clone
