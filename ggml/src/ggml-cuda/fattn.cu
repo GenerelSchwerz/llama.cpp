@@ -434,6 +434,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 template <ggml_type type, int D, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_quant_shape(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1) {
+    // 128 columns, one block of 8 warps per SM, for prompt processing at D=128 and D=256.
+    if constexpr (D == 128 || D == 256) {
+        if (ncols1 == 128/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 128/ncols2, ncols2, type, type>(ctx, dst);
+            return;
+        }
+    }
     if (ncols1 == 64/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
         return;
@@ -616,9 +623,10 @@ enum best_fattn_kernel {
 };
 
 // Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
-//   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (32x2, 16x2, 4x2)
+//   D=64-256:     8 heads per tile (16x8, 8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (64x2, 32x2, 16x2, 4x2)
 //                 for GQA 2 and for larger query batches of a GQA ratio that is not a multiple of 8 and not odd above 4.
 //   D=512:        a GQA ratio above 4 (8x8, 4x8, 2x8, 1x8).
+// The 128-column shapes (16x8, 64x2) exist at D=128 and D=256 only.
 // fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
 // like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
 static bool ggml_cuda_fattn_native_supported(
@@ -679,9 +687,12 @@ static bool ggml_cuda_fattn_native_supported(
         heads8 = gqa_ratio > 2 && n_q <= 8;
     }
 
+    // Prompt processing takes 128 columns at D=128 and D=256: one block of 8 warps converts each K/V tile for
+    // twice the query columns of two blocks of 4 warps.
+    const bool wide128 = wide_tile && Q->ne[0] != 64;
     if (heads8) {
         // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
-        *ncols1 = n_q > 4 ? (wide_tile ? 8 : 4) : (n_q > 2 ? 4 : n_q);
+        *ncols1 = n_q > 4 ? (wide_tile ? (wide128 && n_q > 8 ? 16 : 8) : 4) : (n_q > 2 ? 4 : n_q);
         *ncols2 = 8;
         return true;
     }
@@ -689,7 +700,7 @@ static bool ggml_cuda_fattn_native_supported(
     if (gqa_ratio < 2) {
         return false;
     }
-    *ncols1 = n_q > 16 ? (wide_tile ? 32 : 16) : (n_q > 4 ? 16 : 4);
+    *ncols1 = n_q > 16 ? (wide_tile ? (wide128 && n_q > 32 ? 64 : 32) : 16) : (n_q > 4 ? 16 : 4);
     *ncols2 = 2;
     return true;
 }

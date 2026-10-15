@@ -39,10 +39,12 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 # It is the same table as ggml_cuda_fattn_native_supported() in fattn.cu and
 # fattn-mma-quant-decl.cuh. Each row has a wide shape for Ampere and newer, a
 # Turing shape with half the columns, and 8- and 16-column shapes for decode;
-# D=512 has the rows of 8 heads per tile only. Nothing outside this table is
+# D=128 and D=256 have 128-column shapes for prompt processing, D=512 the rows
+# of 8 heads per tile only. Nothing outside this table is
 # reachable, so nothing else is built.
 FATTN_MMA_QUANT_ROUTES = [(head_size, ncols1, ncols2) for head_size in (64, 128, 256)
                           for ncols1, ncols2 in ((8, 8), (4, 8), (2, 8), (1, 8), (32, 2), (16, 2), (4, 2))] + \
+                         [(head_size, ncols1, ncols2) for head_size in (128, 256) for ncols1, ncols2 in ((64, 2), (16, 8))] + \
                          [(512, ncols1, 8) for ncols1 in (8, 4, 2, 1)]
 
 FATTN_MMA_QUANT_MANIFEST = os.path.join(

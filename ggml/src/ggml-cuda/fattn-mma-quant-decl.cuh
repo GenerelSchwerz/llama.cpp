@@ -30,9 +30,16 @@
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, D, D, 16, 2);) \
     FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, D, D,  4, 2);)
 
+// D=128 and D=256 also have 128-column shapes for prompt processing on Ampere and newer.
+#define DECL_FATTN_MMA_QUANT_CASE_D128(type_K, stem, tier, D) \
+    FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, D, D, 64, 2);) \
+    FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, D, D, 16, 8);)
+
 FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D, 64)
 FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D, 128)
 FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D, 256)
+FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D128, 128)
+FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D128, 256)
 
 // D=512 has 8 heads per tile only, for a GQA ratio above 4.
 #define DECL_FATTN_MMA_QUANT_CASE_D512(type_K, stem, tier, args) \
