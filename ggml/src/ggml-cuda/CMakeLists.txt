@@ -127,6 +127,16 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # an extra quantized-native type compiles when GGML_CUDA_FA_QUANTS selects its K-V pair of the same type
+    get_directory_property(FATTN_DEFINITIONS COMPILE_DEFINITIONS)
+    ggml_cuda_fattn_mma_quant_extra_stems(FATTN_MMA_QUANT_EXTRA_STEMS)
+    foreach (STEM IN LISTS FATTN_MMA_QUANT_EXTRA_STEMS)
+        string(TOUPPER "GGML_CUDA_FA_${STEM}_${STEM}=1" PAIR_DEFINITION)
+        if (NOT PAIR_DEFINITION IN_LIST FATTN_DEFINITIONS)
+            list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "fattn-mma-quant-instance-${STEM}-.*[.]cu$")
+        endif()
+    endforeach()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
