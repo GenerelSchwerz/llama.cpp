@@ -486,14 +486,8 @@ static void ggml_cuda_flash_attn_ext_mma_quant_case(
         return;
     }
 
-    // The D=512 row exists for Q4_0 and Q8_0 only.
-    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
-        GGML_ASSERT(D == 512 && ncols2 == 8);
-        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
-        return;
-    }
-
-    GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_supported
+    GGML_ASSERT(D == 512 && ncols2 == 8); // gated by ggml_cuda_fattn_native_supported
+    ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
 }
 
 static void ggml_cuda_flash_attn_ext_mma_quant(
@@ -624,7 +618,7 @@ enum best_fattn_kernel {
 // Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
 //   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (32x2, 16x2, 4x2)
 //                 for GQA 2 and for larger query batches of a GQA ratio that is not a multiple of 8 and not odd above 4.
-//   D=512:        a GQA ratio above 4, Q4_0 and Q8_0 only (8x8, 4x8, 2x8, 1x8).
+//   D=512:        a GQA ratio above 4 (8x8, 4x8, 2x8, 1x8).
 // fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
 // like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
 static bool ggml_cuda_fattn_native_supported(
@@ -655,13 +649,12 @@ static bool ggml_cuda_fattn_native_supported(
         return false;
     }
 
-    const bool default_tier = K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0;
     const bool wide_tile    = ampere_mma_available(cc);
 
     // Small query batches (decode, speculative decoding) take narrower tiles. They are bound by
     // reading K/V, which this route does once per KV head at 4.5 to 8.5 bits per value.
     if (Q->ne[0] == 512) {
-        if (!default_tier || gqa_ratio <= 4) {
+        if (gqa_ratio <= 4) {
             return false;
         }
         // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter().

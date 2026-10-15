@@ -11785,11 +11785,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         add_native_equivalence(type, 256, 8, { 2, 1},  1024, 65, 1);
         add_native_equivalence(type, 512, 1, {16, 1},  4096, 65, 1);
     }
-    // the extra tier has the D=256 rows only
+    // the extra tier at D=256 and D=512, the latter in chunks of 256 values
     for (ggml_type type : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
         add_native_equivalence(type, 256, 4, { 6, 1}, 16384, 65, 1);
         add_native_equivalence(type, 256, 8, { 2, 1},  1024, 65, 1);
-        add_native_equivalence(type, 512, 1, {16, 1},   512, 65, 0);
+        add_native_equivalence(type, 512, 1, {16, 1},   512, 65, 1);
+        add_native_equivalence(type, 512, 1, {16, 1},  2048,  1, 1);
+        add_native_equivalence(type, 512, 2, { 8, 1},  1024,  3, 1);
     }
     // GQA 4 takes 2 heads per tile, GQA 6 with a small query batch 8 heads per tile
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 4, 1},  1024,   65, 1);
