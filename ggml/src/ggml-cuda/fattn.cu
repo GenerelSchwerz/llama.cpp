@@ -438,17 +438,15 @@ static void ggml_cuda_flash_attn_ext_mma_quant_shape(
         ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
         return;
     }
-    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode exist at D <= 256 only.
-    if constexpr (D <= 256) {
-        if (ncols1 == 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8/ncols2, ncols2, type, type>(ctx, dst);
+    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode.
+    if (ncols1 == 8/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8/ncols2, ncols2, type, type>(ctx, dst);
+        return;
+    }
+    if constexpr (ncols2 == 8) {
+        if (ncols1 == 16/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 16/ncols2, ncols2, type, type>(ctx, dst);
             return;
-        }
-        if constexpr (ncols2 == 8) {
-            if (ncols1 == 16/ncols2) {
-                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 16/ncols2, ncols2, type, type>(ctx, dst);
-                return;
-            }
         }
     }
     GGML_ASSERT(ncols1 == 32/ncols2); // the row has no other compiled width
@@ -626,7 +624,7 @@ enum best_fattn_kernel {
 // Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
 //   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (32x2, 16x2, 4x2)
 //                 for GQA 2 and for larger query batches of a GQA ratio that is not a multiple of 8 and not odd above 4.
-//   D=512:        a GQA ratio above 4, Q4_0 and Q8_0 only (8x8, 4x8).
+//   D=512:        a GQA ratio above 4, Q4_0 and Q8_0 only (8x8, 4x8, 2x8, 1x8).
 // fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
 // like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
 static bool ggml_cuda_fattn_native_supported(
@@ -666,7 +664,8 @@ static bool ggml_cuda_fattn_native_supported(
         if (!default_tier || gqa_ratio <= 4) {
             return false;
         }
-        *ncols1 = wide_tile && Q->ne[1] > 4 ? 8 : 4;
+        // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter().
+        *ncols1 = Q->ne[1] > 4 ? (wide_tile ? 8 : 4) : (Q->ne[1] > 2 || !wide_tile ? 4 : Q->ne[1]);
         *ncols2 = 8;
         return true;
     }

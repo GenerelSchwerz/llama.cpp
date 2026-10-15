@@ -11806,6 +11806,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 8, { 2, 1},  1024,   16, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 512, 1, {16, 1},  1024,    1, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 512, 1, {16, 1},  1024,    3, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 512, 1, {16, 1},  4096,    1, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 512, 1, {16, 1},  1024,    2, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 512, 2, { 8, 1},  2048,    1, 1);
     // two sequences, and query batches large enough for the mask scan (KV_max)
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 6, 2},  1024,   65, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 2},  1024,    1, 1);

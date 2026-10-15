@@ -802,8 +802,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             flash_attn_ext_quant_stage_tile<type_V, 2*nbatch_V2, nthreads, nbatch_fa>((const char *) V_h2 + c*chunk_row_bytes, raw_c, k_VKQ_0, stride_V);
             fattn_quant_cp_async_commit();
         } else if constexpr (nstages <= 1) {
-            if constexpr (ggml_cuda_fattn_mma_quant_type(type_K)) {
-                static_assert((DKQ/2) % nbatch_K2 == 0, "K batching leaves a partial quantized tile");
+            if constexpr (ggml_cuda_fattn_mma_quant_type(type_K) && (DKQ/2) % nbatch_K2 != 0) {
+                // Turing batches K of D=512 in 96 half2 below 32 columns. The host takes 4x8 there instead.
+                NO_DEVICE_CODE;
+            } else if constexpr (ggml_cuda_fattn_mma_quant_type(type_K)) {
                 static_assert((2*nbatch_K2) % 32 == 0, "K batch start is not quant block aligned");
                 static_assert(!use_sparse, "quantized-native K/V with a sparse index set not implemented");
                 constexpr int nthreads_quant = nwarps * ggml_cuda_get_physical_warp_size();
