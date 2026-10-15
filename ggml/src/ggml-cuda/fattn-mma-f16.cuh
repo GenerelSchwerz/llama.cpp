@@ -405,10 +405,12 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nstages_quant(
     if (nstages == 2 && nbatch_K2 == DKQ/2 && nbatch_V2 == DV/2) {
         return 2;
     }
+    // Chunked mode is taken even if it fits fewer blocks per SM than targeted: the synchronous loaders are slower.
+    GGML_UNUSED(occupancy);
     const bool chunks_ok = type_K == type_V && DKQ == DV && nbatch_K2 == nbatch_V2 && nbatch_K2 < DKQ/2 &&
         nbatch_K2 % 64 == 0 && (DKQ/2) % nbatch_K2 == 0;
-    return chunks_ok && occupancy*(ggml_cuda_fattn_quant_chunked_bytes(
-        type_K, DKQ, ncols1*ncols2, ncols1, nbatch_fa, nbatch_K2, Q_in_reg) + 1024) <= smem_per_sm ? 1 : 0;
+    return chunks_ok && ggml_cuda_fattn_quant_chunked_bytes(
+        type_K, DKQ, ncols1*ncols2, ncols1, nbatch_fa, nbatch_K2, Q_in_reg) + 1024 <= smem_per_sm ? 1 : 0;
 }
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages_quant(
