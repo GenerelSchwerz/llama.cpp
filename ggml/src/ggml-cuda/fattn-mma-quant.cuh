@@ -131,8 +131,8 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
 }
 
 // Staged loading (cp.async available): raw quantized rows are copied to shared memory while the previous tile computes,
-// then converted to the half2 tile. A row of 256 elements is a whole number of 16-byte chunks for every type here,
-// so rows are copied as is. The host takes the route only for 16-byte aligned K/V and strides.
+// then converted to the half2 tile. Rows are copied as is, in pieces of ggml_cuda_fattn_quant_copy_bytes().
+// The host takes the route only for K/V data and strides aligned to that size.
 
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_block_bytes(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0) :
@@ -142,10 +142,22 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_quant_block_bytes(const
            type == GGML_TYPE_Q8_0 ? sizeof(block_q8_0) : 0;
 }
 
-// Bytes between two staged rows. Blocks of 2 mod 4 bytes are converted in even and odd passes, which is free of bank
-// conflicts with packed rows. 4-byte aligned blocks need 16 bytes of padding for the same.
+// Bytes between two staged rows. The 8 lanes of a quarter warp read 8 rows of one block. With fewer than 4 blocks
+// per row (per parity class for blocks of 2 mod 4 bytes) qr = 2 or 4 quarter warps also read rows 8 apart.
+// A row of (4/qr)*odd words keeps all of them on distinct banks. Rows of 2 mod 4 byte blocks have that length,
+// rows of 4-byte aligned blocks are padded to it.
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_stage_pitch(const ggml_type type, const int D) {
-    return D/32 * ggml_cuda_fattn_quant_block_bytes(type) + (ggml_cuda_fattn_quant_block_bytes(type) % 4 == 0 ? 16 : 0);
+    const int bb = ggml_cuda_fattn_quant_block_bytes(type);
+    const int qr = D/32 >= 4 ? 1 : 4/(D/32);
+    const int m  = 8/qr;
+    return D/32*bb + (bb % 4 == 0 ? 4*((4/qr - (D/32*bb/4) % m + m) % m) : 0);
+}
+
+// Size of the cp.async copies of a staged row: 16, 8 or 4 bytes, the largest that divides the row and the pitch.
+static constexpr __host__ __device__ int ggml_cuda_fattn_quant_copy_bytes(const ggml_type type, const int D) {
+    const int row   = D/32*ggml_cuda_fattn_quant_block_bytes(type);
+    const int pitch = ggml_cuda_fattn_quant_stage_pitch(type, D);
+    return row % 16 == 0 && pitch % 16 == 0 ? 16 : (row % 8 == 0 && pitch % 8 == 0 ? 8 : 4);
 }
 
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_stage_bytes(const ggml_type type, const int D, const int nrows) {
@@ -201,8 +213,24 @@ static __device__ __forceinline__ void fattn_quant_cp_async_wait_group() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// cp.async of 4, 8 or 16 bytes. Only the 16-byte copy can bypass L1.
+template <int nbytes>
+static __device__ __forceinline__ void fattn_quant_cp_async(const unsigned int dst, const char * const src) {
+#ifdef CP_ASYNC_AVAILABLE
+    static_assert(nbytes == 4 || nbytes == 8 || nbytes == 16, "bad copy size");
+    if constexpr (nbytes == 16) {
+        cp_async_cg_16<0>(dst, src);
+    } else {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" : : "r"(dst), "l"(src), "n"(nbytes));
+    }
+#else
+    GGML_UNUSED_VARS(dst, src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Start copying nbatch_fa raw rows of D elements, row0 onward, into raw.
-// Consecutive threads take consecutive 16-byte chunks so each row is read as whole sectors.
+// Consecutive threads take consecutive chunks so each row is read as whole sectors.
 template<ggml_type type, int D, int nthreads, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
         const char * const __restrict__ KV, char * const __restrict__ raw, const int row0, const int stride_row) {
@@ -210,10 +238,10 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
     constexpr int row_bytes      = D/32 * ggml_cuda_fattn_quant_block_bytes(type);
     constexpr int pitch          = ggml_cuda_fattn_quant_stage_pitch(type, D);
-    constexpr int chunks_per_row = row_bytes/16;
+    constexpr int cs             = ggml_cuda_fattn_quant_copy_bytes(type, D);
+    constexpr int chunks_per_row = row_bytes/cs;
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
-    static_assert(row_bytes % 16 == 0, "a quantized row is not a whole number of 16-byte chunks");
-    static_assert(pitch % 16 == 0, "bad stage pitch");
+    static_assert(row_bytes % cs == 0 && pitch % cs == 0, "bad stage pitch");
 
     const unsigned int raw_s = ggml_cuda_cvta_generic_to_shared(raw);
     const char * const src0 = KV + int64_t(row0)*stride_row;
@@ -224,7 +252,7 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
         const int c = c0 + tid;
         const int i = c / chunks_per_row;
         const int k = c - i*chunks_per_row;
-        cp_async_cg_16<0>(raw_s + i*pitch + 16*k, src0 + (i*stride_row + 16*k));
+        fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src0 + (i*stride_row + cs*k));
     }
 
     // Copy the remaining chunks in 4-byte pieces so every thread takes part.
@@ -232,22 +260,22 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
     constexpr int nrem  = nchunks % nthreads;
     constexpr int c_rem = nchunks - nrem;
     static_assert(nrem % warp_size == 0, "bad remainder");
-    if constexpr ((16*nrem) % (4*nthreads) != 0) {
+    if constexpr ((cs*nrem) % (4*nthreads) != 0) {
         if (int(threadIdx.y) < nrem/warp_size) {
             const int c = c_rem + tid;
             const int i = c / chunks_per_row;
             const int k = c - i*chunks_per_row;
-            cp_async_cg_16<0>(raw_s + i*pitch + 16*k, src0 + (i*stride_row + 16*k));
+            fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src0 + (i*stride_row + cs*k));
         }
     } else {
 #pragma unroll
-        for (int o0 = 0; o0 < 16*nrem; o0 += 4*nthreads) {
+        for (int o0 = 0; o0 < cs*nrem; o0 += 4*nthreads) {
             const int o = o0 + 4*tid;
-            const int c = c_rem + o/16;
+            const int c = c_rem + o/cs;
             const int i = c / chunks_per_row;
             const int k = c - i*chunks_per_row;
-            const int b = 16*k + o % 16;
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" : : "r"(raw_s + i*pitch + b), "l"(src0 + (i*stride_row + b)));
+            const int b = cs*k + o % cs;
+            fattn_quant_cp_async<4>(raw_s + i*pitch + b, src0 + (i*stride_row + b));
         }
     }
 #else
@@ -256,74 +284,79 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
 #endif // CP_ASYNC_AVAILABLE
 }
 
-// Convert pass k of a staged tile. The 8 lanes of a quarter warp take 8 consecutive rows of the same block:
-// through the tile swizzle their 16-byte stores hit 8 distinct bank groups, and their reads of the staged rows do not conflict.
-template<ggml_type type, int D, int stride_tile, int nthreads, int nbatch_fa, int k>
-static __device__ __forceinline__ void flash_attn_ext_quant_dequant_pass(
-        const char * const __restrict__ raw, half2 * const __restrict__ tile, const int i_first, const int i_step) {
+// Convert one block of 32 values of staged row i, p % 4 == mis for its address p.
+template<ggml_type type, int D, int stride_tile, int mis>
+static __device__ __forceinline__ void flash_attn_ext_quant_dequant_block(
+        const char * const __restrict__ raw, half2 * const __restrict__ tile, const int i, const int b) {
     using traits = fattn_quant_type_traits<type>;
+    constexpr int bb    = ggml_cuda_fattn_quant_block_bytes(type);
+    constexpr int pitch = ggml_cuda_fattn_quant_stage_pitch(type, D);
 
-    constexpr int nblocks   = D/32;
-    constexpr int bb        = ggml_cuda_fattn_quant_block_bytes(type);
-    constexpr int pitch     = ggml_cuda_fattn_quant_stage_pitch(type, D);
-    // Blocks of 2 mod 4 bytes alternate between aligned and misaligned, pass k takes one parity only.
-    constexpr bool parity_split = bb % 4 != 0;
-    constexpr int  mis          = parity_split ? (k*bb) % 4 : 0;
-    static_assert(!parity_split || ((nblocks/4)*bb) % 4 == 0, "bad block split");
-
-    const int q = threadIdx.x / 8;
-    const int b = parity_split ? (nblocks/4)*q + k : 4*k + q;
+    __align__(16) half2 vals[16];
+    traits::template dequant_block<mis>(raw + i*pitch + b*bb, vals);
 
 #pragma unroll
-    for (int i0 = 0; i0 < nbatch_fa; i0 += i_step) {
-        const int i = i0 + i_first;
-
-        __align__(16) half2 vals[16];
-        traits::template dequant_block<mis>(raw + i*pitch + b*bb, vals);
-
-#pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            ggml_cuda_memcpy_1<16>(ggml_cuda_mma::swizzle<stride_tile>(tile, i*stride_tile + 16*b + 4*c, i), vals + 4*c);
-        }
+    for (int c = 0; c < 4; ++c) {
+        ggml_cuda_memcpy_1<16>(ggml_cuda_mma::swizzle<stride_tile>(tile, i*stride_tile + 16*b + 4*c, i), vals + 4*c);
     }
 }
 
 // Convert a staged tile of nbatch_fa rows of D elements into the half2 tile.
+// The 8 lanes of a quarter warp take 8 consecutive rows of the same block: through the tile swizzle their 16-byte stores
+// hit 8 distinct bank groups, and their reads of the staged rows do not conflict.
+// Blocks of 2 mod 4 bytes alternate between aligned and misaligned: even and odd blocks are separate classes,
+// so the misalignment is a compile-time constant. A warp step converts 4 units of 8 rows x 1 block of one class:
+// qb blocks x qr row groups.
 template<ggml_type type, int D, int stride_tile, int nthreads, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_quant_dequant_tile(
         const char * const __restrict__ raw, half2 * const __restrict__ tile) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nblocks   = D/32;
     constexpr int nwarps    = nthreads/warp_size;
+    constexpr int bb        = ggml_cuda_fattn_quant_block_bytes(type);
+    constexpr int ncls      = bb % 4 != 0 ? 2 : 1;
+    constexpr int nb_cls    = nblocks/ncls;
+    constexpr int qb        = nb_cls < 4 ? nb_cls : 4;
+    constexpr int qr        = 4/qb;
+    constexpr int ng        = nbatch_fa/(8*qr);    // row group sets
+    constexpr int nsteps    = ng*(nb_cls/qb);       // warp steps per class
     static_assert(warp_size == 32, "the conversion lane layout assumes 32 lanes");
-    static_assert(nblocks == 8 || nblocks == 16, "unsupported head size");
+    static_assert(nblocks % ncls == 0 && nb_cls % qb == 0 && nbatch_fa % (8*qr) == 0, "unsupported head size");
+    static_assert(ncls == 1 || ((ncls*bb) % 4 == 0), "bad block split");
     static_assert(stride_tile == D/2, "the staged tile must be swizzled, not padded");
 
-    if constexpr (8*nwarps <= nbatch_fa) {
-        // Every warp takes 8 rows of each pass.
-        static_assert(nbatch_fa % (8*nwarps) == 0, "bad nbatch_fa");
-        const int i_first = 8*threadIdx.y + threadIdx.x % 8;
-        flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 0>(raw, tile, i_first, 8*nwarps);
-        flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 1>(raw, tile, i_first, 8*nwarps);
-        if constexpr (nblocks == 16) {
-            flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 2>(raw, tile, i_first, 8*nwarps);
-            flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 3>(raw, tile, i_first, 8*nwarps);
+    const int q   = threadIdx.x / 8;
+    const int i_q = qr == 1 ? threadIdx.x % 8 : 8*(q / qb) + threadIdx.x % 8;
+    const int b_q = qr == 1 ? ncls*q : ncls*(q % qb);
+
+    if constexpr (ng % nwarps == 0) {
+        // Every warp takes ng/nwarps row group sets of each block set and class.
+#pragma unroll
+        for (int cls = 0; cls < ncls; ++cls) {
+#pragma unroll
+            for (int bs = 0; bs < nb_cls/qb; ++bs) {
+#pragma unroll
+                for (int r0 = 0; r0 < ng; r0 += nwarps) {
+                    const int i = 8*qr*(r0 + threadIdx.y) + i_q;
+                    const int b = ncls*qb*bs + b_q + cls;
+                    if (cls == 0) {
+                        flash_attn_ext_quant_dequant_block<type, D, stride_tile, 0>(raw, tile, i, b);
+                    } else {
+                        flash_attn_ext_quant_dequant_block<type, D, stride_tile, bb % 4>(raw, tile, i, b);
+                    }
+                }
+            }
         }
     } else {
-        // More warps than rows: each warp takes 8 rows of one pass.
-        static_assert(nwarps == (nbatch_fa/8)*(nblocks/4), "bad warp count");
-        const int i_first = 8*(threadIdx.y % (nbatch_fa/8)) + threadIdx.x % 8;
-        const int k       = threadIdx.y / (nbatch_fa/8);
-        if (k == 0) {
-            flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 0>(raw, tile, i_first, nbatch_fa);
-        } else if (nblocks == 8 || k == 1) {
-            flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 1>(raw, tile, i_first, nbatch_fa);
-        } else if constexpr (nblocks == 16) {
-            if (k == 2) {
-                flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 2>(raw, tile, i_first, nbatch_fa);
-            } else {
-                flash_attn_ext_quant_dequant_pass<type, D, stride_tile, nthreads, nbatch_fa, 3>(raw, tile, i_first, nbatch_fa);
-            }
+        // More warps than row group sets: each warp takes one step of one class.
+        static_assert(nwarps == ncls*nsteps, "bad warp count");
+        const int s = threadIdx.y % nsteps;
+        const int i = 8*qr*(s % ng) + i_q;
+        const int b = ncls*qb*(s / ng) + b_q;
+        if (int(threadIdx.y) < nsteps) {
+            flash_attn_ext_quant_dequant_block<type, D, stride_tile, 0>(raw, tile, i, b);
+        } else if constexpr (ncls == 2) {
+            flash_attn_ext_quant_dequant_block<type, D, stride_tile, bb % 4>(raw, tile, i, b + 1);
         }
     }
 }

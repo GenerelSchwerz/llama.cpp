@@ -11815,6 +11815,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // an odd GQA ratio of 4 or less has no tile shape and stays on the F16 path
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 3, 1},  1024,   65, 0);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 3, 1},  1024,    4, 0);
+    // D=128 has the D=256 rows; its rows of 2 mod 4 byte blocks are staged in 8-byte pieces
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+        add_native_equivalence(type, 128, 4, { 8, 1},  1024,   65, 1);
+        add_native_equivalence(type, 128, 8, { 4, 1},  4096,   65, 1);
+        add_native_equivalence(type, 128, 4, { 8, 1},  4096,    1, 1);
+    }
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 6, 1},  1024,   12, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 4, { 6, 1},  1024, 1024, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 8, { 2, 1},  2048,   65, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 8, { 2, 1},  1024,    3, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 8, { 4, 1},  1024,    8, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 4, { 8, 1},  1024,    2, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 8, 1},   512,    4, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 4, { 8, 2},  1024,   65, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 3, 1},  1024,   65, 0);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 8, { 4, 1},  1024,    1, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 8, { 4, 1},  1024,    2, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 128, 8, { 4, 1},  1024,   12, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 8, { 1, 1},  1024,    4, 0);
+    // D=64 stages 4-byte pieces for blocks of 2 mod 4 bytes; GQA 8 with attention sinks as in gpt-oss
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+        add_native_equivalence(type, 64, 4, { 8, 1},  1024,   65, 1);
+        add_native_equivalence(type, 64, 4, { 8, 1},  4096,    1, 1);
+        add_native_equivalence(type, 64, 8, { 2, 1},  1024,   65, 1);
+    }
+    for (int64_t nb : { 1, 3, 65 }) {
+        for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        64, 64, 8, {8, 1}, 2048, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                        type, type, {0, 1, 2, 3}, true, false, 0, 1, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(
+                128, 128, 4, {8, 1}, 1024, 65, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, 1, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -12497,10 +12532,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // Quantized-native FlashAttention against the F16-casting path, on the three
-    // rows the route has kernels for: D=256 GQA 6 and GQA 2, D=512 GQA 16.
+    // Quantized-native FlashAttention against the F16-casting path, on the
+    // rows the route has kernels for: D=256 GQA 6 and GQA 2, D=512 GQA 16, D=128 GQA 8 and GQA 4, D=64 GQA 8.
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1 }) {
-        for (auto [hs, nh, nr2] : std::initializer_list<std::array<int64_t, 3>>{ {256, 4, 6}, {256, 8, 2}, {512, 1, 16} }) {
+        for (auto [hs, nh, nr2] : std::initializer_list<std::array<int64_t, 3>>{ {256, 4, 6}, {256, 8, 2}, {512, 1, 16}, {128, 4, 8}, {128, 8, 4}, {64, 8, 8} }) {
             for (int64_t kv : { 1024, 4096, 16384 }) {
                 for (int64_t nb : { 512, 2048 }) {
                     for (int native : { 0, 1 }) {
@@ -12514,7 +12549,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // The same rows at decode and speculative-decoding batch sizes.
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
-        for (auto [hs, nh, nr2] : std::initializer_list<std::array<int64_t, 3>>{ {256, 4, 6}, {256, 8, 2}, {512, 1, 16} }) {
+        for (auto [hs, nh, nr2] : std::initializer_list<std::array<int64_t, 3>>{ {256, 4, 6}, {256, 8, 2}, {512, 1, 16}, {128, 4, 8}, {128, 8, 4}, {64, 8, 8} }) {
             for (int64_t kv : { 4096, 16384, 65536 }) {
                 for (int64_t nb : { 1, 2, 3, 4, 8 }) {
                     for (int native : { 0, 1 }) {

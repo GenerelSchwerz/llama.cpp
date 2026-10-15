@@ -3,4 +3,6 @@
 #include "../fattn-mma-quant-q4_0.cuh"
 #include "../fattn-mma-f16.cuh"
 
+DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 64, 64, 1, 8);
+DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 128, 128, 1, 8);
 DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 256, 256, 1, 8);

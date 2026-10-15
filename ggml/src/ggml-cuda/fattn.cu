@@ -438,8 +438,8 @@ static void ggml_cuda_flash_attn_ext_mma_quant_shape(
         ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
         return;
     }
-    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode exist at D=256 only.
-    if constexpr (D == 256) {
+    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode exist at D <= 256 only.
+    if constexpr (D <= 256) {
         if (ncols1 == 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8/ncols2, ncols2, type, type>(ctx, dst);
             return;
@@ -463,6 +463,22 @@ static void ggml_cuda_flash_attn_ext_mma_quant_case(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
     const int64_t D = dst->src[0]->ne[0];
 
+    if (D == 64 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 64, 8>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 64 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 64, 2>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 128 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 128, 8>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 128 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 128, 2>(ctx, dst, ncols1);
+        return;
+    }
     if (D == 256 && ncols2 == 8) {
         ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 8>(ctx, dst, ncols1);
         return;
@@ -607,26 +623,12 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_NATIVE = 500, // MMA reading a quantized cache in place, no F16 copy
 };
 
-// Geometry the quantized-native route has a compiled kernel for, and the tile
-// shape that kernel uses. The rows are:
-//
-//   D=256, gqa_ratio == 2, n_q > 16 -> 32x2, Q4_0 and Q8_0
-//   D=256, gqa_ratio  > 4, n_q >  4 ->  8x8, every compiled native type
-//   D=512, gqa_ratio  > 4, n_q >  4 ->  8x8, Q4_0 and Q8_0
-//
-// Each shape is what ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1/2() would
-// pick inside those bounds. It is written out here rather than taken from those
-// switches so that the compiled kernel set is exactly the set this function can
-// select; fattn-mma-quant-decl.cuh declares the same rows.
-//
-// Turing takes the same rows with half the columns: 16x2, 4x8 and 4x8. That is
-// the Turing escape in switch_ncols1(), which caps ncols1*ncols2 at 32 there.
-// The escape fires exactly when Ampere is not the compiled target, so
-// ampere_mma_available() is what picks between the two shapes.
-//
-// Every condition here answers "is a kernel compiled for this". The caller opts
-// in with --flash-attn-native-quants and owns the decision from there; nothing
-// second-guesses it by cache length or by where the cache lives.
+// Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
+//   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio above 4, 2 heads per tile (32x2, 16x2, 4x2)
+//                 for GQA 2 and 4 and for larger query batches of an even GQA ratio that is not a multiple of 8.
+//   D=512:        a GQA ratio above 4, Q4_0 and Q8_0 only (8x8, 4x8).
+// fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
+// like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
 static bool ggml_cuda_fattn_native_supported(
         const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
         int * ncols1, int * ncols2) {
@@ -637,10 +639,11 @@ static bool ggml_cuda_fattn_native_supported(
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    // Rows are staged with 16-byte cp.async copies, and the q5_1 loader reads qh
-    // with an 8-byte aligned access. A KV cache is always aligned this way.
+    // Rows are staged with cp.async copies of up to 16 bytes, see ggml_cuda_fattn_quant_copy_bytes(). That is at least
+    // 8 bytes for q5_1, which the synchronous q5_1 loader needs. A KV cache is always aligned this way.
     const auto aligned = [](const ggml_tensor * tensor) {
-        return (((uintptr_t) tensor->data | tensor->nb[1] | tensor->nb[2] | tensor->nb[3]) & 15) == 0;
+        const size_t align = ggml_cuda_fattn_quant_copy_bytes(tensor->type, tensor->ne[0]);
+        return ((uintptr_t) tensor->data | tensor->nb[1] | tensor->nb[2] | tensor->nb[3]) % align == 0;
     };
 
     // A sparse K/V set (n_kv_max > 0) is gathered by the F16 kernel only, and
@@ -668,7 +671,7 @@ static bool ggml_cuda_fattn_native_supported(
         return true;
     }
 
-    if (Q->ne[0] != 256) {
+    if (Q->ne[0] != 64 && Q->ne[0] != 128 && Q->ne[0] != 256) {
         return false;
     }
 
