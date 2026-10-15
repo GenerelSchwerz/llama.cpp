@@ -397,7 +397,8 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_quant_chunked_bytes(
 //     0: no cp.async, the synchronous loaders.
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nstages_quant(
         const ggml_type type_K, const ggml_type type_V, const int DKQ, const int DV, const int ncols1, const int ncols2,
-        const int nstages, const int nbatch_K2, const int nbatch_V2, const int nbatch_fa, const int occupancy, const bool Q_in_reg) {
+        const int nstages, const int nbatch_K2, const int nbatch_V2, const int nbatch_fa, const int occupancy, const bool Q_in_reg,
+        const int smem_per_sm) {
     if (!ggml_cuda_fattn_mma_quant_type(type_K) || nstages == 0) {
         return 0;
     }
@@ -407,7 +408,7 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nstages_quant(
     const bool chunks_ok = type_K == type_V && DKQ == DV && nbatch_K2 == nbatch_V2 && nbatch_K2 < DKQ/2 &&
         nbatch_K2 % 64 == 0 && (DKQ/2) % nbatch_K2 == 0;
     return chunks_ok && occupancy*(ggml_cuda_fattn_quant_chunked_bytes(
-        type_K, DKQ, ncols1*ncols2, ncols1, nbatch_fa, nbatch_K2, Q_in_reg) + 1024) <= 100*1024 ? 1 : 0;
+        type_K, DKQ, ncols1*ncols2, ncols1, nbatch_fa, nbatch_K2, Q_in_reg) + 1024) <= smem_per_sm ? 1 : 0;
 }
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages_quant(
@@ -417,7 +418,7 @@ static __host__ int ggml_cuda_fattn_mma_get_nstages_quant(
         ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc),
         ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc), ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc),
         ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols, cc),
-        ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc));
+        ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc), ggml_cuda_fattn_quant_smem_per_sm(ggml_cuda_highest_compiled_arch(cc)));
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages_quant(
@@ -427,11 +428,12 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages_quant(
         ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, false),
         ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols), ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols),
         ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols),
-        ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols));
+        ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols), ggml_cuda_fattn_quant_smem_per_sm_device());
 }
 
 // Staged quantized K/V with separate half2 tiles for K and V: converting one overlaps the MMA that reads the other.
-// Only used if it keeps the targeted occupancy within 100 KiB of shared memory per SM (1 KiB reserved per block).
+// Only used if it keeps the targeted occupancy within the shared memory per SM (1 KiB reserved per block),
+// see ggml_cuda_fattn_quant_smem_per_sm().
 // If the mask tile does not fit next to the K/V tiles, each thread loads its mask values to registers instead.
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_shadow_bytes(
         const ggml_type type_K, const ggml_type type_V, const int DKQ, const int DV, const int nbatch_fa) {
@@ -443,22 +445,22 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_mma_mask_bytes(const in
     return ncols1*(nbatch_fa/2 + 4)*int(sizeof(half2));
 }
 
-static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_shadow_fits(const int nbytes, const int occupancy) {
-    return occupancy*(nbytes + 1024) <= 100*1024;
+static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_shadow_fits(const int nbytes, const int occupancy, const int smem_per_sm) {
+    return occupancy*(nbytes + 1024) <= smem_per_sm;
 }
 
 // 0: no separate K/V tiles, 1: separate K/V tiles, 2: separate K/V tiles with the mask in registers.
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_shadow_mode(
         const ggml_type type_K, const ggml_type type_V, const int DKQ, const int DV, const int ncols1, const int nbatch_fa,
-        const int occupancy, const int nstages, const int cols_per_warp) {
+        const int occupancy, const int nstages, const int cols_per_warp, const int smem_per_sm) {
     if (!ggml_cuda_fattn_mma_quant_type(type_K) || nstages < 2 || cols_per_warp != 16) {
         return 0;
     }
     const int nbytes = ggml_cuda_fattn_quant_shadow_bytes(type_K, type_V, DKQ, DV, nbatch_fa);
-    if (ggml_cuda_fattn_quant_shadow_fits(nbytes + ggml_cuda_fattn_mma_mask_bytes(ncols1, nbatch_fa), occupancy)) {
+    if (ggml_cuda_fattn_quant_shadow_fits(nbytes + ggml_cuda_fattn_mma_mask_bytes(ncols1, nbatch_fa), occupancy, smem_per_sm)) {
         return 1;
     }
-    return ggml_cuda_fattn_quant_shadow_fits(nbytes, occupancy) ? 2 : 0;
+    return ggml_cuda_fattn_quant_shadow_fits(nbytes, occupancy, smem_per_sm) ? 2 : 0;
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -713,7 +715,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // Staged quantized K/V: the half2 tile(s), then the raw K rows, then the raw V rows.
     // With stage_shadow K and V have their own half2 tiles, otherwise tile_V == tile_K.
     constexpr int  shadow_mode  = ggml_cuda_fattn_quant_shadow_mode(
-        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols), nstages, cols_per_warp);
+        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols), nstages, cols_per_warp,
+        ggml_cuda_fattn_quant_smem_per_sm_device());
     constexpr bool stage_shadow = shadow_mode > 0;
     constexpr bool mask_in_reg  = shadow_mode == 2;
     [[maybe_unused]] char * const raw_K = (char *) (tile_V + nbatch_fa*stride_tile_V);
@@ -1512,7 +1515,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Staged quantized K/V: the half2 tile(s), the raw K rows, the raw V rows, then the mask, see flash_attn_ext_f16_iter.
     constexpr bool stage_quant  = is_quant_kv && nstages > 1;
     constexpr int  shadow_mode  = ggml_cuda_fattn_quant_shadow_mode(
-        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols), nstages, cols_per_warp);
+        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols), nstages, cols_per_warp,
+        ggml_cuda_fattn_quant_smem_per_sm_device());
     constexpr bool stage_shadow = shadow_mode > 0;
     constexpr int  nbytes_raw   = stage_quant ?
         ggml_cuda_fattn_quant_stage_bytes(type_K, DKQ, nbatch_fa) + ggml_cuda_fattn_quant_stage_bytes(type_V, DV, nbatch_fa) : 0;
@@ -2306,6 +2310,56 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
+// Dynamic shared memory of a flash_attn_ext_f16 kernel, see flash_attn_ext_f16_process_tile.
+static __host__ size_t ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(
+        const int DKQ, const int DV, const int ncols1, const int ncols2, const ggml_type type_K, const ggml_type type_V,
+        const int cc, const int warp_size) {
+    const bool is_quant_kv = ggml_cuda_fattn_mma_quant_type(type_K) || ggml_cuda_fattn_mma_quant_type(type_V);
+    const int  ncols       = ncols1*ncols2;
+
+    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int  nstages        = is_quant_kv ?
+        ggml_cuda_fattn_mma_get_nstages_quant(type_K, type_V, DKQ, DV, ncols1, ncols2, cc) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
+
+    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int nwarps        = nthreads / warp_size;
+
+    const bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+
+    // KV tile strides must match flash_attn_ext_f16_iter / _process_tile.
+    const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
+    const int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
+    const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
+    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
+    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
+    // Staged quantized K/V: one half2 tile, or one each for K and V with stage_shadow, plus the raw K and V rows.
+    const int    shadow_mode             = ggml_cuda_fattn_quant_shadow_mode(
+        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols, cc), nstages, cols_per_warp,
+        ggml_cuda_fattn_quant_smem_per_sm(ggml_cuda_highest_compiled_arch(cc)));
+    const bool   stage_shadow            = shadow_mode > 0;
+
+    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
+    const size_t nbytes_shared_mask      = shadow_mode == 2 ? 0 : ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+    const size_t nbytes_shared_KV_quant  = nbatch_fa            *         stride_tile_K*(stage_shadow ? 2 : 1) * sizeof(half2) +
+        ggml_cuda_fattn_quant_stage_bytes(type_K, DKQ, nbatch_fa) + ggml_cuda_fattn_quant_stage_bytes(type_V, DV, nbatch_fa);
+
+    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage :
+        (is_quant_kv ? nbytes_shared_KV_quant : nbytes_shared_KV_2stage);
+
+    // Chunked mode: two raw chunk buffers after the mask.
+    const size_t nbytes_shared_chunks = is_quant_kv && nstages == 1 ? 2*ggml_cuda_fattn_quant_stage_bytes(type_K, 2*nbatch_K2, nbatch_fa) : 0;
+
+    return std::max(nbytes_shared_combine, (Q_in_reg ?
+        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
+                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask) + nbytes_shared_chunks);
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2,
     ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2323,45 +2377,15 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
     const int  nstages        = is_quant_kv ?
         ggml_cuda_fattn_mma_get_nstages_quant(type_K, type_V, DKQ, DV, ncols1, ncols2, cc) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
 
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
 
-    // KV tile strides must match flash_attn_ext_f16_iter / _process_tile.
-    const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
-    const int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
-    const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
-    // Staged quantized K/V: one half2 tile, or one each for K and V with stage_shadow, plus the raw K and V rows.
-    const int    shadow_mode             = ggml_cuda_fattn_quant_shadow_mode(
-        type_K, type_V, DKQ, DV, ncols1, nbatch_fa, ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols, cc), nstages, cols_per_warp);
-    const bool   stage_shadow            = shadow_mode > 0;
-
-    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
-    const size_t nbytes_shared_mask      = shadow_mode == 2 ? 0 : ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
-    const size_t nbytes_shared_KV_quant  = nbatch_fa            *         stride_tile_K*(stage_shadow ? 2 : 1) * sizeof(half2) +
-        ggml_cuda_fattn_quant_stage_bytes(type_K, DKQ, nbatch_fa) + ggml_cuda_fattn_quant_stage_bytes(type_V, DV, nbatch_fa);
-
-    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage :
-        (is_quant_kv ? nbytes_shared_KV_quant : nbytes_shared_KV_2stage);
-
-    // Chunked mode: two raw chunk buffers after the mask.
-    const size_t nbytes_shared_chunks = is_quant_kv && nstages == 1 ? 2*ggml_cuda_fattn_quant_stage_bytes(type_K, 2*nbatch_K2, nbatch_fa) : 0;
-
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, (Q_in_reg ?
-        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask) + nbytes_shared_chunks);
+    const size_t nbytes_shared_total = ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(DKQ, DV, ncols1, ncols2, type_K, type_V, cc, warp_size_host);
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));

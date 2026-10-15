@@ -708,10 +708,19 @@ static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
 }
 
 static bool ggml_cuda_fattn_native_applies(
-        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        const int device, const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
         int * ncols1, int * ncols2) {
-    return ggml_cuda_fattn_native_enabled(dst) &&
-        ggml_cuda_fattn_native_supported(cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2);
+    if (!ggml_cuda_fattn_native_enabled(dst) ||
+            !ggml_cuda_fattn_native_supported(cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2)) {
+        return false;
+    }
+    // The staging is planned for the shared memory of the compiled architecture, see ggml_cuda_fattn_quant_smem_per_sm().
+    // Code for sm_80 also runs on devices with less.
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
+    return ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(
+        K->ne[0], V->ne[0], *ncols1, *ncols2, K->type, V->type, cc, info.warp_size) <= info.smpbo;
 }
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -835,7 +844,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
         // Checked before the vector kernel, which reads K/V once per Q head rather than once per KV head.
         int native_ncols1 = 0;
         int native_ncols2 = 0;
-        if (ggml_cuda_fattn_native_applies(cc, dst, gqa_opt_applies, gqa_ratio, &native_ncols1, &native_ncols2)) {
+        if (ggml_cuda_fattn_native_applies(device, cc, dst, gqa_opt_applies, gqa_ratio, &native_ncols1, &native_ncols2)) {
             if (ncols1 && ncols2) {
                 *ncols1 = native_ncols1;
                 *ncols2 = native_ncols2;

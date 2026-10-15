@@ -65,6 +65,22 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_pair(ggml_ty
 #define GGML_FATTN_QUANT_KQ_HALF
 #endif
 
+// Shared memory per SM that the staging modes plan with, for the architecture the device code is compiled for.
+// Code for sm_80 also runs on sm_86 and sm_89, which have less; the host then declines kernels that do not fit.
+static constexpr __host__ __device__ int ggml_cuda_fattn_quant_smem_per_sm(const int arch) {
+    return arch == 750 ? 64*1024 :
+           arch == 800 || arch == 870 ? 164*1024 :
+           arch == 900 || arch == 1000 || arch == 1030 ? 228*1024 : 100*1024;
+}
+
+static constexpr __device__ int ggml_cuda_fattn_quant_smem_per_sm_device() {
+#ifdef __CUDA_ARCH__
+    return ggml_cuda_fattn_quant_smem_per_sm(__CUDA_ARCH__);
+#else
+    return ggml_cuda_fattn_quant_smem_per_sm(0);
+#endif // __CUDA_ARCH__
+}
+
 // Load quantized rows directly into the half2 shared-memory tile consumed by
 // the existing MMA kernel.
 template<ggml_type type, int D2, int stride_tile, int nthreads, int nbatch_fa, int ncols1, int ncols2, bool oob_check>
