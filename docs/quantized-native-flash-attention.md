@@ -36,12 +36,13 @@ The graph opts in per node via `ggml_flash_attn_ext_set_native_quants()`, which 
 | 256 | even, not a multiple of 8 | > 16 | 32x2 | 16x2 |
 | 256 | even above 4, not a multiple of 8 | 5-16 | 8x8 | 4x8 |
 | 256 | odd above 4, or a multiple of 8 | > 4 | 8x8 | 4x8 |
-| 256 | > 4 | 2-4 | 4x8 | 4x8 |
+| 256 | > 4 | 3-4 | 4x8 | 4x8 |
+| 256 | > 4 | 2 | 2x8 | 2x8 |
 | 256 | > 4 | 1 | 1x8 | 1x8 |
 | 512 | > 4 | > 4 | 8x8 | 4x8 |
 | 512 | > 4 | 1-4 | 4x8 | 4x8 |
 
-D=256 has kernels for `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0`, D=512 for `q4_0` and `q8_0`. A tile `AxB` covers A query tokens of B Q heads that share a KV head. An even GQA ratio that is not a multiple of 8 takes 2 heads per tile when the query batch is large, because 8 heads per tile would compute zeros for the missing ones (25% of the tile at GQA 6). Small query batches take narrower shapes: they are bound by reading K/V, and at D=256 a single token (or up to 4 at 2 heads per tile) gets an 8-column tile, which loads 64 K/V rows per stage instead of 32 and does a quarter of the arithmetic. With 2 or more tokens at 8 heads per tile, one 4x8 tile beats several 1x8 tiles, which would read K/V once each.
+D=256 has kernels for `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0`, D=512 for `q4_0` and `q8_0`. A tile `AxB` covers A query tokens of B Q heads that share a KV head. An even GQA ratio that is not a multiple of 8 takes 2 heads per tile when the query batch is large, because 8 heads per tile would compute zeros for the missing ones (25% of the tile at GQA 6). Small query batches take narrower shapes: they are bound by reading K/V, and at D=256 one or two tokens at 8 heads per tile get 8 or 16 columns (1x8, 2x8), up to 4 tokens at 2 heads per tile 8 columns (4x2). These load 64 K/V rows per stage instead of 32 and do a fraction of the arithmetic. One tile per KV head beats several narrower ones, which would each read K/V again.
 
 `fattn-mma-quant-decl.cuh` declares exactly these shapes and nothing else, so a disagreement with `ggml_cuda_fattn_native_supported()` is a link error.
 
@@ -57,7 +58,7 @@ The cache-type inventory lives in `ggml/src/ggml-cuda/fattn-mma-quant-types.h`:
 | `q5_0` | EXTRA | `GGML_CUDA_FA_QUANTS` with `q5_0-q5_0`, or `all` |
 | `q5_1` | EXTRA | `GGML_CUDA_FA_QUANTS` with `q5_1-q5_1`, or `all` |
 
-An extra type follows its own `type-type` pair, the same selection that compiles its vector kernel. Without its pair a cache of that type still runs, on the F16-casting path. That gives 16 kernels in a default build, six more per selected extra pair and 34 with `all`. `scripts/fattn-native-inventory.py --fa-quants <value>` reads the built library back and fails on a missing, unexpected or duplicated kernel. The route is CUDA only; HIP and MUSA do not build the instances.
+An extra type follows its own `type-type` pair, the same selection that compiles its vector kernel. Without its pair a cache of that type still runs, on the F16-casting path. That gives 18 kernels in a default build, seven more per selected extra pair and 39 with `all`. `scripts/fattn-native-inventory.py --fa-quants <value>` reads the built library back and fails on a missing, unexpected or duplicated kernel. The route is CUDA only; HIP and MUSA do not build the instances.
 
 ## Implementation
 
@@ -87,9 +88,9 @@ Two changes to the code both paths share make the F16 path faster as well, with 
 RTX 4070 (`sm_89`, Ada) and RTX 3060 (`sm_86`, Ampere), CUDA 13.4, `CMAKE_CUDA_ARCHITECTURES=86-real;89-real`, all five types selected.
 
 - `test-backend-ops -o FLASH_ATTN_EXT`: 3993/3993 on both GPUs; `-o GATED_DELTA_NET` (shares the ldmatrix helpers): 43/43.
-- `test-backend-ops -o NATIVE_QUANT_EQUIVALENCE`: 37/37 on both GPUs. Each case computes the attention over the quantized cache and over an F16 copy of it in one graph, requires the two CUDA results to agree within an NMSE of 1e-4, and checks which path the dispatcher took through the backend's native-launch counter. The largest NMSE between the two halves is 2.9e-5 (n_kv=16384), a tenth of the difference between the CPU's own two halves (3.5e-4, since the CPU takes quantized dot products for a quantized cache), and the same as with float KQ accumulation. The cases cover every tile shape, decode and small query batches, GQA 4 and 8, two sequences and query batches large enough for the mask scan; five cases assert the F16-casting path where no kernel exists.
-- `compute-sanitizer` racecheck, synccheck and memcheck: no errors or warnings on the native kernels, on both GPUs, for the two-stage, shadow and chunked modes, the 8- and 32-column tiles at decode and small batches, and the half KQ accumulation at D=256 and D=512. The one racecheck warning is in upstream's F16 vector kernel, which computes the reference half of a decode case on Ada; `master` reports the same warning there.
-- `scripts/fattn-native-inventory.py`: 34 declared kernels with all types selected, all compiled, nothing else.
+- `test-backend-ops -o NATIVE_QUANT_EQUIVALENCE`: 39/39 on both GPUs. Each case computes the attention over the quantized cache and over an F16 copy of it in one graph, requires the two CUDA results to agree within an NMSE of 1e-4, and checks which path the dispatcher took through the backend's native-launch counter. The largest NMSE between the two halves is 2.9e-5 (n_kv=16384), a tenth of the difference between the CPU's own two halves (3.5e-4, since the CPU takes quantized dot products for a quantized cache), and the same as with float KQ accumulation. The cases cover every tile shape, decode and small query batches, GQA 4 and 8, two sequences and query batches large enough for the mask scan; five cases assert the F16-casting path where no kernel exists.
+- `compute-sanitizer` racecheck, synccheck and memcheck: no errors or warnings on the native kernels, on both GPUs, for the two-stage, shadow and chunked modes, the 8-, 16- and 32-column tiles at decode and small batches, and the half KQ accumulation at D=256 and D=512. The one racecheck warning is in upstream's F16 vector kernel, which computes the reference half of a decode case on Ada; `master` reports the same warning there.
+- `scripts/fattn-native-inventory.py`: 39 declared kernels with all types selected, all compiled, nothing else.
 
 KL divergence of Qwen3.8-27B IQ3_XXS (D=256, GQA 6) against the same model with an F16 cache, wikitext-2 test, `-c 4096 -b 1024`. Sample 1 is the first 6 chunks, sample 2 4 chunks from the middle of the file. "native, float KQ" is the route before the half accumulation; the column the route ships with is "native".
 
@@ -276,56 +277,56 @@ At D=256 the route is 19-46% faster at GQA 6 and 3-61% at GQA 2, and 19-27% (306
 
 ### Decode and small query batches
 
-Each cell is "without the flag / with it (change)", us/run, the faster of two or three runs. Without the flag a single query token (two on Ada) takes the vector kernel, larger batches the cast and the F16 MMA kernel.
+Each cell is "without the flag / with it (change)", us/run, the faster of two runs. Without the flag a single query token (two on Ada) takes the vector kernel, larger batches the cast and the F16 MMA kernel.
 
 
 **RTX 3060 (Ampere, sm_86)**
 
 | type | D | GQA | n_kv | n_q=1 | n_q=2 | n_q=3 | n_q=4 | n_q=8 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| `q4_0` | 256 | 6 | 4096 | 112 / 23 (-80%) | 170 / 30 (-83%) | 174 / 32 (-82%) | 174 / 32 (-82%) | 187 / 54 (-71%) |
-| `q4_0` | 256 | 6 | 16384 | 402 / 64 (-84%) | 632 / 85 (-87%) | 637 / 87 (-86%) | 636 / 88 (-86%) | 650 / 145 (-78%) |
-| `q4_0` | 256 | 6 | 65536 | 1551 / 231 (-85%) | 2489 / 309 (-88%) | 2493 / 312 (-87%) | 2493 / 314 (-87%) | 2515 / 514 (-80%) |
-| `q4_0` | 256 | 2 | 4096 | 81 / 41 (-50%) | 326 / 42 (-87%) | 326 / 42 (-87%) | 327 / 43 (-87%) | 330 / 49 (-85%) |
-| `q4_0` | 256 | 2 | 16384 | 284 / 123 (-57%) | 1250 / 125 (-90%) | 1253 / 126 (-90%) | 1253 / 127 (-90%) | 1255 / 160 (-87%) |
-| `q4_0` | 256 | 2 | 65536 | 1077 / 457 (-58%) | 4987 / 459 (-91%) | 4981 / 461 (-91%) | 4984 / 463 (-91%) | 5024 / 643 (-87%) |
-| `q4_0` | 512 | 16 | 4096 | 113 / 57 (-49%) | 85 / 44 (-48%) | 94 / 45 (-52%) | 93 / 44 (-53%) | 122 / 71 (-42%) |
-| `q4_0` | 512 | 16 | 16384 | 264 / 122 (-54%) | 266 / 123 (-54%) | 311 / 124 (-60%) | 312 / 126 (-60%) | 373 / 188 (-50%) |
-| `q4_0` | 512 | 16 | 65536 | 969 / 455 (-53%) | 1002 / 456 (-55%) | 1189 / 458 (-62%) | 1188 / 462 (-61%) | 1398 / 664 (-53%) |
-| `q8_0` | 256 | 6 | 4096 | 106 / 35 (-67%) | 171 / 42 (-75%) | 174 / 43 (-75%) | 175 / 44 (-75%) | 188 / 60 (-68%) |
-| `q8_0` | 256 | 6 | 16384 | 377 / 112 (-70%) | 637 / 121 (-81%) | 640 / 123 (-81%) | 641 / 124 (-81%) | 656 / 160 (-76%) |
-| `q8_0` | 256 | 6 | 65536 | 1515 / 426 (-72%) | 2503 / 437 (-83%) | 2507 / 438 (-83%) | 2509 / 440 (-82%) | 2528 / 571 (-77%) |
-| `q8_0` | 256 | 2 | 4096 | 80 / 64 (-19%) | 327 / 64 (-80%) | 328 / 66 (-80%) | 328 / 66 (-80%) | 334 / 69 (-79%) |
-| `q8_0` | 256 | 2 | 16384 | 274 / 219 (-20%) | 1260 / 219 (-83%) | 1265 / 220 (-83%) | 1261 / 221 (-82%) | 1266 / 229 (-82%) |
-| `q8_0` | 256 | 2 | 65536 | 1049 / 845 (-20%) | 4994 / 846 (-83%) | 4995 / 848 (-83%) | 4997 / 849 (-83%) | 5005 / 866 (-83%) |
-| `q8_0` | 512 | 16 | 4096 | 89 / 45 (-50%) | 83 / 45 (-45%) | 95 / 46 (-51%) | 95 / 47 (-50%) | 120 / 73 (-39%) |
-| `q8_0` | 512 | 16 | 16384 | 282 / 134 (-53%) | 282 / 135 (-52%) | 328 / 137 (-58%) | 328 / 138 (-58%) | 389 / 198 (-49%) |
-| `q8_0` | 512 | 16 | 65536 | 1039 / 503 (-52%) | 1071 / 505 (-53%) | 1260 / 507 (-60%) | 1260 / 512 (-59%) | 1468 / 710 (-52%) |
+| `q4_0` | 256 | 6 | 4096 | 112 / 23 (-80%) | 170 / 25 (-85%) | 173 / 31 (-82%) | 174 / 32 (-81%) | 187 / 54 (-71%) |
+| `q4_0` | 256 | 6 | 16384 | 403 / 64 (-84%) | 636 / 76 (-88%) | 636 / 87 (-86%) | 637 / 88 (-86%) | 650 / 144 (-78%) |
+| `q4_0` | 256 | 6 | 65536 | 1549 / 232 (-85%) | 2488 / 280 (-89%) | 2491 / 311 (-88%) | 2492 / 314 (-87%) | 2508 / 515 (-79%) |
+| `q4_0` | 256 | 2 | 4096 | 82 / 41 (-49%) | 325 / 42 (-87%) | 326 / 43 (-87%) | 327 / 43 (-87%) | 330 / 49 (-85%) |
+| `q4_0` | 256 | 2 | 16384 | 284 / 123 (-57%) | 1251 / 125 (-90%) | 1252 / 127 (-90%) | 1253 / 128 (-90%) | 1256 / 159 (-87%) |
+| `q4_0` | 256 | 2 | 65536 | 1077 / 457 (-58%) | 4986 / 459 (-91%) | 4975 / 462 (-91%) | 4952 / 464 (-91%) | 4955 / 601 (-88%) |
+| `q4_0` | 512 | 16 | 4096 | 88 / 42 (-52%) | 82 / 43 (-48%) | 92 / 43 (-53%) | 93 / 44 (-52%) | 120 / 71 (-40%) |
+| `q4_0` | 512 | 16 | 16384 | 265 / 122 (-54%) | 266 / 123 (-54%) | 311 / 125 (-60%) | 312 / 126 (-59%) | 372 / 187 (-50%) |
+| `q4_0` | 512 | 16 | 65536 | 969 / 457 (-53%) | 1002 / 458 (-54%) | 1190 / 459 (-61%) | 1193 / 463 (-61%) | 1399 / 666 (-52%) |
+| `q8_0` | 256 | 6 | 4096 | 107 / 35 (-67%) | 173 / 38 (-78%) | 174 / 43 (-75%) | 175 / 44 (-75%) | 188 / 60 (-68%) |
+| `q8_0` | 256 | 6 | 16384 | 376 / 113 (-70%) | 639 / 116 (-82%) | 641 / 123 (-81%) | 643 / 124 (-81%) | 655 / 160 (-76%) |
+| `q8_0` | 256 | 6 | 65536 | 1521 / 427 (-72%) | 2508 / 430 (-83%) | 2511 / 439 (-83%) | 2513 / 441 (-82%) | 2532 / 571 (-77%) |
+| `q8_0` | 256 | 2 | 4096 | 81 / 65 (-19%) | 328 / 65 (-80%) | 329 / 66 (-80%) | 330 / 66 (-80%) | 333 / 69 (-79%) |
+| `q8_0` | 256 | 2 | 16384 | 274 / 219 (-20%) | 1262 / 219 (-83%) | 1267 / 220 (-83%) | 1263 / 221 (-83%) | 1266 / 230 (-82%) |
+| `q8_0` | 256 | 2 | 65536 | 1047 / 845 (-19%) | 5024 / 845 (-83%) | 5011 / 847 (-83%) | 4999 / 851 (-83%) | 5004 / 870 (-83%) |
+| `q8_0` | 512 | 16 | 4096 | 91 / 45 (-51%) | 84 / 45 (-46%) | 95 / 46 (-51%) | 95 / 47 (-50%) | 120 / 73 (-39%) |
+| `q8_0` | 512 | 16 | 16384 | 282 / 134 (-53%) | 283 / 135 (-52%) | 328 / 137 (-58%) | 329 / 139 (-58%) | 390 / 199 (-49%) |
+| `q8_0` | 512 | 16 | 65536 | 1040 / 504 (-51%) | 1074 / 505 (-53%) | 1262 / 508 (-60%) | 1262 / 513 (-59%) | 1474 / 712 (-52%) |
 
 **RTX 4070 (Ada, sm_89)**
 
 | type | D | GQA | n_kv | n_q=1 | n_q=2 | n_q=3 | n_q=4 | n_q=8 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| `q4_0` | 256 | 6 | 4096 | 49 / 11 (-79%) | 99 / 15 (-85%) | 58 / 15 (-73%) | 59 / 16 (-72%) | 68 / 25 (-63%) |
-| `q4_0` | 256 | 6 | 16384 | 176 / 28 (-84%) | 358 / 38 (-89%) | 384 / 39 (-90%) | 386 / 40 (-90%) | 394 / 65 (-83%) |
-| `q4_0` | 256 | 6 | 65536 | 742 / 167 (-77%) | 1772 / 179 (-90%) | 1537 / 179 (-88%) | 1537 / 181 (-88%) | 1548 / 244 (-84%) |
-| `q4_0` | 256 | 2 | 4096 | 33 / 18 (-45%) | 68 / 19 (-72%) | 144 / 19 (-87%) | 147 / 20 (-87%) | 150 / 23 (-84%) |
-| `q4_0` | 256 | 2 | 16384 | 129 / 57 (-56%) | 300 / 56 (-81%) | 771 / 57 (-93%) | 770 / 57 (-93%) | 775 / 80 (-90%) |
-| `q4_0` | 256 | 2 | 65536 | 554 / 327 (-41%) | 1374 / 328 (-76%) | 3029 / 330 (-89%) | 3035 / 331 (-89%) | 3033 / 341 (-89%) |
-| `q4_0` | 512 | 16 | 4096 | 52 / 26 (-50%) | 47 / 22 (-53%) | 49 / 22 (-56%) | 50 / 23 (-55%) | 61 / 33 (-46%) |
-| `q4_0` | 512 | 16 | 16384 | 137 / 55 (-60%) | 139 / 56 (-60%) | 161 / 58 (-64%) | 162 / 59 (-63%) | 189 / 85 (-55%) |
-| `q4_0` | 512 | 16 | 65536 | 698 / 202 (-71%) | 692 / 206 (-70%) | 723 / 210 (-71%) | 724 / 212 (-71%) | 787 / 301 (-62%) |
-| `q8_0` | 256 | 6 | 4096 | 47 / 12 (-75%) | 96 / 16 (-83%) | 58 / 17 (-70%) | 59 / 18 (-69%) | 71 / 27 (-62%) |
-| `q8_0` | 256 | 6 | 16384 | 167 / 34 (-80%) | 353 / 51 (-85%) | 402 / 49 (-88%) | 404 / 50 (-88%) | 413 / 86 (-79%) |
-| `q8_0` | 256 | 6 | 65536 | 748 / 307 (-59%) | 1910 / 317 (-83%) | 1587 / 319 (-80%) | 1587 / 320 (-80%) | 1600 / 339 (-79%) |
-| `q8_0` | 256 | 2 | 4096 | 32 / 21 (-36%) | 65 / 21 (-68%) | 163 / 21 (-87%) | 163 / 22 (-87%) | 164 / 25 (-85%) |
-| `q8_0` | 256 | 2 | 16384 | 171 / 159 (-7%) | 352 / 159 (-55%) | 800 / 159 (-80%) | 800 / 159 (-80%) | 805 / 167 (-79%) |
-| `q8_0` | 256 | 2 | 65536 | 667 / 607 (-9%) | 1354 / 608 (-55%) | 3148 / 611 (-81%) | 3149 / 611 (-81%) | 3165 / 615 (-81%) |
-| `q8_0` | 512 | 16 | 4096 | 32 / 21 (-32%) | 30 / 23 (-24%) | 34 / 23 (-32%) | 34 / 24 (-31%) | 45 / 35 (-24%) |
-| `q8_0` | 512 | 16 | 16384 | 147 / 60 (-60%) | 155 / 61 (-61%) | 179 / 62 (-65%) | 179 / 63 (-65%) | 207 / 90 (-57%) |
-| `q8_0` | 512 | 16 | 65536 | 738 / 229 (-69%) | 734 / 232 (-68%) | 771 / 236 (-69%) | 771 / 238 (-69%) | 840 / 325 (-61%) |
+| `q4_0` | 256 | 6 | 4096 | 49 / 10 (-79%) | 99 / 13 (-87%) | 58 / 15 (-73%) | 59 / 16 (-72%) | 68 / 25 (-63%) |
+| `q4_0` | 256 | 6 | 16384 | 176 / 28 (-84%) | 359 / 36 (-90%) | 385 / 39 (-90%) | 386 / 40 (-90%) | 394 / 65 (-84%) |
+| `q4_0` | 256 | 6 | 65536 | 740 / 167 (-77%) | 1766 / 170 (-90%) | 1530 / 179 (-88%) | 1535 / 181 (-88%) | 1542 / 243 (-84%) |
+| `q4_0` | 256 | 2 | 4096 | 33 / 18 (-45%) | 68 / 19 (-73%) | 143 / 19 (-87%) | 148 / 20 (-87%) | 151 / 23 (-85%) |
+| `q4_0` | 256 | 2 | 16384 | 130 / 56 (-57%) | 300 / 55 (-82%) | 770 / 57 (-93%) | 771 / 57 (-93%) | 776 / 81 (-90%) |
+| `q4_0` | 256 | 2 | 65536 | 553 / 328 (-41%) | 1366 / 328 (-76%) | 3026 / 330 (-89%) | 3026 / 332 (-89%) | 3034 / 339 (-89%) |
+| `q4_0` | 512 | 16 | 4096 | 47 / 20 (-58%) | 45 / 21 (-54%) | 49 / 22 (-56%) | 50 / 23 (-54%) | 60 / 33 (-45%) |
+| `q4_0` | 512 | 16 | 16384 | 136 / 55 (-60%) | 140 / 56 (-60%) | 161 / 58 (-64%) | 161 / 59 (-63%) | 188 / 85 (-55%) |
+| `q4_0` | 512 | 16 | 65536 | 697 / 203 (-71%) | 692 / 206 (-70%) | 724 / 209 (-71%) | 725 / 212 (-71%) | 788 / 301 (-62%) |
+| `q8_0` | 256 | 6 | 4096 | 47 / 12 (-74%) | 97 / 14 (-86%) | 58 / 17 (-71%) | 59 / 18 (-70%) | 70 / 27 (-62%) |
+| `q8_0` | 256 | 6 | 16384 | 167 / 34 (-80%) | 353 / 41 (-88%) | 402 / 50 (-88%) | 405 / 53 (-87%) | 413 / 90 (-78%) |
+| `q8_0` | 256 | 6 | 65536 | 748 / 306 (-59%) | 1913 / 310 (-84%) | 1587 / 319 (-80%) | 1587 / 320 (-80%) | 1600 / 339 (-79%) |
+| `q8_0` | 256 | 2 | 4096 | 32 / 21 (-36%) | 66 / 21 (-68%) | 161 / 21 (-87%) | 161 / 22 (-87%) | 164 / 26 (-84%) |
+| `q8_0` | 256 | 2 | 16384 | 170 / 160 (-6%) | 352 / 159 (-55%) | 801 / 159 (-80%) | 801 / 160 (-80%) | 806 / 167 (-79%) |
+| `q8_0` | 256 | 2 | 65536 | 668 / 607 (-9%) | 1369 / 608 (-56%) | 3151 / 610 (-81%) | 3150 / 611 (-81%) | 3149 / 615 (-80%) |
+| `q8_0` | 512 | 16 | 4096 | 32 / 21 (-33%) | 30 / 23 (-25%) | 34 / 23 (-31%) | 34 / 24 (-31%) | 45 / 35 (-23%) |
+| `q8_0` | 512 | 16 | 16384 | 148 / 60 (-60%) | 154 / 61 (-60%) | 178 / 62 (-65%) | 178 / 64 (-64%) | 205 / 90 (-56%) |
+| `q8_0` | 512 | 16 | 65536 | 741 / 229 (-69%) | 736 / 233 (-68%) | 770 / 237 (-69%) | 772 / 239 (-69%) | 840 / 326 (-61%) |
 
-The native kernels read every K/V row once per KV head and nothing else, so these steps run close to the DRAM bandwidth: `q8_0` decode at GQA 6 and n_kv=65536 reads K/V at about 90% of it on both cards. A single query token at 8 heads per tile, or up to 4 at 2 heads per tile, takes the 8-column tiles. Without the flag, two to eight query tokens pay for the cast, which reads the cache, writes an F16 copy two to four times its size and has the kernel read that again.
+The native kernels read every K/V row once per KV head and nothing else, so these steps run close to the DRAM bandwidth: `q8_0` decode at GQA 6 and n_kv=65536 reads K/V at about 90% of it on both cards. One or two query tokens at 8 heads per tile take the 1x8 and 2x8 tiles, up to 4 at 2 heads per tile the 4x2 tile. Without the flag, two to eight query tokens pay for the cast, which reads the cache, writes an F16 copy two to four times its size and has the kernel read that again.
 
 ### End to end
 
@@ -357,6 +358,15 @@ The native kernels read every K/V row once per KV head and nothing else, so thes
 | RTX 4070 | `q4_0` | pp512 @ d16384 | 1032.4 | 1039.6 | 1120.0 | +8.5% |
 | RTX 4070 | `q4_0` | pp4 @ d16384 | 90.3 | 90.4 | 103.7 | +14.8% |
 | RTX 4070 | `q4_0` | tg128 @ d16384 | 34.2 | 34.2 | 37.3 | +8.8% |
+
+Two-token steps (speculative decoding with one draft token), one GPU each, `-p 2 -n 0 -d 16384 -r 3`:
+
+| GPU | cache | test | upstream | native off | native on | on vs upstream |
+|---|---|---|--:|--:|--:|--:|
+| RTX 3060 | `q8_0` | pp2 @ d16384 | 31.1 | 30.9 | 35.4 | +13.7% |
+| RTX 3060 | `q4_0` | pp2 @ d16384 | 30.8 | 30.6 | 35.7 | +16.1% |
+| RTX 4070 | `q8_0` | pp2 @ d16384 | 49.2 | 49.3 | 63.0 | +27.9% |
+| RTX 4070 | `q4_0` | pp2 @ d16384 | 49.0 | 48.9 | 64.0 | +30.6% |
 
 Both GPUs (`-sm layer`), 64k context, `-p 512,4 -n 32 -d 65536 -r 1`, best of up to two passes:
 
