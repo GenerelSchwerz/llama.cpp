@@ -11812,9 +11812,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 1},  1024, 1024, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 8, { 2, 1},  2048, 1024, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 512, 1, {16, 1},  1024, 1024, 1);
-    // an odd GQA ratio of 4 or less has no tile shape and stays on the F16 path
-    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 3, 1},  1024,   65, 0);
-    add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 3, 1},  1024,    4, 0);
+    // GQA 3 and 4 take 8 heads per tile up to 8 query tokens, 2 heads per tile above; MHA stays on the F16 path
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 3, 1},  1024,   65, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 3, 1},  1024,    4, 1);
+    add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 4, 1},  1024,    1, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 4, 1},  1024,    7, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 1, 1},  1024,   65, 0);
+    add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 1, 1},  1024,    1, 0);
     // D=128 has the D=256 rows; its rows of 2 mod 4 byte blocks are staged in 8-byte pieces
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
         add_native_equivalence(type, 128, 4, { 8, 1},  1024,   65, 1);
@@ -11829,7 +11833,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_native_equivalence(GGML_TYPE_Q8_0, 128, 4, { 8, 1},  1024,    2, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 8, 1},   512,    4, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 128, 4, { 8, 2},  1024,   65, 1);
-    add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 3, 1},  1024,   65, 0);
+    add_native_equivalence(GGML_TYPE_Q4_0, 128, 4, { 3, 1},  1024,   65, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 128, 8, { 4, 1},  1024,    1, 1);
     add_native_equivalence(GGML_TYPE_Q4_0, 128, 8, { 4, 1},  1024,    2, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 128, 8, { 4, 1},  1024,   12, 1);

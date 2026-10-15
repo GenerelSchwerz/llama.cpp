@@ -624,8 +624,8 @@ enum best_fattn_kernel {
 };
 
 // Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
-//   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio above 4, 2 heads per tile (32x2, 16x2, 4x2)
-//                 for GQA 2 and 4 and for larger query batches of an even GQA ratio that is not a multiple of 8.
+//   D=64-256:     8 heads per tile (8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (32x2, 16x2, 4x2)
+//                 for GQA 2 and for larger query batches of a GQA ratio that is not a multiple of 8 and not odd above 4.
 //   D=512:        a GQA ratio above 4, Q4_0 and Q8_0 only (8x8, 4x8).
 // fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
 // like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
@@ -675,19 +675,30 @@ static bool ggml_cuda_fattn_native_supported(
         return false;
     }
 
-    // An even GQA ratio that is not a multiple of 8 takes 2 heads per tile: 8 heads per tile would compute zeros for the missing ones.
-    if (gqa_ratio % 2 == 0 && gqa_ratio % 8 != 0 && (Q->ne[1] > 16 || gqa_ratio <= 4)) {
-        *ncols1 = Q->ne[1] > 16 ? (wide_tile ? 32 : 16) : (Q->ne[1] > 4 ? 16 : 4);
-        *ncols2 = 2;
+    // A tile of 8 heads reads K/V once per KV head. Below 8 heads the unused ones cost compute only,
+    // which small query batches can afford. Larger query batches of an even GQA ratio take tiles of 2 heads.
+    const int64_t n_q = Q->ne[1];
+    bool heads8;
+    if (gqa_ratio % 8 == 0 || (gqa_ratio % 2 != 0 && gqa_ratio > 4)) {
+        heads8 = true;
+    } else if (gqa_ratio > 4) {
+        heads8 = n_q <= 16;
+    } else {
+        heads8 = gqa_ratio > 2 && n_q <= 8;
+    }
+
+    if (heads8) {
+        // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
+        *ncols1 = n_q > 4 ? (wide_tile ? 8 : 4) : (n_q > 2 ? 4 : n_q);
+        *ncols2 = 8;
         return true;
     }
 
-    if (gqa_ratio <= 4) {
+    if (gqa_ratio < 2) {
         return false;
     }
-    // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
-    *ncols1 = Q->ne[1] > 4 ? (wide_tile ? 8 : 4) : (Q->ne[1] > 2 ? 4 : Q->ne[1]);
-    *ncols2 = 8;
+    *ncols1 = n_q > 16 ? (wide_tile ? 32 : 16) : (n_q > 4 ? 16 : 4);
+    *ncols2 = 2;
     return true;
 }
 
