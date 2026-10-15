@@ -56,12 +56,17 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_pair(ggml_ty
     return type_K == type_V && ggml_cuda_fattn_mma_quant_type(type_K);
 }
 
-// GeForce cards run MMAs with float accumulators at half the rate of half
-// accumulators, so there the route sums KQ in half over short runs of D and in
-// float across them. sm_80 runs both at the same rate. Defining
-// GGML_FATTN_QUANT_KQ_FLOAT keeps float accumulation everywhere, for comparison.
+// GeForce cards run MMAs with float accumulators at half the rate of half accumulators. There the route sums KQ
+// in half over short runs of D and in float across them, in a kernel variant the host selects per device.
+// The architectures of GeForce cards with tensor cores compile that variant: the same chips in professional and
+// data center cards run both accumulators at the same rate and take the float variant. Keep both lists the same.
+// Defining GGML_FATTN_QUANT_KQ_FLOAT keeps float accumulation everywhere, for comparison.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_kq_half_arch(const int arch) {
+    return arch == 750 || arch == 860 || arch == 890 || arch == 1200;
+}
+
 #if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_FATTN_QUANT_KQ_FLOAT) && \
-    (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+    (__CUDA_ARCH__ == 750 || __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
 #define GGML_FATTN_QUANT_KQ_HALF
 #endif
 

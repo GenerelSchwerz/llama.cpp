@@ -1185,6 +1185,7 @@ struct ggml_cuda_device_info {
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
         int     virtual_index;                  // index of this (virtual) device among those sharing its physical GPU
+        bool    mma_f32_acc_half_rate;          // MMAs with float accumulators run at half rate (GeForce)
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};

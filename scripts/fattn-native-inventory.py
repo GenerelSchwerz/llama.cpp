@@ -49,11 +49,12 @@ CASE_RE = re.compile(
     r"^\s*DECL_FATTN_MMA_QUANT_CASE\(\s*(GGML_TYPE_\w+)\s*,"
     r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
 
-# <DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse, type_K, type_V>
+# <DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse, type_K, type_V, kq_half>
+# Every native case has a float and a half KQ accumulation variant, the host selects one per device.
 KERNEL_RE = re.compile(
     r"flash_attn_ext_f16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),"
     r"\s*(\w+),\s*(\w+),\s*(\w+),"
-    r"\s*\(ggml_type\)(\d+),\s*\(ggml_type\)(\d+)\s*>")
+    r"\s*\(ggml_type\)(\d+),\s*\(ggml_type\)(\d+)(?:,\s*(\w+))?\s*>")
 
 
 def read_manifest(path):
@@ -163,7 +164,7 @@ def main():
     seen_symbols = collections.Counter()
     for m in KERNEL_RE.finditer(symbols):
         geometry = tuple(int(m.group(i)) for i in range(1, 5))
-        bools = (m.group(5), m.group(6), m.group(7))
+        bools = (m.group(5), m.group(6), m.group(7), m.group(10) or "false")
         k, v = int(m.group(8)), int(m.group(9))
         if k not in value_to_name and v not in value_to_name:
             continue  # an F16/BF16 kernel, not this route's
@@ -214,6 +215,9 @@ def main():
     shapes = {frozenset(v) for v in variants.values()}
     if len(shapes) > 1:
         failures.append(f"kernel variants differ between cases: {sorted(map(sorted, shapes))}")
+    for case, v in sorted(variants.items()):
+        if {b[3] for b in v} != {"false", "true"}:
+            failures.append(f"float and half KQ variants not both compiled: {case}")
 
     if args.json:
         with open(args.json, "w") as f:
