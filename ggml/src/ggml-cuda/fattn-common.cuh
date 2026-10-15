@@ -1146,9 +1146,16 @@ void launch_fattn(
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
         const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
 
-        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        // A kernel reading a quantized K/V in place with one block per SM leaves whole SMs idle in a partial last wave.
+        const bool native_one_block = ggml_is_quantized(K->type) && !need_f16_K && max_blocks_per_sm == 1;
+
+        auto should_use_stream_k = [prefer_whole_tiles, native_one_block](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+
+            if (GGML_CUDA_CC_IS_NVIDIA(cc) && native_one_block) {
+                return true;
+            }
 
             if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
                 return false;
