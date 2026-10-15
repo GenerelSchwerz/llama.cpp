@@ -1735,9 +1735,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--flash-attn-native-quants"},
         {"--no-flash-attn-native-quants"},
         "read quantized K/V caches directly in the CUDA MMA FlashAttention kernel instead of casting them to F16 "
-        "first, which removes the transient F16 copy of the attention window. Output is unchanged. Applies only "
-        "where a native loader exists for the cache type and head dimension; other cases keep the F16 path "
-        "(default: disabled)",
+        "first, which removes the transient F16 copy of the attention window. Results differ from the F16 path "
+        "in rounding only. Applies only where a native kernel exists for the cache type, head dimension and GQA "
+        "ratio; other cases keep the F16 path (default: disabled)",
         [](common_params & params, bool value) {
             params.flash_attn_native_quants = value;
         }
