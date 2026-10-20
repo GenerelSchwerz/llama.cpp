@@ -3366,7 +3366,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 
     if (!spec->lookup.empty()) {
-        spec->lookup.at(seq_id) = {};
+        spec->lookup.at(seq_id) = decltype(spec->lookup)::value_type();
         spec->lookup.at(seq_id).policy = common_ngram_chain_policy(common_speculative_n_max(spec));
         spec->lookup.at(seq_id).history.update(prompt);
     }
